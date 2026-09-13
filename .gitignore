@@ -1,0 +1,6 @@
+# node_modules/ 仅在本包被当普通 npm 包安装时产生；零依赖纯 JS 直挂 lib/
+node_modules/
+# 注意：lib/ 是交付物本体（零依赖纯 JS），不要忽略
+# lib/
+*.tsbuildinfo
+*.tgz

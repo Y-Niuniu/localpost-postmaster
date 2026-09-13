@@ -1,0 +1,23 @@
+{
+  "name": "@dsh-external/dsh-localpost-postmaster",
+  "version": "0.0.1",
+  "description": "LocalPost 局长外壳：定时对账 + 告警冒泡（ntfy 推送 + Windows 桌面 toast）+ localpost_check 手动工具。零依赖，纯 host 侧。",
+  "private": true,
+  "type": "module",
+  "main": "./lib/index.js",
+  "files": [
+    "lib",
+    "assets",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "license": "BSD-3-Clause",
+  "engines": {
+    "node": ">=20"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

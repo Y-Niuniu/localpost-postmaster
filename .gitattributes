@@ -1,0 +1,5 @@
+# 行尾一致：仓库内存 LF，所有 worktree 都检出 LF
+# 理由：本机 git core.autocrlf=true，而不同 agent 的 git 配置可能不同，
+# 不做这一步会出现「同一文件两种字节」的假冲突（计划 §3 要消灭的那类病）。
+* text=auto eol=lf
+*.ps1 text eol=crlf

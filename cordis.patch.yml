@@ -1,0 +1,24 @@
+# dsh-localpost-postmaster bundle patch
+# ------------------------------------------------------------------
+# 出现在 profile 的 dsh.profile.bundles 列表时，由 loader 自动装配这一行。
+# 手动热注入（dev_inject_plugin）不走这里，两条路径装配出来的是同一个插件。
+#
+# 全部配置项都有代码内默认值，下面这行 config 留空即可跑；
+# 想改就在 profile 的 cordis.patch.yml 里覆盖同名键（例如把间隔临时调成 1 分钟做验收）。
+#
+#   root            信箱根目录              默认 C:/AI_ASSIST/.mailbox
+#   kernelPath      内核文件路径            默认 <root>/postmaster.mjs
+#   intervalMinutes 定时器间隔（分钟）       默认 15
+#   startupDelayMs  加载后首次检查延迟      默认 3000
+#   cooldownHours   同一告警重复提醒冷却     默认 12
+#   selfFailThreshold 连续失败几轮才报故障   默认 3
+#   ntfyEnabled / ntfyServer / ntfyTopic     默认 on / https://ntfy.sh / dsh-ysiqnef3w9j7lz
+#   toastEnabled    桌面 toast 开关（仅 error 级弹）默认 on
+#   toastScriptPath 覆盖 toast 脚本路径      默认 <包>/assets/toast.ps1
+#   stateFile       冷却状态文件             默认 %DSH_HOME%/.dsh/localpost-postmaster/state.json
+#   logFile         插件日志                 默认 %DSH_HOME%/.dsh/localpost-postmaster/plugin.log
+
+- insert:
+    - id: dsh-localpost-postmaster
+      name: '@dsh-external/dsh-localpost-postmaster'
+      config: {}
