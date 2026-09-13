@@ -213,6 +213,41 @@ check('12h 冷却边界：恰好 12h 仍静默（严格超过才重提）',
 check('12h 冷却边界：超过 1ms 即重提',
   notify.selectFresh([alertB], stateB, COOL, T0 + COOL + 1).fresh.length === 1)
 
+/* ---- 9c. readState 容错与 selectFresh 状态清理（agent/opencode · base_rev ebbddfd） ---- */
+const safeReadState = (file) => {
+  try { return { threw: false, state: notify.readState(file) } } catch (e) { return { threw: true, error: String(e) } }
+}
+const isEmptyState = (r) => !r.threw && !!r.state && !!r.state.notified && Object.keys(r.state.notified).length === 0
+
+const rMissing = safeReadState(join(TMP, 'state-missing.json'))
+check('readState 容错：文件不存在 → 空状态且不抛异常', isEmptyState(rMissing),
+  rMissing.threw ? '抛异常: ' + rMissing.error : JSON.stringify(rMissing.state.notified))
+
+const badJsonFile = join(TMP, 'state-bad-json.json')
+writeFileSync(badJsonFile, '{ 这不是 JSON', 'utf8')
+const rBadJson = safeReadState(badJsonFile)
+check('readState 容错：非法 JSON → 空状态且不抛异常', isEmptyState(rBadJson),
+  rBadJson.threw ? '抛异常: ' + rBadJson.error : JSON.stringify(rBadJson.state.notified))
+
+const badShapeFile = join(TMP, 'state-bad-shape.json')
+writeFileSync(badShapeFile, JSON.stringify({ hello: 1 }), 'utf8')
+const rBadShape = safeReadState(badShapeFile)
+check('readState 容错：JSON 合法但结构不对（缺 notified）→ 退回空状态', isEmptyState(rBadShape),
+  rBadShape.threw ? '抛异常: ' + rBadShape.error : JSON.stringify(rBadShape.state.notified))
+
+const K_RESOLVED = 'overdue|task-resolved|agents/opencode/inbox/task-resolved.json|'
+const stateResolved = { schema: 'localpost-plugin-state-v1', notified: { [K_RESOLVED]: { at: new Date(T0).toISOString(), severity: 'warn' } } }
+const rResolved = notify.selectFresh([alertB], stateResolved, COOL, T0)
+check('selectFresh 清理：告警已解决（本轮不存在）→ 旧键被删',
+  !(K_RESOLVED in rResolved.next.notified), Object.keys(rResolved.next.notified).join(', '))
+
+const K_ZOMBIE = 'overdue|task-zombie|agents/opencode/inbox/task-zombie.json|'
+const zombieAlert = { kind: 'overdue', id: 'task-zombie', path: 'agents/opencode/inbox/task-zombie.json', severity: 'warn' }
+const zombieState = { schema: 'localpost-plugin-state-v1', notified: { [K_ZOMBIE]: { at: new Date(T0 - 31 * 24 * 3600e3).toISOString(), severity: 'warn' } } }
+const rZombie = notify.selectFresh([zombieAlert], zombieState, 365 * 24 * 3600e3, T0)
+check('selectFresh 清理：超 30 天保留期的僵尸键被删（本轮仍存在、冷却极大）',
+  !(K_ZOMBIE in rZombie.next.notified), Object.keys(rZombie.next.notified).join(', '))
+
 /* ---- 10. 确认没碰内核的地盘 ---- */
 const ledger = (() => { try { return JSON.parse(readFileSync(join(MAILBOX, 'ledger.json'), 'utf8')) } catch { return null } })()
 check('内核 ledger.json 未被插件改写（唯一写者约束）', !!ledger && typeof ledger.envelopes === 'object',
