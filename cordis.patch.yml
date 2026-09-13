@@ -8,11 +8,15 @@
 #
 #   root            信箱根目录              默认 C:/AI_ASSIST/.mailbox
 #   kernelPath      内核文件路径            默认 <root>/postmaster.mjs
-#   intervalMinutes 定时器间隔（分钟）       默认 15
+#   intervalMinutes 定时器间隔（分钟）       默认 15；单一来源 = .mailbox/postmaster.config.json 顶层
 #   startupDelayMs  加载后首次检查延迟      默认 3000
 #   cooldownHours   同一告警重复提醒冷却     默认 12
 #   selfFailThreshold 连续失败几轮才报故障   默认 3
-#   ntfyEnabled / ntfyServer / ntfyTopic     默认 on / https://ntfy.sh / dsh-ysiqnef3w9j7lz
+#   ntfyEnabled / ntfyServer / ntfyTopic     默认 off / https://ntfy.sh / 空
+#       ↑ 私人 topic 不写在这里，也不写源码：放 .mailbox/postmaster.config.json 的 notify 段
+#         （本插件由 profile 的 dsh.profile.bundles 自动装配，再往 profile 的 cordis.patch.yml
+#           写同 id 的 row 会撞 duplicate loader entry id 启动崩溃）
+#       取值优先级：row config > postmaster.config.json 的 notify 段 > 源码 DEFAULTS
 #   toastEnabled    桌面 toast 开关（仅 error 级弹）默认 on
 #   toastScriptPath 覆盖 toast 脚本路径      默认 <包>/assets/toast.ps1
 #   stateFile       冷却状态文件             默认 %DSH_HOME%/.dsh/localpost-postmaster/state.json

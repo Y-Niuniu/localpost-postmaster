@@ -248,7 +248,51 @@ const rZombie = notify.selectFresh([zombieAlert], zombieState, 365 * 24 * 3600e3
 check('selectFresh 清理：超 30 天保留期的僵尸键被删（本轮仍存在、冷却极大）',
   !(K_ZOMBIE in rZombie.next.notified), Object.keys(rZombie.next.notified).join(', '))
 
-/* ---- 10. 确认没碰内核的地盘 ---- */
+/* ---- 11. 单一配置源：<root>/postmaster.config.json（2026-09-13 加固）----
+ * 私人 ntfy topic 与定时器间隔都从配置文件读，源码 DEFAULTS 里只有空/关。
+ * 这一段就是「别把私人 topic 抄回源码」的机器判据 —— 谁抄回去、什么时候抄的，这里会红。
+ * 同时锁住内核侧的两个死键，防止有人再把"看起来能配"的开关加回 DEFAULT_CONFIG。 */
+function readyLineOf(fileCfg) {
+  const root = join(TMP, 'cfgroot-' + Math.random().toString(36).slice(2))
+  mkdirSync(root, { recursive: true })
+  if (fileCfg) writeFileSync(join(root, 'postmaster.config.json'), JSON.stringify(fileCfg))
+  const seen = []
+  const ctx2 = {
+    logger: { info: (m) => seen.push(m), warn: (m) => seen.push(m) },
+    effect(fn) { return fn() },
+    on() { return () => {} },
+    setTimeout() { return () => {} },   // 故意不触发首轮 run：本段只验配置解析
+    setInterval() { return () => {} },
+    tools: { register() { return () => {} } },
+  }
+  mod.apply(ctx2, { root, kernelPath: join(root, 'no-such-kernel.mjs'), startupDelayMs: 0 })
+  return (seen.join('\n').split('\n').filter((l) => l.includes('插件就绪')).pop() || '')
+}
+
+const lineWithCfg = readyLineOf({
+  intervalMinutes: 7,
+  notify: { ntfyEnabled: true, ntfyServer: 'http://127.0.0.1:8899', ntfyTopic: 't-from-config-file' },
+})
+check('配置文件：notify.ntfyEnabled 被读到 -> ntfy=on', lineWithCfg.includes('ntfy=on'), lineWithCfg.slice(-58))
+check('配置文件：顶层 intervalMinutes 被读到 -> 间隔=7', lineWithCfg.includes('间隔=7'), lineWithCfg.slice(-58))
+
+const lineNoCfg = readyLineOf(null)
+check('无配置文件时回到源码默认（ntfy=off 且 间隔=15）',
+  lineNoCfg.includes('ntfy=off') && lineNoCfg.includes('间隔=15'), lineNoCfg.slice(-58))
+
+const libSrc = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8') +
+  readFileSync(new URL('../lib/notify.js', import.meta.url), 'utf8')
+check('lib/ 下没有任何非空 ntfyTopic 字面量（私人 topic 不许抄回源码）',
+  !/ntfyTopic:\s*'[^']+'/.test(libSrc),
+  (libSrc.match(/ntfyTopic:\s*'[^']*'/) || ['无 ntfyTopic 字面量'])[0])
+
+const kernelSrc = readFileSync(KERNEL, 'utf8')
+const defBlock = (kernelSrc.match(/export const DEFAULT_CONFIG = \{[\s\S]*?\n\}/) || [''])[0]
+check('内核 DEFAULT_CONFIG 里没有"声明了没人读"的死键（scanIntervalMinutes / ignoreTypes）',
+  !!defBlock && !/scanIntervalMinutes|ignoreTypes/.test(defBlock),
+  defBlock.replace(/\s+/g, ' ').slice(0, 76))
+
+/* ---- 12. 确认没碰内核的地盘 ---- */
 const ledger = (() => { try { return JSON.parse(readFileSync(join(MAILBOX, 'ledger.json'), 'utf8')) } catch { return null } })()
 check('内核 ledger.json 未被插件改写（唯一写者约束）', !!ledger && typeof ledger.envelopes === 'object',
   '条目=' + (ledger ? Object.keys(ledger.envelopes).length : '账本不可读'))

@@ -46,12 +46,20 @@ LocalPost **局长外壳**（子项目②）：给已经写好的局长内核套
 |---|---|---|
 | `root` | `C:/AI_ASSIST/.mailbox` | 信箱根目录 |
 | `kernelPath` | `<root>/postmaster.mjs` | 内核文件路径 |
-| `intervalMinutes` | `15` | 定时器间隔（支持小数，验收时可临时调 0.1） |
+| `intervalMinutes` | `15` | 定时器间隔（支持小数）。**单一来源 = `<root>/postmaster.config.json` 顶层**；row config 可临时覆盖 |
 | `startupDelayMs` | `3000` | 加载后首次检查的延迟（DSH 一开就先查一次） |
 | `cooldownHours` | `12` | 同一告警重复提醒的冷却 |
 | `selfFailThreshold` | `3` | 连续失败几轮才报「插件故障」 |
-| `ntfyEnabled` / `ntfyServer` / `ntfyTopic` | `on` / `https://ntfy.sh` / `dsh-ysiqnef3w9j7lz` | 通道 A（与 `ntfy-notify` 同一 topic） |
+| `ntfyEnabled` / `ntfyServer` / `ntfyTopic` | `off` / `https://ntfy.sh` / `（空）` | 通道 A。**私人 topic 不写源码**，放 `<root>/postmaster.config.json` 的 `notify` 段；源码默认关+空 |
 | `toastEnabled` / `toastScriptPath` | `on` / `<包>/assets/toast.ps1` | 通道 D |
+
+> **配置放哪里（2026-09-13 改）**：优先级 = loader row 的 `config` > `<root>/postmaster.config.json`（`notify` 段 + 顶层 `intervalMinutes`）> 源码 `DEFAULTS`。
+> 之所以不放 row config：本插件是由 profile 的 `dsh.profile.bundles` 自动装配的，再往 `cordis.patch.yml` 写同 id 的 row 会撞
+> 「duplicate loader entry id」启动崩溃。放配置文件既避开这个坑，也只多一个可读的数据文件。
+>
+> 旧版 `postmaster.config.json` 里的 `scanIntervalMinutes` / `ignoreTypes` 是**声明了没人读的死键**（改它们没效果，
+> 而 `_note` 还写着"改数字不用改代码"）—— 2026-09-13 已删，间隔改名 `intervalMinutes` 并真正生效。
+> 自测里加了 5 条断言锁死这一点（含「lib/ 下不许出现非空 ntfyTopic 字面量」）。
 | `stateFile` | `%DSH_HOME%/.dsh/localpost-postmaster/state.json` | 冷却状态（原子写，损坏即当空状态） |
 | `logFile` | `%DSH_HOME%/.dsh/localpost-postmaster/plugin.log` | 插件日志（超 256KB 转 `.1`） |
 
