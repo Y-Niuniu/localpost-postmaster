@@ -187,6 +187,32 @@ check('单例守卫：旧实例停摆在日志里留痕',
   readFileSync(logFile, 'utf8').includes('实例已停止'),
   (readFileSync(logFile, 'utf8').split('\n').filter((l) => l.includes('实例已停止')).pop() || '').slice(0, 120))
 
+/* ---- 9b. 交付层补充断言（agent/opencode · base_rev 8aceea3） ---- */
+const notify = await import(new URL('../lib/notify.js', import.meta.url).href)
+
+// ① alertKey 稳定性：同一封问题信跨轮必须得到同一个键 —— 键变了 = 冷却失效 = 每轮重复弹窗
+const alertA = { kind: 'overdue', id: 'task-x', path: 'agents/opencode/inbox/task-x.json', attachment: '' }
+const keyFirst = notify.alertKey(alertA)
+check('alertKey 稳定：同内容告警跨轮同键',
+  notify.alertKey(Object.assign({}, alertA)) === keyFirst &&
+  keyFirst === 'overdue|task-x|agents/opencode/inbox/task-x.json|', keyFirst)
+check('alertKey 区分：kind 或 id 变了必须换键',
+  notify.alertKey(Object.assign({}, alertA, { id: 'task-y' })) !== keyFirst &&
+  notify.alertKey(Object.assign({}, alertA, { kind: 'malformed' })) !== keyFirst)
+check('alertKey 容错：缺字段/空值返占位而非 undefined',
+  notify.alertKey({}) === '?|||' && notify.alertKey(null) === '?|||', notify.alertKey({}))
+
+// ② selectFresh 的 12h 冷却边界：判定必须是「严格超过」，恰好 12h 仍算冷却中
+const COOL = 12 * 3600e3
+const T0 = Date.parse('2026-09-13T00:00:00.000Z')
+const KB = 'overdue|task-b|agents/opencode/inbox/task-b.json|'
+const alertB = { kind: 'overdue', id: 'task-b', path: 'agents/opencode/inbox/task-b.json', severity: 'warn' }
+const stateB = { schema: 'localpost-notify-v1', notified: { [KB]: { at: new Date(T0).toISOString(), severity: 'warn' } } }
+check('12h 冷却边界：恰好 12h 仍静默（严格超过才重提）',
+  notify.selectFresh([alertB], stateB, COOL, T0 + COOL).fresh.length === 0)
+check('12h 冷却边界：超过 1ms 即重提',
+  notify.selectFresh([alertB], stateB, COOL, T0 + COOL + 1).fresh.length === 1)
+
 /* ---- 10. 确认没碰内核的地盘 ---- */
 const ledger = (() => { try { return JSON.parse(readFileSync(join(MAILBOX, 'ledger.json'), 'utf8')) } catch { return null } })()
 check('内核 ledger.json 未被插件改写（唯一写者约束）', !!ledger && typeof ledger.envelopes === 'object',
