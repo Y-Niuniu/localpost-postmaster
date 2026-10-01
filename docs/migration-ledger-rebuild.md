@@ -30,12 +30,15 @@
 ## 3. 迁移前必须做的事（硬性前置）
 
 1. **独立、不可覆盖的迁移前快照**：`node localpost/migrate.mjs snapshot --root C:/AI_ASSIST/.mailbox --label pre-ledger-rebuild`
-   - 目录名 = `runtime/snapshots/<UTC 时间戳>-<label>`；同名同毫秒再次执行会**拒绝覆盖**
-   - 记录 `ledger.json` / `alerts.json` / `postmaster.config.json` 的 SHA-256 与当时的信封清单
+   - 目录名 = `runtime/snapshots/<UTC 时间戳>-<label>`，用排他 mkdir 原子创建：同名（含同毫秒并发）只有一个成功，其余**明确报错、不覆盖**
+   - 按**原始字节**记录 `ledger.json` / `alerts.json` / `postmaster.config.json` 的 present/bytes/SHA-256 与当时的信封清单
    - **不要**依赖运行期内核每轮覆盖的 `ledger.json.bak`：它只是当轮安全副本，一次覆盖就没证据了
 2. **校验快照**：`node localpost/migrate.mjs verify --root C:/AI_ASSIST/.mailbox --snapshot runtime/snapshots/<目录>` → 必须 `ok: true`
+   - verify 先严格校验 manifest 结构（封闭 schema：空对象、缺字段、多字段、类型不符都判失败），再逐字节比对副本；没有 `manifest.json` 的目录是未完成的快照，verify 直接报错
 3. **保留六条历史记录摘要**：把第 2 节表格（或等价的 JSON 摘要）随快照一起归档，**不要**只留重建后的账本
-4. 停写：迁移期间不应有并发的 postmaster 轮次（快照与写回都受 `.mailbox-write.lock` 保护，但仍应确认）
+4. **停写（靠操作，不靠锁）**：`snapshot` 不持任何锁；`restore --apply` 只持 `.mailbox-write.lock`，它只与 `mailbox.mjs` 投递/回执/归档、`gc.mjs`、receiver 首次初始化互斥，
+   **不与内核轮次互斥**（内核持的是 `.postmaster.lock`，见 `postmaster.mjs` 的 `runOnce`），按 README 直接写文件的 agent 也不走任何锁。
+   → 快照与写回前必须先停掉内核计划任务，并确认没有 agent 正在投信
 
 ## 4. 重建本身（`--rebuild`）
 
@@ -56,12 +59,13 @@ dry-run 实测（新内核，只读）：
 
 1. `node localpost/migrate.mjs restore --root C:/AI_ASSIST/.mailbox --snapshot runtime/snapshots/<目录>` → 只预览
    （逐文件列出 `create / overwrite / unchanged`，**不写盘**）
-2. 确认预览符合预期后加 `--apply`；写回前会先自校验快照完整性，被改动过则拒绝恢复；写回持有 `.mailbox-write.lock`
+2. 确认预览符合预期后加 `--apply`；写回前会先过与 `verify` 相同的校验，manifest 或副本被改动过则拒绝恢复；
+   只写回通过校验的那份字节；写回持有 `.mailbox-write.lock`（不排斥内核轮次，见第 3 节第 4 条）
 3. 写回后工具会再做一次快照自校验；另外应对内核跑一次 `--dry-run`，确认告警集合与迁移前一致
 4. 恢复后再次运行 `verify`，并比对 `ledger.json` 的 SHA-256 是否等于第 1 节记录的迁移前值
 
 ## 6. 未做 / 未验证
 
 - 本任务未在生产执行 snapshot / rebuild / restore 中的任何一步（生产文件哈希未变）
-- 快照与恢复逻辑只在隔离测试（`localpost/migrate.test.mjs`，5 项）中验证过；未在生产信箱实跑过 `snapshot` 写盘
+- 快照与恢复逻辑只在隔离测试（`localpost/migrate.test.mjs`，8 项，含同名并发与 29 个 manifest 篡改子用例）中验证过；未在生产信箱实跑过 `snapshot` 写盘
 - 六条记录的「当时是否真的收到过回执」无法从现有证据判定，保持为未解决事项
