@@ -1,5 +1,10 @@
 # @dsh-external/dsh-localpost-postmaster
 
+2026-10-01 staged reliability/reception implementation is in `localpost/`.
+Run `node scripts/test.mjs`; integration and runtime gaps are documented in
+`docs/integration.md` and `docs/runtime-probe.md`. This branch does not deploy
+itself or enable model wakeup. The existing production-plugin description follows.
+
 LocalPost **局长外壳**（子项目②）：给已经写好的局长内核套一层 dsh 插件。
 
 内核（对账器）在 `C:/AI_ASSIST/.mailbox/postmaster.mjs`，本插件**不含任何业务逻辑**，只做三件事：

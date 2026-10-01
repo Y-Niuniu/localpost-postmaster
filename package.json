@@ -5,8 +5,12 @@
   "private": true,
   "type": "module",
   "main": "./lib/index.js",
+  "scripts": {
+    "test": "node scripts/test.mjs"
+  },
   "files": [
     "lib",
+    "localpost",
     "assets",
     "cordis.patch.yml",
     "README.md"

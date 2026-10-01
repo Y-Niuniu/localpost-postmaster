@@ -15,6 +15,7 @@ import { join } from 'node:path'
 const PLUGIN = new URL('../lib/index.js', import.meta.url).href
 const MAILBOX = process.env.LOCALPOST_MAILBOX || 'C:/AI_ASSIST/.mailbox'
 const KERNEL = join(MAILBOX, 'postmaster.mjs')
+const initialSourceLedger = existsSync(join(MAILBOX, 'ledger.json')) ? readFileSync(join(MAILBOX, 'ledger.json'), 'utf8') : null
 const TMP = join(tmpdir(), 'localpost-selftest')
 const FIXTURE = join(TMP, 'mailbox')
 
@@ -33,8 +34,8 @@ function envelope(id, budget, msAgo, extra) {
 }
 
 function writeEnvelope(name, env) {
-  mkdirSync(join(FIXTURE, 'agents', 'opencode', 'inbox'), { recursive: true })
-  writeFileSync(join(FIXTURE, 'agents', 'opencode', 'inbox', name), JSON.stringify(env, null, 2))
+  mkdirSync(join(FIXTURE, 'agents', env.to, 'inbox'), { recursive: true })
+  writeFileSync(join(FIXTURE, 'agents', env.to, 'inbox', name), JSON.stringify(env, null, 2))
 }
 
 /* ---- 假 ntfy 服务器：记录收到的推送 ---- */
@@ -158,7 +159,7 @@ check('坏信被判为告警并冒泡', pushed.length === 3 && pushed[2].message
 
 /* ---- 7b. 状态清理：告警消失（收到回执）后旧键必须被删掉 ---- */
 writeEnvelope('task-1.result.json', Object.assign(
-  envelope('task-1-result', 'standard', 60e3), { type: 'result', reply_to: 'task-1' }))
+  envelope('task-1.result', 'standard', 60e3), { type: 'result', reply_to: 'task-1', from: 'opencode', to: 'dsh', thread_id: 'th-task-1', outcome: 'completed' }))
 await intervalFn()
 await new Promise((r) => setTimeout(r, 300))
 check('告警消失后冷却键被清理（下次再超时会重新响）', stateOf()[K1] === undefined,
@@ -293,9 +294,8 @@ check('内核 DEFAULT_CONFIG 里没有"声明了没人读"的死键（scanInterv
   defBlock.replace(/\s+/g, ' ').slice(0, 76))
 
 /* ---- 12. 确认没碰内核的地盘 ---- */
-const ledger = (() => { try { return JSON.parse(readFileSync(join(MAILBOX, 'ledger.json'), 'utf8')) } catch { return null } })()
-check('内核 ledger.json 未被插件改写（唯一写者约束）', !!ledger && typeof ledger.envelopes === 'object',
-  '条目=' + (ledger ? Object.keys(ledger.envelopes).length : '账本不可读'))
+const finalSourceLedger = existsSync(join(MAILBOX, 'ledger.json')) ? readFileSync(join(MAILBOX, 'ledger.json'), 'utf8') : null
+check('插件只运行fixture内核，源目录ledger字节未改变', finalSourceLedger === initialSourceLedger)
 
 server.close()
 const failed = results.filter((r) => !r.ok)
