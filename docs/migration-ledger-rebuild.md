@@ -27,22 +27,44 @@
 
 （补充观察：`pilot-20260905-001` 的 `reply` 字段是 `null`，与其他 5 条不同；含义未确认，不作为结论。）
 
-## 3. 迁移前必须做的事（硬性前置）
+## 3. 迁移前必须做的事（硬性前置，**严格按顺序**）
 
-1. **独立、不可覆盖的迁移前快照**：`node localpost/migrate.mjs snapshot --root C:/AI_ASSIST/.mailbox --label pre-ledger-rebuild`
+顺序：**停所有写入口 → 等在途写入结束并确认 → snapshot → verify → 保存历史摘要 → dry-run / 迁移**。
+停写靠操作保证，锁只是第二道防线（见本节末）：`snapshot` 不持任何锁，锁对生产当前的旧内核也无效。
+
+1. **停掉所有写入口**（缺一个都不算停写）：
+
+   | 写入口 | 怎么停 |
+   |---|---|
+   | 内核计划任务 `LocalPostPostmaster` | `Disable-ScheduledTask -TaskName LocalPostPostmaster` |
+   | GC 计划任务 `LocalPostGC` | `Disable-ScheduledTask -TaskName LocalPostGC` |
+   | dsh 的 LocalPost 插件：启动后跑一轮、之后每 `intervalMinutes`（默认 15）分钟一轮，外加手动 `localpost_check`（`lib/index.js` 定时器段），在 dsh 进程内直接 import 内核跑 `runOnce` | **完全退出 dsh**（TUI / web / 桌面端）。插件由 profile bundles 自动装配，没有单独开关；**只停计划任务停不住它** |
+   | 投信 / 回执 / 归档的写者：各 agent 会话、`mailbox.mjs`，以及已部署的 receiver / MCP server | 结束或暂停所有 agent 会话，确认没有人正在投信 |
+
+2. **等在途写入结束，并确认已暂停**（停掉入口不会中断已经开始的轮次）：
+   - `Get-ScheduledTask -TaskName LocalPostPostmaster, LocalPostGC` → 两个都是 `Disabled`
+   - `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'postmaster|localpost-gc|gc\.mjs' }` → 无输出
+   - `C:/AI_ASSIST/.mailbox/` 下没有 `.postmaster.lock`、`.mailbox-write.lock`。如果有，说明还有轮次在跑，或者是上次异常退出留下的锁：
+     **先查清楚是哪一种，不要直接删**
+3. **独立、不可覆盖的迁移前快照**：`node localpost/migrate.mjs snapshot --root C:/AI_ASSIST/.mailbox --label pre-ledger-rebuild`
    - 目录名 = `runtime/snapshots/<UTC 时间戳>-<label>`，用排他 mkdir 原子创建：同名（含同毫秒并发）只有一个成功，其余**明确报错、不覆盖**
    - 按**原始字节**记录 `ledger.json` / `alerts.json` / `postmaster.config.json` 的 present/bytes/SHA-256 与当时的信封清单
+   - 快照不持锁，**多个文件是否属于同一时刻完全靠第 1–2 步保证**；它不是在线快照，不能在写入口开着时用
    - **不要**依赖运行期内核每轮覆盖的 `ledger.json.bak`：它只是当轮安全副本，一次覆盖就没证据了
-2. **校验快照**：`node localpost/migrate.mjs verify --root C:/AI_ASSIST/.mailbox --snapshot runtime/snapshots/<目录>` → 必须 `ok: true`
+4. **校验快照**：`node localpost/migrate.mjs verify --root C:/AI_ASSIST/.mailbox --snapshot runtime/snapshots/<目录>` → 必须 `ok: true`
    - verify 先严格校验 manifest 结构（封闭 schema：空对象、缺字段、多字段、类型不符都判失败），再逐字节比对副本；没有 `manifest.json` 的目录是未完成的快照，verify 直接报错
-3. **保留六条历史记录摘要**：把第 2 节表格（或等价的 JSON 摘要）随快照一起归档，**不要**只留重建后的账本
-4. **停写（以操作为准，锁只是第二道防线）**：
-   - `snapshot` 不持任何锁
-   - `restore --apply` 写回期间同时持 `.postmaster.lock`（与**新内核**轮次互斥：新内核 `runOnce` 持同名租约）和
-     `.mailbox-write.lock`（与 `mailbox.mjs` 投递/回执/归档、`gc.mjs`、receiver 首次初始化互斥）；任一被占即整体跳过（`skipped: true`，退出码 1）
-   - **锁对生产当前的旧内核无效**（2026-10-01 用旧内核副本实测）：旧内核把新租约里数字型的 `started_at` 解析成 NaN，
-     照常运行，并在结束时删掉 `.postmaster.lock`；按 README 直接写文件的 agent 也不走任何锁
-   → 快照与写回前**必须**先停掉内核计划任务，并确认没有 agent 正在投信
+   - verify 证明副本与 manifest 一致，**不证明**各文件属于同一时刻（那是第 1–2 步的责任）
+5. **保留六条历史记录摘要**：把第 2 节表格（或等价的 JSON 摘要）随快照一起归档，**不要**只留重建后的账本
+6. 进入第 4 节：先 `--dry-run` 核对，再 `--rebuild`
+
+**恢复写入口**（迁移或回滚完成后）：先 `Enable-ScheduledTask -TaskName LocalPostPostmaster, LocalPostGC`，**最后**再启动 dsh。
+插件会把已加载的内核模块缓存在 dsh 进程里（`lib/index.js` 的 `loadKernel`），换过内核文件之后，只有重新启动的 dsh 才会加载磁盘上的新版本。
+
+**锁的作用范围（第二道防线，不能代替停写）**：
+- `restore --apply` 写回期间同时持 `.postmaster.lock`（与**新内核**轮次互斥：新内核 `runOnce` 持同名租约）和
+  `.mailbox-write.lock`（与 `mailbox.mjs` 投递/回执/归档、`gc.mjs`、receiver 首次初始化互斥）；任一被占即整体跳过（`skipped: true`，退出码 1）
+- **锁对生产当前的旧内核无效**（2026-10-01 用旧内核副本实测）：旧内核把新租约里数字型的 `started_at` 解析成 NaN，
+  照常运行，并在结束时删掉 `.postmaster.lock`；旧内核自己的锁也是非排他的先读后写；按 README 直接写文件的 agent 不走任何锁
 
 ## 4. 重建本身（`--rebuild`）
 
@@ -67,8 +89,10 @@ dry-run 实测（新内核，只读）：
    只写回通过校验的那份字节；写回期间持 `.postmaster.lock` + `.mailbox-write.lock`，被占则跳过（退出码 1，可重试）
 3. 写回后工具会再做快照自校验与目标文件哈希校验，任一不符 → 结果 `ok: false`、退出码 1；
    另外应对内核跑一次 `--dry-run`，确认告警集合与迁移前一致
-4. 恢复后再次运行 `verify`，并比对 `ledger.json` 的 SHA-256 是否等于第 1 节记录的迁移前值
-5. 回滚顺序：先停计划任务 → 在**新内核文件仍在位**时 `restore --apply`（锁才对内核有效）→ 再换回旧内核文件 → 恢复计划任务
+4. 恢复后再次运行 `verify`，并比对 `ledger.json` 的 SHA-256 是否等于快照 manifest 里记录的迁移前值
+5. 回滚顺序：按第 3 节第 1–2 步停写并确认（两个计划任务 + 退出 dsh + 暂停投信，等在途轮次结束）
+   → 在**新内核文件仍在位**时 `restore --apply`（锁才对内核有效）→ 再换回旧内核文件
+   → 按第 3 节「恢复写入口」恢复（dsh **最后**启动，才会加载换回的旧内核）
 
 退出码约定（`migrate.mjs`）：0 = 成功；1 = verify 发现问题，或 restore 未完成（跳过 / 写回后校验不符）；2 = 报错或拒绝恢复。
 **判断成败以退出码为准**，不要只看是否有输出。
@@ -76,5 +100,6 @@ dry-run 实测（新内核，只读）：
 ## 6. 未做 / 未验证
 
 - 本任务未在生产执行 snapshot / rebuild / restore 中的任何一步（生产文件哈希未变）
+- 第 3 节停写清单里的命令（停/启计划任务、进程检查）未在生产执行过；计划任务名与启动脚本是 2026-10-01 只读查询所得
 - 快照与恢复逻辑只在隔离测试（`localpost/migrate.test.mjs`，12 项，含同名并发、29 个 manifest 篡改子用例、与新内核轮次的锁互斥、CLI 退出码）中验证过；未在生产信箱实跑过 `snapshot` 写盘
 - 六条记录的「当时是否真的收到过回执」无法从现有证据判定，保持为未解决事项

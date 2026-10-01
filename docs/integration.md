@@ -74,7 +74,7 @@ Malformed/abandoned recovery gates require explicit inspection, not blind remova
 |---|---|---|---|---|
 | A | 交付代码可接纳（`faed812` + 本轮修订） | 审计通过 | 无（仅分支） | 已审计通过，**本任务不执行合并** |
 | B | 协议更新：非终态回执不结束任务 / 读信不授予实施权限 | 草稿评审 | 无（草稿在仓库里） | 草稿见 `docs/protocol-needs-authorization-draft.md`，**未写入生产 README** |
-| C | 生产账本重建 | **先做不可覆盖快照并校验**，保留六条历史记录摘要 | 写生产 `ledger.json` | 方案与证据见 `docs/migration-ledger-rebuild.md`，**未执行** |
+| C | 生产账本重建 | **先停所有写入口并等在途轮次结束**，再做不可覆盖快照并校验，保留六条历史记录摘要 | 写生产 `ledger.json` | 方案与证据见 `docs/migration-ledger-rebuild.md`，**未执行** |
 | C+D | 账本迁移与内核部署**同批**执行（避免中间态） | 停写、备份、dry-run 一致 | 生产内核 | **未执行** |
 | D | 可靠性模块升级（watcher/队列/修复/锁/保留），**派发保持禁用** | 配套文件齐全、配置保留、可回滚 | 生产内核 | 可先于 E 进行；本次未执行 |
 | E | 真机验收：焦点绑定、整轮调度、关闭保留、重复事件、丢确认 | 隔离测试会话 | 无（只验收） | 清单见 `docs/live-acceptance.md`，**全部未运行** |
@@ -84,6 +84,8 @@ Malformed/abandoned recovery gates require explicit inspection, not blind remova
 
 - 随内核一起部署的配套文件：`fs-safe.mjs`、`mailbox.mjs`、`mcp-server.mjs`、`receiver.mjs` / `receiver-cli.mjs`、`gc.mjs` + `localpost-gc.ps1`（`gc.mjs` 的 `--apply` 语义与旧计划任务不同，见下）
 - **配置保留**：`postmaster.config.json` 原样沿用（含私人 ntfy topic / toast 开关），新内核不得改动 notify 段
-- **回滚**：迁移前快照（`migrate.mjs`）+ 内核文件备份；回滚 = 停计划任务 → 新内核文件仍在位时 `restore --apply`
-  （其 `.postmaster.lock` 只对新内核有效，旧内核不认）→ 换回旧内核文件；以 `migrate.mjs` 退出码判断成败（见 `migration-ledger-rebuild.md` 第 5 节）
+- **回滚**：迁移前快照（`migrate.mjs`）+ 内核文件备份；回滚 = 按 `migration-ledger-rebuild.md` 第 3 节停写
+  （两个计划任务 + 退出 dsh + 暂停投信，并等在途轮次结束）→ 新内核文件仍在位时 `restore --apply`
+  （其 `.postmaster.lock` 只对新内核有效，旧内核不认）→ 换回旧内核文件 → 恢复写入口，dsh 最后启动
+  （插件在进程内缓存内核模块）；以 `migrate.mjs` 退出码判断成败（见 `migration-ledger-rebuild.md` 第 5 节）
 - 旧计划任务若不带 `--apply`，升级后行为从「删除」变为「只预览」——这是**有意的安全变化**，需在迁移时一并确认计划任务参数
