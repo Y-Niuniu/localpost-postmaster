@@ -4,12 +4,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { createMailbox } from './mailbox.mjs';
+import { removeTreeSync } from './temp-tree.mjs';
 
 const tempRoot = path.resolve(import.meta.dirname, '../.localpost-tmp/mailbox');
 function fixture(t, identity) {
   fs.mkdirSync(tempRoot, { recursive: true });
   const root = fs.mkdtempSync(path.join(tempRoot, 'case-'));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeTreeSync(root));
   return { root, mail: createMailbox({ root, identity }) };
 }
 const letter = (extra = {}) => ({

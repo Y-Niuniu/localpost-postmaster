@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { acquireLease, assertId, safePath, atomicWrite } from './fs-safe.mjs';
+import { removeTree } from './temp-tree.mjs';
 
 test('exclusive lease has exactly one concurrent owner', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'localpost-lock-'));
@@ -14,7 +15,7 @@ test('exclusive lease has exactly one concurrent owner', async () => {
     const next = await acquireLease(root);
     assert.equal(next.acquired, true);
     await next.release();
-  } finally { await fs.rm(root, { recursive: true, force: true }); }
+  } finally { await removeTree(root); }
 });
 
 test('release cannot remove a replaced owner, and live old locks are not stolen', async () => {
@@ -25,7 +26,7 @@ test('release cannot remove a replaced owner, and live old locks are not stolen'
     await fs.writeFile(path.join(root, '.postmaster.lock'), JSON.stringify({ token: 'replacement', pid: process.pid, started_at: 1 }));
     await lease.release();
     assert.equal(JSON.parse(await fs.readFile(path.join(root, '.postmaster.lock'))).token, 'replacement');
-  } finally { await fs.rm(root, { recursive: true, force: true }); }
+  } finally { await removeTree(root); }
 });
 
 test('paths reject traversal and linked escapes; writes use no shared temporary', async () => {
@@ -41,8 +42,8 @@ test('paths reject traversal and linked escapes; writes use no shared temporary'
     assert.ok(Number.isInteger(JSON.parse(await fs.readFile(target, 'utf8')).i));
     assert.deepEqual(await fs.readdir(path.dirname(target)), ['x.json']);
   } finally {
-    await fs.rm(root, { recursive: true, force: true });
-    await fs.rm(outside, { recursive: true, force: true });
+    await removeTree(root);
+    await removeTree(outside);
   }
 });
 
@@ -58,5 +59,5 @@ test('stale dead ISO owner is recovered once, unknown owner is retained', async 
     assert.equal(unknown.acquired, false);
     assert.match(unknown.reason, /reconcile/);
     assert.equal(await fs.readFile(path.join(root, '.postmaster.lock'), 'utf8'), '{bad');
-  } finally { await fs.rm(root, { recursive: true, force: true }); }
+  } finally { await removeTree(root); }
 });

@@ -5,6 +5,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { createReceiver } from './receiver.mjs';
 import { createMailbox } from './mailbox.mjs';
+import { removeTree } from './temp-tree.mjs';
 
 const letter = (id, extra = {}) => ({ id, thread_id: id, from: 'dsh', to: 'codex', type: 'task', subject: 'test', body: 'Analyze only', budget: 'standard', created_at: new Date().toISOString(), ...extra });
 test('legacy backlog stays untouched; new mail queues without a client or route', async () => {
@@ -21,7 +22,7 @@ test('legacy backlog stays untouched; new mail queues without a client or route'
     assert.equal(state.entries.new.state, 'unbound');
     assert.equal(mailbox.inbox('dsh').length, 0);
     assert.ok(await fs.stat(path.join(root, 'agents/codex/inbox/old.json')));
-  } finally { await fs.rm(root, { recursive: true, force: true }); }
+  } finally { await removeTree(root); }
 });
 
 test('uncertain runtime acceptance is never blindly retried and untrusted sender is blocked', async () => {
@@ -42,7 +43,7 @@ test('uncertain runtime acceptance is never blindly retried and untrusted sender
     assert.equal(state.entries.denied.state, 'denied');
     assert.equal(calls, 1);
     assert.equal((await fs.readFile(path.join(root, 'runtime/queues/codex.json'), 'utf8')).includes('Analyze only'), false);
-  } finally { await fs.rm(root, { recursive: true, force: true }); }
+  } finally { await removeTree(root); }
 });
 
 test('periodic scan discovers mail even if watch hints are missed and result does not cause automatic reply', async () => {
@@ -59,7 +60,7 @@ test('periodic scan discovers mail even if watch hints are missed and result doe
     }
     assert.equal(found?.state, 'unbound');
     assert.equal((await fs.readdir(path.join(root, 'agents'))).includes('dsh'), false);
-  } finally { await receiver.stop(); await fs.rm(root, { recursive: true, force: true }); }
+  } finally { await receiver.stop(); await removeTree(root); }
 });
 
 test('crash after runtime processed and archived is reconciled only by explicit result', async () => {
@@ -77,7 +78,7 @@ test('crash after runtime processed and archived is reconciled only by explicit 
     await createMailbox({ root, identity: 'codex' }).reply('codex', { reply_to: 'crash', body: 'complete', outcome: 'completed' });
     await createReceiver(options).scan();
     assert.equal((await receiver.snapshot()).entries.crash.state, 'completed');
-  } finally { await fs.rm(root, { recursive: true, force: true }); }
+  } finally { await removeTree(root); }
 });
 
 test('prototype property identifiers survive persisted queue roundtrips', async () => {
@@ -89,7 +90,7 @@ test('prototype property identifiers survive persisted queue roundtrips', async 
     await receiver.scan(); await createReceiver(options).scan();
     const state = await receiver.snapshot();
     for (const id of ['constructor', 'toString']) { assert.equal(Object.hasOwn(state.entries, id), true); assert.equal(state.entries[id].state, 'unbound'); }
-  } finally { await fs.rm(root, { recursive: true, force: true }); }
+  } finally { await removeTree(root); }
 });
 
 test('one corrupt publication record cannot block other queued letters', async () => {
@@ -106,7 +107,7 @@ test('one corrupt publication record cannot block other queued letters', async (
     assert.equal(state.entries['a-bad'].state, 'needs_reconcile');
     assert.equal(state.entries['b-good'].state, 'queued');
     assert.ok(state.errors.some(x => x.file === 'runtime/routes/a-bad.json'));
-  } finally { await fs.rm(root, { recursive: true, force: true }); }
+  } finally { await removeTree(root); }
 });
 
 test('sender permission revoked before dispatch also applies to persisted queued mail', async () => {
@@ -121,7 +122,7 @@ test('sender permission revoked before dispatch also applies to persisted queued
     await createReceiver({ ...options, allowFrom: [], adapter }).scan();
     assert.equal(dispatched, false);
     assert.equal((await receiver.snapshot()).entries.revoke.state, 'denied');
-  } finally { await fs.rm(root, { recursive: true, force: true }); }
+  } finally { await removeTree(root); }
 });
 
 test('one unavailable runtime target stays queued without blocking another target', async () => {
@@ -140,7 +141,7 @@ test('one unavailable runtime target stays queued without blocking another targe
     await createReceiver({ ...options, adapter }).scan();
     assert.deepEqual(accepted, ['b-live']);
     assert.equal((await receiver.snapshot()).entries['a-offline'].state, 'queued');
-  } finally { await fs.rm(root, { recursive: true, force: true }); }
+  } finally { await removeTree(root); }
 });
 
 test('publication binds A, closed client queues, restart never resubmits accepted mail', async () => {
@@ -178,5 +179,5 @@ test('publication binds A, closed client queues, restart never resubmits accepte
     await receiver.scan();
     assert.equal((await receiver.snapshot()).entries.queued.state, 'completed');
     assert.equal(calls.length, 1);
-  } finally { await fs.rm(root, { recursive: true, force: true }); }
+  } finally { await removeTree(root); }
 });
