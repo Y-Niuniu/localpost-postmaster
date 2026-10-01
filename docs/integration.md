@@ -64,3 +64,25 @@ Path checks catch ordinary traversal/junction escapes and receiver root changes;
 they are not an OS-level defense against a malicious local process replacing
 directories between validation and I/O. Trusted root ACLs remain necessary.
 Malformed/abandoned recovery gates require explicit inspection, not blind removal.
+
+## 修订后的集成顺序（2026-10-01，按 codex 审核意见调整）
+
+先前把 A–E 并列其实不准确：**派发禁用**与**派发启用**是两条不同的门槛。
+可靠性升级不需要等真机验收，而**启用自动派发**必须先过验收。
+
+| 序 | 动作 | 前置 | 生产影响 | 现状 |
+|---|---|---|---|---|
+| A | 交付代码可接纳（`faed812` + 本轮修订） | 审计通过 | 无（仅分支） | 已审计通过，**本任务不执行合并** |
+| B | 协议更新：非终态回执不结束任务 / 读信不授予实施权限 | 草稿评审 | 无（草稿在仓库里） | 草稿见 `docs/protocol-needs-authorization-draft.md`，**未写入生产 README** |
+| C | 生产账本重建 | **先做不可覆盖快照并校验**，保留六条历史记录摘要 | 写生产 `ledger.json` | 方案与证据见 `docs/migration-ledger-rebuild.md`，**未执行** |
+| C+D | 账本迁移与内核部署**同批**执行（避免中间态） | 停写、备份、dry-run 一致 | 生产内核 | **未执行** |
+| D | 可靠性模块升级（watcher/队列/修复/锁/保留），**派发保持禁用** | 配套文件齐全、配置保留、可回滚 | 生产内核 | 可先于 E 进行；本次未执行 |
+| E | 真机验收：焦点绑定、整轮调度、关闭保留、重复事件、丢确认 | 隔离测试会话 | 无（只验收） | 清单见 `docs/live-acceptance.md`，**全部未运行** |
+| 末 | **启用自动派发** | E 全部通过 | 会真实唤醒模型 | 未启用，适配器仍 disabled |
+
+### D 的配套检查（升级时逐项核对）
+
+- 随内核一起部署的配套文件：`fs-safe.mjs`、`mailbox.mjs`、`mcp-server.mjs`、`receiver.mjs` / `receiver-cli.mjs`、`gc.mjs` + `localpost-gc.ps1`（`gc.mjs` 的 `--apply` 语义与旧计划任务不同，见下）
+- **配置保留**：`postmaster.config.json` 原样沿用（含私人 ntfy topic / toast 开关），新内核不得改动 notify 段
+- **回滚**：迁移前快照（`migrate.mjs`）+ 内核文件备份；回滚 = `restore --apply` + 换回旧内核文件
+- 旧计划任务若不带 `--apply`，升级后行为从「删除」变为「只预览」——这是**有意的安全变化**，需在迁移时一并确认计划任务参数
