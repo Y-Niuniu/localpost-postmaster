@@ -8,7 +8,7 @@ import assert from 'node:assert/strict'
 import { promises as fsp } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { runOnce, reconcile, readAlerts, loadConfig, validateEnvelope, KERNEL_VERSION } from './postmaster.mjs'
+import { runOnce, reconcile, readAlerts, loadConfig, validateEnvelope, isTerminalResult, KERNEL_VERSION } from './postmaster.mjs'
 
 async function makeRoot() {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'localpost-test-'))
@@ -296,6 +296,20 @@ test('等待授权回复不结束任务，完成结果优先于较新的等待�
   const done = reconcileItems([task, completed, waiting])
   assert.equal(done.ledger.envelopes[task.id].status, 'replied')
   assert.equal(done.ledger.envelopes[task.id].reply_envelope, completed.id)
+})
+
+test('等待授权只认信封顶层 outcome：正文写「需要授权」但缺 outcome 仍是终态', () => {
+  const task = env({ created_at: minutesAgo(500) })
+  const bodyOnly = resultOf(task.id, { body: '需要用户授权才能继续' })
+  assert.equal(isTerminalResult(bodyOnly), true)
+  const closed = reconcileItems([task, bodyOnly]).ledger.envelopes[task.id]
+  assert.equal(closed.status, 'replied')
+  assert.equal(closed.outcome, 'completed')
+  const flagged = resultOf(task.id, { id: 'task-1.result.auth-1', body: '需要用户授权才能继续', outcome: 'needs_authorization' })
+  assert.equal(isTerminalResult(flagged), false)
+  assert.equal(reconcileItems([task, flagged]).ledger.envelopes[task.id].status, 'awaiting_authorization')
+  for (const outcome of ['completed', 'failed', 'rejected', 'cancelled']) assert.equal(isTerminalResult(resultOf(task.id, { outcome })), true)
+  assert.equal(validateEnvelope(resultOf(task.id, { outcome: '需要授权' })).ok, false)
 })
 
 test('同 ID 相同信封只计一次，不同正文隔离并明确告警', () => {

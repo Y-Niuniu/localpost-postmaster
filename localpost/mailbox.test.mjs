@@ -83,6 +83,15 @@ test('authorization replies stay pending; terminal reply retries repair archive 
   await assert.rejects(mail.reply('codex', { ...reply, body: 'changed result' }), /conflict|冲突/i);
 });
 
+test('reply outcome comes only from the explicit field; body wording never makes it nonterminal', async t => {
+  const { mail } = fixture(t);
+  await mail.deliver(letter());
+  const reply = await mail.reply('codex', { reply_to: 'task-one', body: '需要用户授权才能继续' });
+  assert.equal(reply.outcome, 'completed');
+  assert.equal(mail.read('dsh', 'task-one.result').envelope.outcome, 'completed');
+  assert.equal(mail.inbox('codex').length, 0);
+});
+
 test('generated IDs are UUIDs and send retries preserve generated timestamps', async t => {
   const { mail } = fixture(t);
   const minimal = { from: 'dsh', to: 'codex', type: 'task', subject: 'Inspect', body: 'Read only' };
