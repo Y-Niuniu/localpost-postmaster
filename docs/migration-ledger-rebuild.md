@@ -36,9 +36,13 @@
 2. **校验快照**：`node localpost/migrate.mjs verify --root C:/AI_ASSIST/.mailbox --snapshot runtime/snapshots/<目录>` → 必须 `ok: true`
    - verify 先严格校验 manifest 结构（封闭 schema：空对象、缺字段、多字段、类型不符都判失败），再逐字节比对副本；没有 `manifest.json` 的目录是未完成的快照，verify 直接报错
 3. **保留六条历史记录摘要**：把第 2 节表格（或等价的 JSON 摘要）随快照一起归档，**不要**只留重建后的账本
-4. **停写（靠操作，不靠锁）**：`snapshot` 不持任何锁；`restore --apply` 只持 `.mailbox-write.lock`，它只与 `mailbox.mjs` 投递/回执/归档、`gc.mjs`、receiver 首次初始化互斥，
-   **不与内核轮次互斥**（内核持的是 `.postmaster.lock`，见 `postmaster.mjs` 的 `runOnce`），按 README 直接写文件的 agent 也不走任何锁。
-   → 快照与写回前必须先停掉内核计划任务，并确认没有 agent 正在投信
+4. **停写（以操作为准，锁只是第二道防线）**：
+   - `snapshot` 不持任何锁
+   - `restore --apply` 写回期间同时持 `.postmaster.lock`（与**新内核**轮次互斥：新内核 `runOnce` 持同名租约）和
+     `.mailbox-write.lock`（与 `mailbox.mjs` 投递/回执/归档、`gc.mjs`、receiver 首次初始化互斥）；任一被占即整体跳过（`skipped: true`，退出码 1）
+   - **锁对生产当前的旧内核无效**（2026-10-01 用旧内核副本实测）：旧内核把新租约里数字型的 `started_at` 解析成 NaN，
+     照常运行，并在结束时删掉 `.postmaster.lock`；按 README 直接写文件的 agent 也不走任何锁
+   → 快照与写回前**必须**先停掉内核计划任务，并确认没有 agent 正在投信
 
 ## 4. 重建本身（`--rebuild`）
 
@@ -59,13 +63,18 @@ dry-run 实测（新内核，只读）：
 
 1. `node localpost/migrate.mjs restore --root C:/AI_ASSIST/.mailbox --snapshot runtime/snapshots/<目录>` → 只预览
    （逐文件列出 `create / overwrite / unchanged`，**不写盘**）
-2. 确认预览符合预期后加 `--apply`；写回前会先过与 `verify` 相同的校验，manifest 或副本被改动过则拒绝恢复；
-   只写回通过校验的那份字节；写回持有 `.mailbox-write.lock`（不排斥内核轮次，见第 3 节第 4 条）
-3. 写回后工具会再做一次快照自校验；另外应对内核跑一次 `--dry-run`，确认告警集合与迁移前一致
+2. 确认预览符合预期后加 `--apply`；写回前会先过与 `verify` 相同的校验，manifest 或副本被改动过则拒绝恢复（退出码 2）；
+   只写回通过校验的那份字节；写回期间持 `.postmaster.lock` + `.mailbox-write.lock`，被占则跳过（退出码 1，可重试）
+3. 写回后工具会再做快照自校验与目标文件哈希校验，任一不符 → 结果 `ok: false`、退出码 1；
+   另外应对内核跑一次 `--dry-run`，确认告警集合与迁移前一致
 4. 恢复后再次运行 `verify`，并比对 `ledger.json` 的 SHA-256 是否等于第 1 节记录的迁移前值
+5. 回滚顺序：先停计划任务 → 在**新内核文件仍在位**时 `restore --apply`（锁才对内核有效）→ 再换回旧内核文件 → 恢复计划任务
+
+退出码约定（`migrate.mjs`）：0 = 成功；1 = verify 发现问题，或 restore 未完成（跳过 / 写回后校验不符）；2 = 报错或拒绝恢复。
+**判断成败以退出码为准**，不要只看是否有输出。
 
 ## 6. 未做 / 未验证
 
 - 本任务未在生产执行 snapshot / rebuild / restore 中的任何一步（生产文件哈希未变）
-- 快照与恢复逻辑只在隔离测试（`localpost/migrate.test.mjs`，8 项，含同名并发与 29 个 manifest 篡改子用例）中验证过；未在生产信箱实跑过 `snapshot` 写盘
+- 快照与恢复逻辑只在隔离测试（`localpost/migrate.test.mjs`，12 项，含同名并发、29 个 manifest 篡改子用例、与新内核轮次的锁互斥、CLI 退出码）中验证过；未在生产信箱实跑过 `snapshot` 写盘
 - 六条记录的「当时是否真的收到过回执」无法从现有证据判定，保持为未解决事项

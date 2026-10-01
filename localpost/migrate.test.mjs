@@ -4,7 +4,10 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { createSnapshot, listSnapshots, verifySnapshot, restoreSnapshot, SNAPSHOT_SCHEMA } from './migrate.mjs';
+import { runOnce } from './postmaster.mjs';
 import { removeTree } from './temp-tree.mjs';
 
 async function fixture() {
@@ -15,6 +18,11 @@ async function fixture() {
   await fs.writeFile(path.join(root, 'agents/dsh/inbox/task-1.json'), '{ "id": "task-1" }\n');
   return root;
 }
+
+// 模拟另一个活着的持锁者（owner pid = 本测试进程，所以不会被当成陈旧锁回收）。
+const holdLock = (root, name) => fs.writeFile(path.join(root, name), JSON.stringify({ token: 'other', pid: process.pid, started_at: Date.now() }));
+const MIGRATE = fileURLToPath(new URL('./migrate.mjs', import.meta.url));
+const cli = (script, ...args) => spawnSync(process.execPath, [script, ...args], { encoding: 'utf8' });
 
 test('迁移快照名独立且不可覆盖：同标签同毫秒第二次直接拒绝', async () => {
   const root = await fixture();
@@ -83,9 +91,11 @@ test('restore 默认只预览不写盘，apply 才写回，被篡改的快照拒
     await fs.writeFile(path.join(root, 'ledger.json'), '{ "schema": "changed" }\n');
     const preview = await restoreSnapshot({ root, snapshot: snap.path });
     assert.equal(preview.dry_run, true);
+    assert.equal(preview.ok, true);
     assert.ok(preview.plan.some((p) => p.name === 'ledger.json' && p.action === 'overwrite'));
     assert.equal(await fs.readFile(path.join(root, 'ledger.json'), 'utf8'), '{ "schema": "changed" }\n');
     const applied = await restoreSnapshot({ root, snapshot: snap.path, apply: true });
+    assert.equal(applied.ok, true);
     assert.deepEqual(applied.restored.slice().sort(), ['alerts.json', 'ledger.json']);
     assert.equal(applied.after.ok, true);
     assert.deepEqual(applied.targetVerified, { ok: true, checked: 2, mismatches: [] });
@@ -174,9 +184,92 @@ test('恢复持有信箱写锁：已有新鲜锁时跳过而不是硬写', async
   const root = await fixture();
   try {
     const snap = await createSnapshot({ root });
-    await fs.writeFile(path.join(root, '.mailbox-write.lock'), JSON.stringify({ token: 'other', pid: process.pid, started_at: Date.now() }));
+    await holdLock(root, '.mailbox-write.lock');
     const result = await restoreSnapshot({ root, snapshot: snap.path, apply: true });
     assert.equal(result.skipped, true);
     assert.deepEqual(result.restored, []);
+    assert.deepEqual({ ok: result.ok, lock: result.lock }, { ok: false, lock: '.mailbox-write.lock' });
+    await assert.rejects(fs.access(path.join(root, '.postmaster.lock')), { code: 'ENOENT' }); // 已取得的内核锁要放掉
+  } finally { await removeTree(root); }
+});
+
+test('恢复与内核轮次互斥：内核持锁时 restore 整体跳过，不写目标、不留半截锁', async () => {
+  const root = await fixture();
+  try {
+    const snap = await createSnapshot({ root });
+    await fs.writeFile(path.join(root, 'ledger.json'), '{ "schema": "changed" }\n');
+    await holdLock(root, '.postmaster.lock');
+    const result = await restoreSnapshot({ root, snapshot: snap.path, apply: true });
+    assert.deepEqual({ ok: result.ok, skipped: result.skipped, lock: result.lock, restored: result.restored },
+      { ok: false, skipped: true, lock: '.postmaster.lock', restored: [] });
+    assert.equal(await fs.readFile(path.join(root, 'ledger.json'), 'utf8'), '{ "schema": "changed" }\n');
+    await assert.rejects(fs.access(path.join(root, '.mailbox-write.lock')), { code: 'ENOENT' });
+  } finally { await removeTree(root); }
+});
+
+test('写回期间内核轮次被挡在门外：restore 持锁时 runOnce 跳过，写回完成后内核照常运行', { timeout: 10000 }, async (t) => {
+  const root = await fixture();
+  try {
+    const snap = await createSnapshot({ root });
+    await fs.writeFile(path.join(root, 'ledger.json'), '{ "schema": "changed" }\n');
+    // 只在 restore 第一次写回 ledger.json 时停住，确认此时内核轮次拿不到锁；
+    // 之后的写入（包括没被挡住的内核轮次）直接放行，失败时干净地断言失败而不是互相死等。
+    const rename = fs.rename;
+    let reached; const atWrite = new Promise((resolve) => { reached = resolve; });
+    let release; const gate = new Promise((resolve) => { release = resolve; });
+    let gated = false;
+    t.mock.method(fs, 'rename', async (from, to) => {
+      if (!gated && path.resolve(to) === path.resolve(root, 'ledger.json')) { gated = true; reached(); await gate; }
+      return rename(from, to);
+    });
+    const restoring = restoreSnapshot({ root, snapshot: snap.path, apply: true });
+    let during;
+    try {
+      await Promise.race([atWrite, restoring.then(() => { throw new Error('restore finished without reaching the write'); })]);
+      during = await runOnce({ root });
+    } finally { release(); }
+    const restored = await restoring;
+    assert.equal(during.skipped, true);
+    assert.equal(restored.ok, true);
+    assert.deepEqual(restored.targetVerified, { ok: true, checked: 2, mismatches: [] });
+    assert.equal((await runOnce({ root })).skipped, false);
+  } finally { await removeTree(root); }
+});
+
+test('绕过锁的写者在写回后改动目标：targetVerified 与顶层 ok 都为 false', async (t) => {
+  const root = await fixture();
+  try {
+    const snap = await createSnapshot({ root });
+    const rename = fs.rename;
+    t.mock.method(fs, 'rename', async (from, to) => {
+      await rename(from, to);
+      if (path.resolve(to) === path.resolve(root, 'ledger.json')) await fs.writeFile(to, '{ "intruder": true }\n');
+    });
+    const result = await restoreSnapshot({ root, snapshot: snap.path, apply: true });
+    assert.equal(result.ok, false);
+    assert.deepEqual(result.targetVerified, { ok: false, checked: 2, mismatches: ['ledger.json'] });
+    assert.equal(result.after.ok, true);
+  } finally { await removeTree(root); }
+});
+
+test('CLI 退出码如实反映结果：被锁跳过 → 1，成功 → 0；路径含空格与中文时照常执行', async () => {
+  const root = await fixture();
+  try {
+    const snap = await createSnapshot({ root });
+    await holdLock(root, '.postmaster.lock');
+    const busy = cli(MIGRATE, 'restore', '--root', root, '--snapshot', snap.path, '--apply');
+    assert.equal(busy.status, 1);
+    assert.equal(JSON.parse(busy.stdout).skipped, true);
+    await fs.rm(path.join(root, '.postmaster.lock'));
+    const done = cli(MIGRATE, 'restore', '--root', root, '--snapshot', snap.path, '--apply');
+    assert.equal(done.status, 0);
+    assert.equal(JSON.parse(done.stdout).ok, true);
+    // 入口判断若按 URL pathname 比对，这个路径会被百分号编码 → CLI 静默不执行、退出码 0。
+    const odd = path.join(root, '含 空格');
+    await fs.mkdir(odd);
+    for (const file of ['migrate.mjs', 'fs-safe.mjs']) await fs.copyFile(fileURLToPath(new URL('./' + file, import.meta.url)), path.join(odd, file));
+    const missing = cli(path.join(odd, 'migrate.mjs'), 'verify', '--root', root, '--snapshot', 'runtime/snapshots/nope');
+    assert.equal(missing.status, 2);
+    assert.match(missing.stderr, /missing or unreadable/);
   } finally { await removeTree(root); }
 });

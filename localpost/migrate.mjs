@@ -16,11 +16,16 @@
  *   同名（含同毫秒并发）只有一个调用成功，其余明确报错，**绝不覆盖**。
  * - manifest.json 按**原始字节**记录每个受管文件的 present/bytes/SHA-256 与当时的信封清单（含逐封 SHA-256）。
  * - verify 先严格校验 manifest 结构（封闭 schema：缺字段、多字段、类型不符都算失败），再逐字节校验副本。
- * - restore 默认只预览；--apply 才写回，写前先过同一套校验，失败则拒绝；只写回已校验过的那份字节。
+ * - restore 默认只预览；--apply 才写回，写前先过同一套校验，失败则拒绝；只写回已校验过的那份字节；
+ *   写回期间持 .postmaster.lock + .mailbox-write.lock，任一被占即跳过。
+ *
+ * 退出码：0 = 成功；1 = verify 发现问题，或 restore 未完成（锁被占而跳过 / 写回后校验不符，结果 ok=false）；
+ *         2 = 报错（用法错误、manifest 不可读、完整性校验不过而拒绝恢复等）。
  */
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import { acquireLease, atomicWrite, safePath } from './fs-safe.mjs';
 
 export const SNAPSHOT_SCHEMA = 'localpost-migration-snapshot-v1';
@@ -197,7 +202,13 @@ export async function verifySnapshot({ root, snapshot } = {}) {
   return summarize(snapshot, await inspectSnapshot(path.resolve(root), snapshot));
 }
 
-// 默认预览；apply 才写回。写回前必须通过与 verify 相同的校验，且整个写回持有信箱写锁。
+// 默认预览；apply 才写回。写回前必须通过与 verify 相同的校验；整个写回期间同时持有：
+// - .postmaster.lock：内核 runOnce 持同名租约 → 写回与内核轮次互斥（只对用 acquireLease 的新内核成立）
+// - .mailbox-write.lock：与 mailbox.mjs 投递/回执/归档、gc.mjs、receiver 首次初始化互斥
+// 租约不阻塞：任一被占即整体跳过（已取得的逆序释放），不会死锁。
+// 结果带顶层 ok：跳过、或写回后任一校验不符 → ok=false（CLI 据此返回退出码 1，不再报成功）。
+const RESTORE_LOCKS = ['.postmaster.lock', '.mailbox-write.lock'];
+
 export async function restoreSnapshot({ root, snapshot, apply = false, now = Date.now() } = {}) {
   if (!root || !snapshot) throw new Error('restore requires root and snapshot');
   root = path.resolve(root);
@@ -211,11 +222,15 @@ export async function restoreSnapshot({ root, snapshot, apply = false, now = Dat
     const current = await readBytes(safePath(root, entry.name));
     plan.push({ name: entry.name, action: current === null ? 'create' : current.equals(copies.get(entry.name)) ? 'unchanged' : 'overwrite', sha256: entry.sha256 });
   }
-  const result = { dry_run: !apply, path: snapshot, verified, plan, restored: [] };
+  const result = { ok: true, dry_run: !apply, path: snapshot, verified, plan, restored: [] };
   if (!apply) return result;
-  const lease = await acquireLease(root, { name: '.mailbox-write.lock', now: Number(now) });
-  if (!lease.acquired) return { ...result, skipped: true, reason: lease.reason };
+  const leases = [];
   try {
+    for (const name of RESTORE_LOCKS) {
+      const lease = await acquireLease(root, { name, now: Number(now) });
+      if (!lease.acquired) return { ...result, ok: false, skipped: true, lock: name, reason: lease.reason };
+      leases.push(lease);
+    }
     const kept = manifest.managed.filter((entry) => entry.present);
     for (const entry of kept) {
       await atomicWrite(safePath(root, entry.name), copies.get(entry.name));
@@ -229,11 +244,16 @@ export async function restoreSnapshot({ root, snapshot, apply = false, now = Dat
       if (bytes === null || sha256(bytes) !== entry.sha256) mismatches.push(entry.name);
     }
     result.targetVerified = { ok: mismatches.length === 0, checked: kept.length, mismatches };
+    result.ok = result.after.ok && result.targetVerified.ok;
     return result;
-  } finally { await lease.release(); }
+  } finally {
+    for (const lease of leases.reverse()) await lease.release();
+  }
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'))) {
+// 用 fileURLToPath 判断是否被直接执行：import.meta.url 的 pathname 是百分号编码的，
+// 路径含空格或中文时与 argv[1] 永远不等 → CLI 什么都不做却以 0 退出（等于静默报成功）。
+if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))) {
   const args = process.argv.slice(2);
   const value = (name) => { const i = args.indexOf(name); return i < 0 ? undefined : args[i + 1]; };
   const root = value('--root');

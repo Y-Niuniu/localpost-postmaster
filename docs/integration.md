@@ -84,5 +84,6 @@ Malformed/abandoned recovery gates require explicit inspection, not blind remova
 
 - 随内核一起部署的配套文件：`fs-safe.mjs`、`mailbox.mjs`、`mcp-server.mjs`、`receiver.mjs` / `receiver-cli.mjs`、`gc.mjs` + `localpost-gc.ps1`（`gc.mjs` 的 `--apply` 语义与旧计划任务不同，见下）
 - **配置保留**：`postmaster.config.json` 原样沿用（含私人 ntfy topic / toast 开关），新内核不得改动 notify 段
-- **回滚**：迁移前快照（`migrate.mjs`）+ 内核文件备份；回滚 = `restore --apply` + 换回旧内核文件
+- **回滚**：迁移前快照（`migrate.mjs`）+ 内核文件备份；回滚 = 停计划任务 → 新内核文件仍在位时 `restore --apply`
+  （其 `.postmaster.lock` 只对新内核有效，旧内核不认）→ 换回旧内核文件；以 `migrate.mjs` 退出码判断成败（见 `migration-ledger-rebuild.md` 第 5 节）
 - 旧计划任务若不带 `--apply`，升级后行为从「删除」变为「只预览」——这是**有意的安全变化**，需在迁移时一并确认计划任务参数
