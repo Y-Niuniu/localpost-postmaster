@@ -111,3 +111,18 @@ test('dry-run 列出归档删除后才成为孤儿的附件，与实际清理计
   assert.ok(preview.candidates.includes('attachments/done.txt'))
   assert.equal(await exists(attachment), true)
 })
+
+test('多份有效终态回执按最新完成时间保留整组归档', async () => {
+  const root = await fixture()
+  const task = await put(root, 'agents/b/archive/done.json', envelope('done', { attachments: ['done.txt'] }))
+  const older = await put(root, 'agents/a/archive/done.result-old.json', envelope('done.result-old',
+    { type: 'result', reply_to: 'done', from: 'b', to: 'a', outcome: 'completed' }))
+  const newer = await put(root, 'agents/a/archive/done.result-new.json', envelope('done.result-new',
+    { type: 'result', reply_to: 'done', from: 'b', to: 'a', outcome: 'completed', created_at: new Date(now).toISOString() }))
+  const attachment = await put(root, 'attachments/done.txt', 'done')
+  const preview = await runGc({ root, now })
+  assert.deepEqual(preview.candidates, [])
+  const applied = await runGc({ root, now, dryRun: false })
+  assert.deepEqual(applied.deleted, [])
+  for (const file of [task, older, newer, attachment]) assert.equal(await exists(file), true)
+})

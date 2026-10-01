@@ -78,7 +78,13 @@ export function createReceiver({ root, agent, allowFrom = [], adapter, now = () 
         item = state.entries[env.id] = { id: env.id, thread: env.thread_id, from: env.from, type: env.type, hash, receivedAt: new Date(now()).toISOString() };
         if (state.historicalIds?.includes(env.id)) { item.state = 'historical'; continue; }
         if (!allowFrom.includes(env.from)) { item.state = 'denied'; item.reason = 'sender_not_allowed'; continue; }
-        const route = await json(safePath(root, `runtime/routes/${env.id}.json`));
+        let route;
+        try { route = await json(checked(`runtime/routes/${env.id}.json`)); }
+        catch (error) {
+          item.state = 'needs_reconcile'; item.reason = 'route_unreadable';
+          state.errors.push({ file: `runtime/routes/${env.id}.json`, code: error.code || 'invalid_route', message: 'Publication record cannot be read' });
+          continue;
+        }
         if (!route || route.messageId !== env.id || route.from !== env.from || route.to !== env.to || route.envelopeDigest !== hash ||
             route.scope !== 'analysis-reply' || !route.threadId || !route.cwd || !route.hostId ||
             route.focusRevision === undefined || !Number.isFinite(Date.parse(route.publishedAt))) {
@@ -116,7 +122,11 @@ export function createReceiver({ root, agent, allowFrom = [], adapter, now = () 
       await atomicWrite(stateFile(), JSON.stringify(state, null, 2) + '\n');
       if (verifiedAdapter) {
         for (const item of Object.values(state.entries).filter(x => x.state === 'queued')) {
-          if (!(await adapter.isRunning(item.target))) { item.reason = 'client_closed'; continue; }
+          if (!allowFrom.includes(item.from)) { item.state = 'denied'; item.reason = 'sender_permission_revoked'; continue; }
+          let running
+          try { running = await adapter.isRunning(item.target) }
+          catch (error) { item.reason = 'controller_unavailable'; item.error = error.message; continue }
+          if (!running) { item.reason = 'client_closed'; continue }
           item.state = 'dispatching'; delete item.reason;
           await atomicWrite(stateFile(), JSON.stringify(state, null, 2) + '\n');
           try {

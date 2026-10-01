@@ -92,6 +92,57 @@ test('prototype property identifiers survive persisted queue roundtrips', async 
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
 
+test('one corrupt publication record cannot block other queued letters', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'localpost-bad-route-'));
+  try {
+    const receiver = createReceiver({ root, agent: 'codex', allowFrom: ['dsh'] });
+    await receiver.scan();
+    const route = { threadId: 'chat-A', cwd: root, hostId: 'local', focusRevision: 1, publishedAt: new Date().toISOString(), scope: 'analysis-reply' };
+    const mail = createMailbox({ root });
+    for (const id of ['a-bad', 'b-good']) await mail.deliver(letter(id), { route });
+    await fs.writeFile(path.join(root, 'runtime/routes/a-bad.json'), '{broken');
+    await receiver.scan();
+    const state = await receiver.snapshot();
+    assert.equal(state.entries['a-bad'].state, 'needs_reconcile');
+    assert.equal(state.entries['b-good'].state, 'queued');
+    assert.ok(state.errors.some(x => x.file === 'runtime/routes/a-bad.json'));
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
+test('sender permission revoked before dispatch also applies to persisted queued mail', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'localpost-revoked-'));
+  try {
+    const options = { root, agent: 'codex', allowFrom: ['dsh'] };
+    const receiver = createReceiver(options); await receiver.scan();
+    await createMailbox({ root }).deliver(letter('revoke'), { route: { threadId: 'chat-A', cwd: root, hostId: 'local', focusRevision: 1, publishedAt: new Date().toISOString(), scope: 'analysis-reply' } });
+    await receiver.scan();
+    let dispatched = false;
+    const adapter = { capabilities: { trustedFocus: true, wholeTurn: true, sourceIsRelay: true, dispatchIdempotent: true }, isRunning: async () => true, submit: async () => { dispatched = true; return { accepted: true, receipt: 'r1' }; } };
+    await createReceiver({ ...options, allowFrom: [], adapter }).scan();
+    assert.equal(dispatched, false);
+    assert.equal((await receiver.snapshot()).entries.revoke.state, 'denied');
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
+test('one unavailable runtime target stays queued without blocking another target', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'localpost-offline-'));
+  try {
+    const options = { root, agent: 'codex', allowFrom: ['dsh'] };
+    const receiver = createReceiver(options); await receiver.scan();
+    const mail = createMailbox({ root });
+    for (const id of ['a-offline', 'b-live']) await mail.deliver(letter(id), { route: { threadId: id, cwd: root, hostId: 'local', focusRevision: 1, publishedAt: new Date().toISOString(), scope: 'analysis-reply' } });
+    const accepted = [];
+    const adapter = {
+      capabilities: { trustedFocus: true, wholeTurn: true, sourceIsRelay: true, dispatchIdempotent: true },
+      isRunning: async target => { if (target.threadId === 'a-offline') throw new Error('controller disconnected'); return true; },
+      submit: async request => { accepted.push(request.messageReference.id); return { accepted: true, receipt: 'receipt' }; },
+    };
+    await createReceiver({ ...options, adapter }).scan();
+    assert.deepEqual(accepted, ['b-live']);
+    assert.equal((await receiver.snapshot()).entries['a-offline'].state, 'queued');
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
 test('publication binds A, closed client queues, restart never resubmits accepted mail', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'localpost-route-'));
   try {

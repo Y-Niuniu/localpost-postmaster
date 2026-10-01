@@ -85,8 +85,13 @@ export async function runGc({ root, days = 30, dryRun = true, now = Date.now() }
       }
     }
     const candidates = new Map()
+    const latestCompletion = new Map()
     for (const { task, reply } of matches) {
-      const completedAt = Date.parse(reply.env.created_at)
+      latestCompletion.set(task.env.id, Math.max(latestCompletion.get(task.env.id) ?? 0,
+        Date.parse(reply.env.created_at)))
+    }
+    for (const { task, reply } of matches) {
+      const completedAt = latestCompletion.get(task.env.id)
       for (const record of [task, reply]) {
         if (record.folder === 'archive' && Math.max(record.stat.mtimeMs,
           Date.parse(record.env.created_at), completedAt) < cutoff) candidates.set(record.file, record)

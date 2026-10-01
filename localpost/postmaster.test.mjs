@@ -170,6 +170,26 @@ test('状态只前进不回退：账本记 replied，即使信件被清掉也不
   assert.equal(r.exit_code, 0)
 })
 
+test('--rebuild 从信封重建账本：粘滞的假 replied 恢复真实状态，真实完成不受影响', async () => {
+  const root = await makeRoot()
+  await put(root, 'opencode', 'archive', 'task-1.json', env({ created_at: minutesAgo(500) }))
+  await writeLedger(root, { 'task-1': { status: 'replied', type: 'task', from: 'dsh', to: 'opencode', sent_at: minutesAgo(500), replied_at: minutesAgo(490), reply_envelope: 'task-1.result' } })
+  const sticky = await runOnce({ root })
+  assert.equal(sticky.ledger_summary.replied, 1)
+  assert.equal(sticky.alerts.alerts.filter((a) => a.kind === 'overdue').length, 0)
+  const rebuilt = await runOnce({ root, rebuild: true })
+  assert.equal(rebuilt.rebuilt, true)
+  assert.equal(rebuilt.ledger_summary.replied, 0)
+  assert.equal(rebuilt.ledger_summary.overdue, 1)
+  assert.equal(rebuilt.alerts.alerts.filter((a) => a.kind === 'overdue').length, 1)
+  assert.equal(rebuilt.exit_code, 1)
+  await put(root, 'dsh', 'archive', 'task-1.result.json', resultOf('task-1', { created_at: minutesAgo(495) }))
+  const again = await runOnce({ root, rebuild: true })
+  assert.equal(again.ledger_summary.replied, 1)
+  assert.equal(again.alerts.alerts.length, 0)
+  assert.equal(again.exit_code, 0)
+})
+
 test('账本有记录但信封已消失 → envelope_missing 告警', async () => {
   const root = await makeRoot()
   await writeLedger(root, { 'ghost-1': { status: 'sent', type: 'task', from: 'a', to: 'b', sent_at: minutesAgo(200) } })
