@@ -57,7 +57,8 @@
 
    OPENSSL_CONF 那一行，配置里的 provider 模块指向一个不存在的 DLL，node 在启动阶段就去处理它并因此崩溃。
    说明这个 DLL 如果存在，就会在我们的代码运行之前被加载。注意 Node 默认读的是配置文件里的 `nodejs_conf` 段，不是 `openssl_conf` 段。
-4. **dsh 的环境构造**（静态核对，npm 版 dsh 0.1.5-rc.1 与桌面版 `app.asar` 2026-09-29 构建相同）：
+4. **dsh 的环境构造**（静态核对；核对时的版本：桌面版 DeepSeek Harness 0.2.0-rc.2，`app.asar` SHA-256 `983CA711…3BC2`；
+   npm 版 dsh 0.1.5-rc.1。两边结论相同。完整哈希见方案 §二.4，dsh 升级、哈希变化后要重新核对）：
    - 过滤规则：变量名匹配 `/KEY|PASSWORD|SECRET|TOKEN/i` 或以 `DSH_` 开头的被剔除，其余全部传下去；
    - `buildChildEnv` 是 `{...过滤后的父环境, ...config.env}`，所以注册配置里的空串会覆盖父环境里的同名变量；
    - 父环境里有小写的 `node_options` 时，注册配置里全大写的 `NODE_OPTIONS: ''` 仍然生效（测试 6 实测）。
