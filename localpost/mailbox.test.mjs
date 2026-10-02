@@ -110,7 +110,7 @@ test('the real MCP stdio process exposes seven tools and preserves reply outcome
   const dataListeners = process.stdin.listenerCount('data');
   const { createMcpServer } = await import('./mcp-server.mjs');
   assert.equal(process.stdin.listenerCount('data'), dataListeners, 'import must not register stdio listeners');
-  assert.equal((await createMcpServer({ root }).handle({ id: 9, method: 'tools/list' })).result.tools.length, 7);
+  assert.equal((await createMcpServer({ root, identity: 'codex' }).handle({ id: 9, method: 'tools/list' })).result.tools.length, 7);
   const child = spawn(process.execPath, [path.join(import.meta.dirname, 'mcp-server.mjs')], {
     windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, MAILBOX_ROOT: root, MAILBOX_IDENTITY: 'codex', TEMP: tempRoot, TMP: tempRoot },
@@ -150,4 +150,101 @@ test('a sender outbox copy is not proof of delivery to the recipient', async t =
   const sent = await mail.deliver(letter());
   assert.equal(sent.idempotent, false);
   assert.equal(mail.inbox('codex').length, 1);
+});
+
+// Controlled write service checks from the 2026-10-02 architecture review:
+// own inbox -> archive, idempotent retry, failure repair, cross-identity and path-escape rejection.
+test('identity-bound archive moves only its own letters, retries idempotently, and rejects other identities and escaping names', async t => {
+  const { root, mail } = fixture(t, 'codex');
+  const admin = createMailbox({ root });
+  await admin.deliver(letter());
+  await admin.deliver(letter({ id: 'task-two', from: 'codex', to: 'dsh' }));
+  assert.deepEqual(await mail.archive('codex', 'task-one'), { archived: 'task-one', idempotent: false });
+  assert.ok(fs.existsSync(path.join(root, 'agents/codex/archive/task-one.json')));
+  assert.equal(mail.inbox('codex').length, 0);
+  assert.deepEqual(await mail.archive('codex', 'task-one'), { archived: 'task-one', idempotent: true });
+  await assert.rejects(mail.archive('dsh', 'task-two'), /does not own mailbox/);
+  await assert.rejects(mail.reply('dsh', { reply_to: 'task-two', body: 'Reviewed' }), /does not own mailbox/);
+  for (const id of ['../task-two', '..\task-two', 'dsh/task-two', '']) await assert.rejects(mail.archive('codex', id), /Invalid LocalPost identifier/);
+  await assert.rejects(mail.reply('codex', { reply_to: '../dsh/inbox/task-two', body: 'Reviewed' }), /Invalid LocalPost identifier/);
+  assert.throws(() => mail.inbox('../dsh'), /invalid agent identity/);
+  assert.ok(fs.existsSync(path.join(root, 'agents/dsh/inbox/task-two.json')));
+});
+
+test('an archive failure after a published terminal reply is a visible pending fault that a retry repairs', async t => {
+  const { root, mail } = fixture(t, 'codex');
+  const admin = createMailbox({ root });
+  await admin.deliver(letter());
+  const rename = fs.renameSync;
+  let failNextArchive = true;
+  t.mock.method(fs, 'renameSync', (from, to) => {
+    if (failNextArchive && String(to).includes(`${path.sep}archive${path.sep}`)) {
+      failNextArchive = false;
+      throw Object.assign(new Error('EPERM: operation not permitted, rename'), { code: 'EPERM' });
+    }
+    return rename(from, to);
+  });
+  const reply = { reply_to: 'task-one', body: 'Reviewed', outcome: 'completed' };
+  await assert.rejects(mail.reply('codex', reply), error => error.code === 'REPLIED_ARCHIVE_PENDING'
+    && error.pending === 'task-one' && error.reply.id === 'task-one.result' && /已回执但待归档/.test(error.message));
+  assert.equal(admin.read('dsh', 'task-one.result').envelope.outcome, 'completed');
+  assert.equal(mail.inbox('codex').length, 1);
+  const repaired = await mail.reply('codex', reply);
+  assert.equal(repaired.idempotent, true);
+  assert.equal(mail.inbox('codex').length, 0);
+  assert.equal(admin.inbox('dsh').length, 1);
+});
+
+async function runMcp(t, env, calls) {
+  const base = { ...process.env, TEMP: tempRoot, TMP: tempRoot };
+  for (const key of ['MAILBOX_ROOT', 'MAILBOX_IDENTITY', 'MAILBOX_ADMIN']) delete base[key];
+  const child = spawn(process.execPath, [path.join(import.meta.dirname, 'mcp-server.mjs')], {
+    windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: { ...base, ...env },
+  });
+  t.after(() => { if (child.exitCode === null) child.kill(); });
+  let stdout = '', stderr = '';
+  child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
+  child.stdout.on('data', value => { stdout += value; }); child.stderr.on('data', value => { stderr += value; });
+  const exited = new Promise((resolve, reject) => { child.on('error', reject); child.on('close', code => resolve(code)); });
+  child.stdin.end(calls.map(value => JSON.stringify(value)).join('\n') + (calls.length ? '\n' : ''));
+  const code = await exited;
+  return { code, stderr, responses: stdout.trim() ? stdout.trim().split('\n').map(line => JSON.parse(line)) : [] };
+}
+
+test('the MCP server will not start unbound unless administrator mode is explicit', { timeout: 10000 }, async t => {
+  const { root } = fixture(t);
+  const { createMcpServer } = await import('./mcp-server.mjs');
+  assert.throws(() => createMcpServer({ root, admin: false }), /MAILBOX_IDENTITY/);
+  const admin = await createMcpServer({ root, admin: true }).handle({ id: 1, method: 'initialize', params: {} });
+  assert.match(admin.result.instructions, /administrator mode; not for automated flows/);
+  const unbound = await runMcp(t, { MAILBOX_ROOT: root }, [{ jsonrpc: '2.0', id: 1, method: 'tools/list' }]);
+  assert.equal(unbound.code, 2);
+  assert.equal(unbound.responses.length, 0);
+  assert.match(unbound.stderr, /requires MAILBOX_IDENTITY/);
+});
+
+test('the identity-bound MCP process enforces own-archive, idempotence, identity and path boundaries', { timeout: 10000 }, async t => {
+  const { root } = fixture(t);
+  const admin = createMailbox({ root });
+  await admin.deliver(letter());
+  await admin.deliver(letter({ id: 'task-two', from: 'codex', to: 'dsh' }));
+  const call = (id, name, args) => ({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } });
+  const { code, stderr, responses } = await runMcp(t, { MAILBOX_ROOT: root, MAILBOX_IDENTITY: 'codex' }, [
+    call(1, 'mailbox_archive', { agent: 'codex', id: 'task-one' }),
+    call(2, 'mailbox_archive', { agent: 'codex', id: 'task-one' }),
+    call(3, 'mailbox_archive', { agent: 'dsh', id: 'task-two' }),
+    call(4, 'mailbox_archive', { agent: 'codex', id: '../dsh/inbox/task-two' }),
+    call(5, 'mailbox_inbox', { agent: 'codex' }),
+  ]);
+  assert.equal(code, 0, stderr);
+  const text = index => responses[index].result.content[0].text;
+  assert.equal(responses[0].result.isError, undefined, text(0));
+  assert.equal(JSON.parse(text(0)).idempotent, false);
+  assert.equal(JSON.parse(text(1)).idempotent, true);
+  assert.equal(responses[2].result.isError, true);
+  assert.match(text(2), /does not own mailbox/);
+  assert.equal(responses[3].result.isError, true);
+  assert.match(text(3), /Invalid LocalPost identifier/);
+  assert.equal(JSON.parse(text(4)).letters.length, 0);
+  assert.ok(fs.existsSync(path.join(root, 'agents/dsh/inbox/task-two.json')));
 });

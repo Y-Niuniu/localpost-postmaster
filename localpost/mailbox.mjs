@@ -174,7 +174,19 @@ export function createMailbox({ root, identity } = {}) {
         reply_to: source.id, outcome };
       for (const key of ['commit', 'base_rev', 'test', 'attachments']) if (options[key] !== undefined) envelope[key] = options[key];
       const result = await deliverUnlocked(envelope);
-      if (terminal) Object.assign(result, archiveUnlocked(agent, source.id), { idempotent: result.idempotent });
+      if (terminal) {
+        // The result is already public here; an archive failure must not read as "reply failed".
+        try { Object.assign(result, archiveUnlocked(agent, source.id), { idempotent: result.idempotent }); }
+        catch (error) {
+          const fault = new Error(`replied but archive pending (已回执但待归档): result ${id} was delivered; `
+            + `original ${source.id} was not archived (${error.message}). After an authorized operator fixes access, `
+            + 'retry the same mailbox_reply or mailbox_archive to finish.', { cause: error });
+          fault.code = 'REPLIED_ARCHIVE_PENDING';
+          fault.reply = { ...result, id, outcome };
+          fault.pending = source.id;
+          throw fault;
+        }
+      }
       return { ...result, id, outcome };
     });
   }

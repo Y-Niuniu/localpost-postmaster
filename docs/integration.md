@@ -12,7 +12,11 @@ main integrator. Keep the authoritative mailbox operations in
   stop deleting. Use the tested bundled pwsh rather than changing machine policy.
 - `localpost/mailbox.mjs` + `mcp-server.mjs`: common publisher and seven MCP tools.
   Set `MAILBOX_ROOT` and bind `MAILBOX_IDENTITY=codex` (or dsh per process).
-  Unbound identity is administrator mode, unsuitable for auto-processing.
+  Unbound identity is administrator mode, unsuitable for auto-processing: the MCP
+  server refuses to start unbound unless `MAILBOX_ADMIN=1` is set explicitly.
+  If a terminal reply is published but archiving the original fails, the tool
+  reports `REPLIED_ARCHIVE_PENDING` (已回执但待归档) instead of a plain failure;
+  retrying the same `mailbox_reply` or `mailbox_archive` finishes it.
 - `localpost/receiver.mjs` + `receiver-cli.mjs`: watch + 30-second repair scans and
   metadata-only durable queues in `runtime/queues`. Empty polling calls no model.
 - `localpost/dsh-adapter.mjs`: injectable rc.2 contract, disabled without verified
