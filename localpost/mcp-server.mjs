@@ -49,7 +49,10 @@ export function createMcpServer({
   root = process.env.MAILBOX_ROOT || 'C:/AI_ASSIST/.mailbox',
   identity = process.env.MAILBOX_IDENTITY || undefined,
   admin = process.env.MAILBOX_ADMIN === '1',
-  tools = process.env.MAILBOX_TOOLS || undefined,
+  // 区分「未设置」与「显式设为空」：只有未设置才回到人工模式默认全集。
+  // 空 / 纯空白 / 仅分隔符 / 未知名称都由 allowedTools 拒绝启动（fail closed），
+  // 否则 `MAILBOX_TOOLS=''` 会静默变成「放开全部工具」（含 mailbox_send）。
+  tools = Object.hasOwn(process.env, 'MAILBOX_TOOLS') ? process.env.MAILBOX_TOOLS : undefined,
 } = {}) {
   // An unbound server can act as any agent, so it must be an explicit operator choice, never a default.
   if (!identity && !admin) throw new Error('LocalPost MCP requires MAILBOX_IDENTITY=<agent>; administrator mode needs explicit MAILBOX_ADMIN=1 and is not for automated flows');

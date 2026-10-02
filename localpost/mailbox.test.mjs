@@ -315,25 +315,54 @@ test('an MCP tool allowlist is enforced on call, not only hidden from the list',
   assert.equal(inbox.result.isError, undefined);
 });
 
+test('空 / 非法 MAILBOX_TOOLS 拒绝启动（真实 stdio 子进程），未设置才保留人工默认', { timeout: 30000 }, async t => {
+  const { root } = fixture(t);
+  const serverFile = path.join(import.meta.dirname, 'mcp-server.mjs');
+  const base = { ...process.env, MAILBOX_ROOT: root, MAILBOX_IDENTITY: 'codex', TEMP: tempRoot, TMP: tempRoot };
+  delete base.MAILBOX_TOOLS;
+  const run = (extra, calls) => new Promise((resolve, reject) => {
+    const env = { ...base, ...extra };
+    // 证明空值确实被传入子进程，而不是被测试框架悄悄删掉。
+    assert.equal(Object.hasOwn(env, 'MAILBOX_TOOLS'), Object.hasOwn(extra, 'MAILBOX_TOOLS'), 'explicit setting must reach the child');
+    const child = spawn(process.execPath, [serverFile], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env });
+    let stdout = '', stderr = '';
+    child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
+    child.stdout.on('data', value => { stdout += value; }); child.stderr.on('data', value => { stderr += value; });
+    child.on('error', reject);
+    child.on('close', code => resolve({ code, stdout, stderr }));
+    child.stdin.end((calls || [{ jsonrpc: '2.0', id: 1, method: 'tools/list' }]).map(value => JSON.stringify(value)).join('\n') + '\n');
+  });
+  // 显式为空 / 纯空白 / 仅逗号 / 未知名称 → 必须 fail closed：退出码 2，且一个工具都不暴露
+  for (const bad of ['', '   ', ' , ', 'mailbox_nope']) {
+    const result = await run({ MAILBOX_TOOLS: bad });
+    assert.equal(result.code, 2, JSON.stringify(bad) + ' must fail closed; stderr=' + result.stderr);
+    assert.equal(result.stdout.trim(), '', JSON.stringify(bad) + ' must expose no tools');
+    assert.match(result.stderr, /Invalid MAILBOX_TOOLS/);
+  }
+  // 未设置 → 人工模式默认全部 7 个
+  const unset = await run({});
+  assert.equal(unset.code, 0, unset.stderr);
+  assert.equal(JSON.parse(unset.stdout.trim()).result.tools.length, 7);
+  // 有效限制名单 → 列表隐藏 + 直接调用都受限
+  const limited = await run({ MAILBOX_TOOLS: 'mailbox_inbox,mailbox_archive' }, [
+    { jsonrpc: '2.0', id: 1, method: 'tools/list' },
+    { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'mailbox_send', arguments: letter({ from: 'codex', to: 'dsh' }) } },
+  ]);
+  assert.equal(limited.code, 0, limited.stderr);
+  const lines = limited.stdout.trim().split('\n').map(line => JSON.parse(line));
+  assert.deepEqual(lines[0].result.tools.map(tool => tool.name), ['mailbox_inbox', 'mailbox_archive']);
+  assert.equal(lines[1].result.isError, true);
+  assert.match(lines[1].result.content[0].text, /not allowed in this deployment: mailbox_send/);
+});
+
 test('a process killed between publishing a reply and archiving recovers by rule: one result, original archived, dead lease reclaimed', { timeout: 15000 }, async t => {
   const { root, mail } = fixture(t, 'codex');
   await createMailbox({ root }).deliver(letter());
   const barrier = path.join(root, 'published.barrier');
   const reply = { reply_to: 'task-one', body: 'Reviewed', outcome: 'completed' };
   // The child blocks synchronously inside the archive rename, i.e. after the result is public.
-  const script = `
-    import fs from 'node:fs'; import path from 'node:path';
-    const { createMailbox } = await import(process.env.LP_MAILBOX_URL);
-    const rename = fs.renameSync;
-    fs.renameSync = (from, to) => {
-      if (String(to).includes(path.sep + 'archive' + path.sep)) {
-        fs.writeFileSync(process.env.LP_BARRIER, 'published');
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
-      }
-      return rename(from, to);
-    };
-    await createMailbox({ root: process.env.LP_ROOT, identity: 'codex' }).reply('codex', JSON.parse(process.env.LP_REPLY));`;
-  const child = spawn(process.execPath, ['--input-type=module', '-e', script], { windowsHide: true, stdio: 'ignore', env: {
+  // 以落盘 fixture 启动，不用 node -e（本机规则禁止内联脚本：PDM 会拦文件操作类内联脚本）。
+  const child = spawn(process.execPath, [path.join(import.meta.dirname, 'fixtures', 'reply-then-hang.mjs')], { windowsHide: true, stdio: 'ignore', env: {
     ...process.env, LP_ROOT: root, LP_BARRIER: barrier, LP_REPLY: JSON.stringify(reply), LP_MAILBOX_URL: new URL('./mailbox.mjs', import.meta.url).href } });
   t.after(() => { if (child.exitCode === null) child.kill(); });
   const exited = new Promise(resolve => child.on('close', resolve));
