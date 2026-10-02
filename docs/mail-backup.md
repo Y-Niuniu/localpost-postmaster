@@ -43,27 +43,31 @@
 用户原话：**「d 盘不要副本，专门打游戏的不参与生产」**。据此：
 
 - `D:\`（SanDisk Extreme Pro，USB）是**游戏盘，不参与生产**；不得写入任何生产数据或备份。
-  本会话**没有**在 `D:\` 建立过任何东西。
 - 因此本备份**只有 C: 一份**，与源同盘。
 - **必须告知的残余风险**：同盘备份**不防磁盘故障 / 整盘丢失 / 勒索软件加密整卷**。
   它真正防的是：误删、插件或内核缺陷、权限或路径事故、账本或信件被错误改写。
-- 若日后要异机/异地保护，需**另行决定**（例如 OneDrive 同步目录，代价是把信件内容放进云盘；
-  必须用户明确同意后才做，不在本轮范围）。
+- 若日后要异机/异地保护，需**另行决定**（例如 OneDrive 同步目录，代价是把信件内容放进云盘）。
 
 ## 3. 频率与滚动保留
 
-- **频率**：每日一次 03:30，计划任务 `LocalPostMailBackup`（**2026-10-02 创建并验证**）。
+- **频率**：每日一次 03:30，计划任务 `LocalPostMailBackup`（2026-10-02 创建并验证）。
   设置：`StartWhenAvailable`（错过补跑）、`MultipleInstances IgnoreNew`、
   以当前用户交互身份运行（与 `LocalPostGC` 同款 principal），动作 = wscript 调用
   `.mailbox/localpost-mailbackup-hidden.vbs`（无窗口，等待并回传退出码）。
-- **端到端验证（2026-10-02）**：手动触发任务 → `LastTaskResult=0`，
-  新快照 `2026-10-02T17-04-38-398Z` 发布、自校验 `149/149`、无 `.staging-*` 残留。
-  最坏情况的数据损失窗口 = **约一天**，不宣称零丢失。
-- **保留**：每个目的地保留**最新 7 个**快照（对应七天滚动恢复点），更旧的被清理。
-- **清理安全规则**（`pruneSnapshots` 实现，有测试覆盖）：
-  1. 清理前先验证**最新快照**；验证不过 → 拒绝清理并报告，绝不因定时清理删掉最后可用副本。
-  2. 永不删除最新快照；只剩一个快照时不删。
-  3. 保留期只作用于**本备份集**，与原始信件保留策略无关；**不是**授权删除七天前的原信。
+- **端到端验证（2026-10-02）**：手动触发任务 → `LastTaskResult=0`，新快照发布并自校验通过，
+  无 `.staging-*` 残留。注意 `schtasks /Query` 必须带前导反斜杠（`\LocalPostMailBackup`），
+  否则会误报"找不到路径"。
+- **保留语义 = 时间窗口，不是份数**（v3.2 修订，按 codex 复审意见改）：
+  - CLI 参数是 `--retention-days 7`（默认 7），含义是**保留最近 7×24 小时窗口内的所有完整快照**。
+  - 窗口按每个快照 **manifest 里的 `created_at`** 计算，**绝不按目录名**——
+    目录名是可写文本，不可信。
+  - 快照按 `created_at` 排序；**按时间最新的那个永远保留**，且清理前必须先通过校验。
+  - **边界**：恰好落在 cutoff 那一刻的快照算「窗口内」，保留。
+  - **不确定的一律不动**：manifest 读不出、`created_at` 非法、`created_at` 在未来，
+    都不删除，只报告为 anomaly 留人工处理。若**所有**快照都没有可用的 `created_at`，直接拒绝清理。
+  - 同一天跑多次不会互相顶掉；漏跑几天也不会误删窗口内的恢复点。
+  - 最坏情况的数据损失窗口 = **约一天**，不宣称零丢失。
+- **不做**：保留期只作用于本备份集；**不是**授权删除七天前的原信，**不是** GC `--apply`。
 
 ## 4. 写入与发布语义
 
@@ -78,8 +82,11 @@
 流程（隔离目录，绝不写回 `.mailbox`）：
 
 ```
-node localpost/mail-backup.mjs backup  --source C:/AI_ASSIST/.mailbox --target <目的地> --keep 7
+node localpost/mail-backup.mjs backup  --source C:/AI_ASSIST/.mailbox --target <目的地> --retention-days 7
 node localpost/mail-backup.mjs restore --snapshot <最新快照> --dest <隔离目录>
+node localpost/mail-backup.mjs verify  --snapshot <快照>
+node localpost/mail-backup.mjs prune   --target <目的地> --retention-days 7
+node localpost/mail-backup.mjs status  --target <目的地>
 ```
 
 2026-10-02 首次演练结果（证据 `work/localpost-six-gates-evidence/step2-backup-drill.txt`）：
@@ -90,7 +97,7 @@ node localpost/mail-backup.mjs restore --snapshot <最新快照> --dest <隔离�
 | 备份文件数 / 字节 | 143 / 601233，`verified=true` |
 | 恢复 | 143 个文件写入隔离目录，`RESTORE ok` |
 | 独立比对 | 隔离副本 vs 存活源目录：相对路径 + SHA-256 **143/143 完全一致** |
-| 工具自测 | `node --test localpost/mail-backup.test.mjs`：9/9 通过 |
+| 工具自测 | `node --test localpost/mail-backup.test.mjs`：18/18 通过 |
 
 ## 6. 故障与偏差处理
 

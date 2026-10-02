@@ -1,11 +1,13 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { backupMailbox, listSnapshots, pruneSnapshots, restoreSnapshot, verifySnapshot } from './mail-backup.mjs'
+import { SCHEMA, backupMailbox, listSnapshots, pruneSnapshots, restoreSnapshot, verifySnapshot } from './mail-backup.mjs'
 import { removeTree } from './temp-tree.mjs'
 
+const DAY = 24 * 60 * 60 * 1000
 const roots = []
 
 async function scratch(name) {
@@ -20,14 +22,48 @@ test.after(async () => {
 
 async function writeFixture(root) {
   await fs.mkdir(path.join(root, 'agents', 'codex', 'inbox'), { recursive: true })
-  await fs.mkdir(path.join(root, 'agents', 'codex', 'archive'), { recursive: true })
   await fs.mkdir(path.join(root, 'attachments'), { recursive: true })
   await fs.writeFile(path.join(root, 'agents', 'codex', 'inbox', 'a.json'), '{"id":"a"}\n', 'utf8')
-  await fs.writeFile(path.join(root, 'agents', 'codex', 'archive', 'old.json'), '{"id":"old"}\n', 'utf8')
   await fs.writeFile(path.join(root, 'attachments', 'note.md'), '# note\n', 'utf8')
   await fs.writeFile(path.join(root, 'ledger.json'), '{"records":[]}\n', 'utf8')
-  await fs.writeFile(path.join(root, 'postmaster.config.json'), '{"interval":15}\n', 'utf8')
   return root
+}
+
+/**
+ * Write a structurally valid snapshot by hand: manifest entries carry real
+ * bytes and SHA-256, so the "newest must verify" gate behaves as in production
+ * while created_at stays fully under the test's control.
+ */
+async function fakeSnapshot(target, name, options = {}) {
+  const dir = path.join(target, name)
+  await fs.mkdir(dir, { recursive: true })
+  if (options.raw !== undefined) {
+    await fs.writeFile(path.join(dir, 'manifest.json'), options.raw, 'utf8')
+    return dir
+  }
+  const files = []
+  for (const file of options.files || []) {
+    const full = path.join(dir, ...file.path.split('/'))
+    await fs.mkdir(path.dirname(full), { recursive: true })
+    await fs.writeFile(full, file.body, 'utf8')
+    files.push({ path: file.path, bytes: Buffer.byteLength(file.body), sha256: createHash('sha256').update(file.body).digest('hex') })
+  }
+  const manifest = {
+    schema: SCHEMA,
+    created_at: options.createdAt,
+    source: 'test',
+    file_count: files.length,
+    total_bytes: files.reduce((sum, x) => sum + x.bytes, 0),
+    excluded: [],
+    skipped: [],
+    files,
+  }
+  await fs.writeFile(path.join(dir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8')
+  return dir
+}
+
+function iso(msAgo) {
+  return new Date(Date.now() - msAgo).toISOString()
 }
 
 test('backup writes a verified snapshot whose manifest matches the source', async () => {
@@ -35,19 +71,11 @@ test('backup writes a verified snapshot whose manifest matches the source', asyn
   const target = await scratch('dst')
   const result = await backupMailbox({ source, target, now: new Date('2026-10-02T00:00:00Z') })
   assert.equal(result.name, '2026-10-02T00-00-00-000Z')
-  assert.equal(result.fileCount, 5)
+  assert.equal(result.fileCount, 3)
   assert.equal(result.verification.ok, true)
-  assert.equal(result.verification.expected, 5)
   const manifest = JSON.parse(await fs.readFile(path.join(result.snapshot, 'manifest.json'), 'utf8'))
   assert.equal(manifest.schema, 'localpost-mail-backup-v1')
-  assert.equal(manifest.file_count, 5)
-  assert.deepEqual(manifest.files.map((x) => x.path), [
-    'agents/codex/archive/old.json',
-    'agents/codex/inbox/a.json',
-    'attachments/note.md',
-    'ledger.json',
-    'postmaster.config.json',
-  ])
+  assert.deepEqual(manifest.files.map((x) => x.path), ['agents/codex/inbox/a.json', 'attachments/note.md', 'ledger.json'])
   assert.match(manifest.files[0].sha256, /^[0-9a-f]{64}$/)
 })
 
@@ -57,10 +85,8 @@ test('backup excludes lock and tmp files and records them as skipped', async () 
   await fs.writeFile(path.join(source, 'ledger.json.tmp'), 'x', 'utf8')
   const target = await scratch('dst')
   const result = await backupMailbox({ source, target })
-  assert.equal(result.fileCount, 5)
-  const reasons = result.skipped.map((x) => x.path + ':' + x.reason).sort()
-  assert.deepEqual(reasons, ['.postmaster.lock:excluded pattern', 'ledger.json.tmp:excluded pattern'])
-  await assert.rejects(fs.stat(path.join(result.snapshot, '.postmaster.lock')), { code: 'ENOENT' })
+  assert.equal(result.fileCount, 3)
+  assert.deepEqual(result.skipped.map((x) => x.path + ':' + x.reason).sort(), ['.postmaster.lock:excluded pattern', 'ledger.json.tmp:excluded pattern'])
 })
 
 test('backup refuses to overwrite an existing snapshot name', async () => {
@@ -78,7 +104,7 @@ test('backup rejects an empty source instead of publishing an empty snapshot', a
   assert.deepEqual(await fs.readdir(target), [])
 })
 
-test('verify detects a tampered snapshot and leaves no staging debris', async () => {
+test('verify detects a tampered snapshot and staging is reported separately', async () => {
   const source = await writeFixture(await scratch('tamper'))
   const target = await scratch('dst')
   const result = await backupMailbox({ source, target })
@@ -87,9 +113,11 @@ test('verify detects a tampered snapshot and leaves no staging debris', async ()
   const after = await verifySnapshot(result.snapshot)
   assert.equal(after.ok, false)
   assert.deepEqual(after.differences, [{ path: 'ledger.json', reason: 'content mismatch' }])
+  await fs.mkdir(path.join(target, '.staging-2026-10-02T00-00-01-000Z'))
   const listing = await listSnapshots(target)
   assert.equal(listing.snapshots.length, 1)
-  assert.deepEqual(listing.incomplete, [])
+  assert.deepEqual(listing.staging, ['.staging-2026-10-02T00-00-01-000Z'])
+  assert.deepEqual(listing.unreadable, [])
 })
 
 test('restore reproduces the exact tree and refuses an existing destination', async () => {
@@ -99,53 +127,129 @@ test('restore reproduces the exact tree and refuses an existing destination', as
   const dest = path.join(await scratch('out'), 'restored')
   const restored = await restoreSnapshot({ snapshot: result.snapshot, dest })
   assert.equal(restored.ok, true)
-  assert.equal(restored.restored, 5)
+  assert.equal(restored.restored, 3)
   assert.equal(await fs.readFile(path.join(dest, 'agents', 'codex', 'inbox', 'a.json'), 'utf8'), '{"id":"a"}\n')
   await assert.rejects(restoreSnapshot({ snapshot: result.snapshot, dest }), /refusing to overwrite/)
 })
 
-test('prune keeps the newest snapshots and refuses while the newest is broken', async () => {
-  const source = await writeFixture(await scratch('prune-src'))
+test('retention is a time window: several snapshots from the same day all survive', async () => {
   const target = await scratch('dst')
-  const names = []
-  for (const minute of ['00', '01', '02', '03']) {
-    const result = await backupMailbox({ source, target, now: new Date('2026-10-0' + (Number(minute) + 1) + 'T00:00:00Z') })
-    names.push(result.name)
+  for (const hours of [20, 10, 1]) {
+    await fakeSnapshot(target, 'aaa-' + hours, { createdAt: iso(hours * 60 * 60 * 1000), files: [{ path: 'ledger.json', body: 'body-' + hours }] })
   }
-  const kept = await pruneSnapshots({ target, keep: 2 })
-  assert.equal(kept.skipped, false)
-  assert.deepEqual(kept.kept, [names[3], names[2]])
-  assert.deepEqual(kept.removed, [names[1], names[0]])
-  assert.equal((await listSnapshots(target)).snapshots.length, 2)
-
-  const newest = path.join(target, names[3])
-  await fs.writeFile(path.join(newest, 'ledger.json'), 'broken\n', 'utf8')
-  const refused = await pruneSnapshots({ target, keep: 1 })
-  assert.equal(refused.skipped, true)
-  assert.match(refused.reason, /refusing to prune/)
-  assert.equal((await listSnapshots(target)).snapshots.length, 2)
-})
-
-test('prune never removes the last remaining snapshot and rejects a bad keep', async () => {
-  const source = await writeFixture(await scratch('last-src'))
-  const target = await scratch('dst')
-  await backupMailbox({ source, target })
-  const result = await pruneSnapshots({ target, keep: 7 })
+  const result = await pruneSnapshots({ target, retentionDays: 7 })
   assert.deepEqual(result.removed, [])
-  assert.equal(result.kept.length, 1)
-  await assert.rejects(pruneSnapshots({ target, keep: 0 }), /positive integer/)
-  await assert.rejects(pruneSnapshots({ target, keep: 1.5 }), /positive integer/)
+  assert.equal(result.kept.length, 3)
 })
 
-test('an interrupted staging directory is reported and never mistaken for a snapshot', async () => {
-  const source = await writeFixture(await scratch('staging-src'))
+test('retention removes only what is older than the window, and never the newest', async () => {
   const target = await scratch('dst')
-  await backupMailbox({ source, target })
-  await fs.mkdir(path.join(target, '.staging-2026-10-02T00-00-01-000Z'))
+  await fakeSnapshot(target, 'zzz-old', { createdAt: iso(9 * DAY), files: [{ path: 'ledger.json', body: 'old' }] })
+  await fakeSnapshot(target, 'aaa-fresh', { createdAt: iso(2 * DAY), files: [{ path: 'ledger.json', body: 'fresh' }] })
+  const result = await pruneSnapshots({ target, retentionDays: 7 })
+  assert.deepEqual(result.removed, ['zzz-old'])
+  assert.deepEqual(result.kept, ['aaa-fresh'])
+})
+
+test('ordering follows created_at, never the directory name', async () => {
+  const target = await scratch('dst')
+  await fakeSnapshot(target, 'aaa-newest', { createdAt: iso(1 * DAY), files: [{ path: 'ledger.json', body: 'newest' }] })
+  await fakeSnapshot(target, 'zzz-oldest', { createdAt: iso(30 * DAY), files: [{ path: 'ledger.json', body: 'oldest' }] })
   const listing = await listSnapshots(target)
-  assert.equal(listing.snapshots.length, 1)
-  assert.deepEqual(listing.incomplete, ['.staging-2026-10-02T00-00-01-000Z'])
-  const prune = await pruneSnapshots({ target, keep: 1 })
-  assert.equal(prune.skipped, false)
-  assert.deepEqual(prune.incomplete, ['.staging-2026-10-02T00-00-01-000Z'])
+  assert.deepEqual(listing.snapshots.map((x) => x.name), ['aaa-newest', 'zzz-oldest'])
+  const result = await pruneSnapshots({ target, retentionDays: 7 })
+  assert.deepEqual(result.removed, ['zzz-oldest'])
+})
+
+test('retention keeps the newest snapshot even when every snapshot is older than the window', async () => {
+  const target = await scratch('dst')
+  await fakeSnapshot(target, 'snap-a', { createdAt: iso(30 * DAY), files: [{ path: 'ledger.json', body: 'a' }] })
+  await fakeSnapshot(target, 'snap-b', { createdAt: iso(20 * DAY), files: [{ path: 'ledger.json', body: 'b' }] })
+  const result = await pruneSnapshots({ target, retentionDays: 7 })
+  assert.deepEqual(result.removed, ['snap-a'])
+  assert.deepEqual(result.kept, ['snap-b'])
+})
+
+test('retention boundary: a snapshot created exactly at the cutoff is kept', async () => {
+  const target = await scratch('dst')
+  const now = new Date('2026-10-02T12:00:00.000Z')
+  await fakeSnapshot(target, 'snap-exact', { createdAt: new Date(now.getTime() - 7 * DAY).toISOString(), files: [{ path: 'ledger.json', body: 'e' }] })
+  await fakeSnapshot(target, 'snap-older', { createdAt: new Date(now.getTime() - 7 * DAY - 1).toISOString(), files: [{ path: 'ledger.json', body: 'o' }] })
+  const result = await pruneSnapshots({ target, retentionDays: 7, now })
+  assert.deepEqual(result.removed, ['snap-older'])
+  assert.deepEqual(result.kept, ['snap-exact'])
+})
+
+test('an invalid created_at is never deleted and is reported for manual handling', async () => {
+  const target = await scratch('dst')
+  await fakeSnapshot(target, 'snap-good', { createdAt: iso(1 * DAY), files: [{ path: 'ledger.json', body: 'g' }] })
+  const broken = await fakeSnapshot(target, 'snap-broken-date', { createdAt: 'not-a-date', files: [{ path: 'ledger.json', body: 'b' }] })
+  const result = await pruneSnapshots({ target, retentionDays: 7 })
+  assert.equal(result.removed.includes('snap-broken-date'), false)
+  assert.equal(result.anomalies.length, 1)
+  assert.match(result.anomalies[0].reason, /invalid created_at/)
+  await fs.stat(path.join(broken, 'manifest.json'))
+})
+
+test('a created_at in the future is kept and reported', async () => {
+  const target = await scratch('dst')
+  await fakeSnapshot(target, 'snap-now', { createdAt: iso(0), files: [{ path: 'ledger.json', body: 'n' }] })
+  await fakeSnapshot(target, 'snap-future', { createdAt: new Date(Date.now() + 3 * DAY).toISOString(), files: [{ path: 'ledger.json', body: 'f' }] })
+  const result = await pruneSnapshots({ target, retentionDays: 7 })
+  assert.equal(result.removed.includes('snap-future'), false)
+  assert.equal(result.anomalies.length, 1)
+  assert.match(result.anomalies[0].reason, /future/)
+})
+
+test('a snapshot with an unreadable manifest is reported and never deleted', async () => {
+  const target = await scratch('dst')
+  await fakeSnapshot(target, 'snap-ok', { createdAt: iso(1 * DAY), files: [{ path: 'ledger.json', body: 'ok' }] })
+  const raw = await fakeSnapshot(target, 'snap-raw', { raw: '{ not json' })
+  const result = await pruneSnapshots({ target, retentionDays: 7 })
+  assert.deepEqual(result.unreadable.map((x) => x.name), ['snap-raw'])
+  assert.equal(result.removed.length, 0)
+  await fs.stat(path.join(raw, 'manifest.json'))
+})
+
+test('prune refuses when no snapshot exposes a usable created_at', async () => {
+  const target = await scratch('dst')
+  await fakeSnapshot(target, 'snap-x', { createdAt: 'nope', files: [{ path: 'ledger.json', body: 'x' }] })
+  await fakeSnapshot(target, 'snap-y', { createdAt: 'also-nope', files: [{ path: 'ledger.json', body: 'y' }] })
+  const result = await pruneSnapshots({ target, retentionDays: 7 })
+  assert.equal(result.skipped, true)
+  assert.match(result.reason, /refusing to prune/)
+  assert.equal(result.removed.length, 0)
+  assert.equal(result.anomalies.length, 2)
+})
+
+test('prune refuses to run while the newest snapshot fails verification', async () => {
+  const target = await scratch('dst')
+  await fakeSnapshot(target, 'snap-old', { createdAt: iso(30 * DAY), files: [{ path: 'ledger.json', body: 'old' }] })
+  const newest = await fakeSnapshot(target, 'snap-newest', { createdAt: iso(1 * DAY), files: [{ path: 'ledger.json', body: 'new' }] })
+  await fs.writeFile(path.join(newest, 'ledger.json'), 'corrupted', 'utf8')
+  const result = await pruneSnapshots({ target, retentionDays: 7 })
+  assert.equal(result.skipped, true)
+  assert.match(result.reason, /refusing to prune/)
+  assert.equal(result.removed.length, 0)
+})
+
+test('prune rejects a nonsensical retention window and reports an empty target', async () => {
+  const target = await scratch('dst')
+  await assert.rejects(pruneSnapshots({ target, retentionDays: -1 }), /non-negative/)
+  await assert.rejects(pruneSnapshots({ target, retentionDays: Number.NaN }), /non-negative/)
+  const empty = await pruneSnapshots({ target, retentionDays: 7 })
+  assert.equal(empty.skipped, true)
+  assert.equal(empty.reason, 'no snapshots')
+})
+
+test('backup honours the retention window end to end', async () => {
+  const source = await writeFixture(await scratch('e2e-src'))
+  const target = await scratch('dst')
+  await backupMailbox({ source, target, now: new Date(Date.now() - 10 * DAY) })
+  await backupMailbox({ source, target, now: new Date(Date.now() - 6 * DAY) })
+  const result = await backupMailbox({ source, target, now: new Date() })
+  const prune = await pruneSnapshots({ target, retentionDays: 7 })
+  assert.equal(prune.removed.length, 1)
+  assert.equal((await listSnapshots(target)).snapshots.length, 2)
+  assert.equal((await verifySnapshot(result.snapshot)).ok, true)
 })

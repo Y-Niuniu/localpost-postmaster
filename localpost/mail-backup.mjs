@@ -175,43 +175,104 @@ export async function restoreSnapshot({ snapshot, dest }) {
   return { ok: differences.length === 0, dest, restored: restored.length, differences }
 }
 
-/** List snapshots newest-first; staging leftovers are reported separately. */
+/** Parse a manifest created_at into epoch ms, or null when unusable. */
+function parseCreatedAt(value) {
+  const parsed = new Date(value).getTime()
+  return Number.isNaN(parsed) ? null : parsed
+}
+
+/**
+ * List snapshots, newest first **by manifest created_at** - never by directory
+ * name, which is attacker-controlled text. Entries whose age cannot be
+ * established are returned last and flagged, not hidden.
+ */
 export async function listSnapshots(target) {
   let entries = []
   try { entries = await fs.readdir(target, { withFileTypes: true }) } catch (error) { if (error.code !== 'ENOENT') throw error }
   const snapshots = []
-  const incomplete = []
+  const staging = []
+  const unreadable = []
   for (const entry of entries) {
     if (!entry.isDirectory()) continue
-    if (entry.name.startsWith(STAGING_PREFIX)) { incomplete.push(entry.name); continue }
+    if (entry.name.startsWith(STAGING_PREFIX)) { staging.push(entry.name); continue }
     const dir = path.join(target, entry.name)
     try {
       const manifest = await readManifest(dir)
-      snapshots.push({ name: entry.name, dir, createdAt: manifest.created_at, fileCount: manifest.file_count })
-    } catch { incomplete.push(entry.name) }
+      const createdAt = manifest.created_at
+      snapshots.push({ name: entry.name, dir, createdAt, time: parseCreatedAt(createdAt), usableTime: parseCreatedAt(createdAt) !== null, fileCount: manifest.file_count })
+    } catch (error) {
+      unreadable.push({ name: entry.name, reason: error.message })
+    }
   }
-  snapshots.sort((a, b) => (a.name < b.name ? 1 : a.name > b.name ? -1 : 0))
-  return { snapshots, incomplete }
+  snapshots.sort((a, b) => {
+    if (a.usableTime && b.usableTime && a.time !== b.time) return b.time - a.time
+    if (a.usableTime !== b.usableTime) return a.usableTime ? -1 : 1
+    return a.name < b.name ? 1 : a.name > b.name ? -1 : 0
+  })
+  return { snapshots, staging, unreadable }
 }
 
+export const RETENTION_DAYS_DEFAULT = 7
+const DAY_MS = 24 * 60 * 60 * 1000
+const FUTURE_TOLERANCE_MS = 5 * 60 * 1000
+
 /**
- * Roll a target back to the newest 'keep' verified snapshots.
- * Refuses to prune anything unless the newest snapshot verifies.
+ * Keep every complete snapshot inside the retention window and always keep the
+ * newest verified one.
+ *
+ * The window is measured from each manifest's own created_at, ordered by that
+ * same value - the directory name is never trusted for age. A snapshot whose
+ * age cannot be established (unreadable, invalid or future created_at) is never
+ * deleted; it is reported as an anomaly for manual handling.
+ *
+ * Boundary rule: a snapshot created exactly at the cutoff instant is inside the
+ * window and is kept. If no snapshot has a usable created_at, pruning refuses
+ * to run at all rather than guess.
  */
-export async function pruneSnapshots({ target, keep = 7 }) {
-  if (!Number.isInteger(keep) || keep < 1) throw new Error('keep must be a positive integer')
-  const { snapshots, incomplete } = await listSnapshots(target)
-  if (snapshots.length === 0) return { removed: [], kept: [], skipped: true, reason: 'no snapshots', incomplete }
-  const newest = await verifySnapshot(snapshots[0].dir)
+export async function pruneSnapshots({ target, retentionDays = RETENTION_DAYS_DEFAULT, now = new Date() }) {
+  if (!Number.isFinite(retentionDays) || retentionDays < 0) throw new Error('retentionDays must be a non-negative number')
+  const { snapshots, staging, unreadable } = await listSnapshots(target)
+  const report = { removed: [], kept: [], anomalies: [], staging, unreadable, skipped: false, reason: null }
+  if (snapshots.length === 0) { report.skipped = true; report.reason = 'no snapshots'; return report }
+  const aged = snapshots.filter((x) => x.usableTime)
+  if (aged.length === 0) {
+    report.skipped = true
+    report.reason = 'no snapshot has a usable created_at; refusing to prune'
+    report.kept = snapshots.map((x) => x.name)
+    for (const snapshot of snapshots) report.anomalies.push({ name: snapshot.name, reason: 'invalid created_at; kept for manual handling' })
+    return report
+  }
+  const newest = await verifySnapshot(aged[0].dir)
   if (!newest.ok) {
-    return { removed: [], kept: snapshots.map((x) => x.name), skipped: true, reason: 'newest snapshot failed verification; refusing to prune', incomplete }
+    report.skipped = true
+    report.reason = 'newest snapshot failed verification; refusing to prune'
+    report.kept = snapshots.map((x) => x.name)
+    return report
   }
-  const removed = []
-  for (const snapshot of snapshots.slice(keep)) {
+  const cutoff = now.getTime() - retentionDays * DAY_MS
+  const futureLimit = now.getTime() + FUTURE_TOLERANCE_MS
+  const removable = []
+  for (const [index, snapshot] of aged.entries()) {
+    const isNewest = index === 0
+    if (snapshot.time > futureLimit) {
+      report.anomalies.push({ name: snapshot.name, reason: 'created_at is in the future; kept for manual handling' })
+      report.kept.push(snapshot.name)
+      continue
+    }
+    if (isNewest || snapshot.time >= cutoff) { report.kept.push(snapshot.name); continue }
+    removable.push(snapshot)
+  }
+  for (const snapshot of snapshots) {
+    if (snapshot.usableTime) continue
+    report.anomalies.push({ name: snapshot.name, reason: 'invalid created_at; kept for manual handling' })
+    report.kept.push(snapshot.name)
+  }
+  for (const snapshot of removable) {
     await fs.rm(snapshot.dir, { recursive: true, force: true })
-    removed.push(snapshot.name)
+    report.removed.push(snapshot.name)
   }
-  return { removed, kept: snapshots.slice(0, keep).map((x) => x.name), skipped: false, incomplete }
+  if (report.removed.length === 0) report.reason = 'nothing outside the retention window'
+  return report
 }
 
 function parseArguments(rest) {
@@ -222,29 +283,39 @@ function parseArguments(rest) {
     else if (token === '--target') options.targets.push(rest[++index])
     else if (token === '--snapshot') options.snapshot = rest[++index]
     else if (token === '--dest') options.dest = rest[++index]
-    else if (token === '--keep') options.keep = Number(rest[++index])
+    else if (token === '--retention-days') options.retentionDays = Number(rest[++index])
     else throw new Error('Unknown argument: ' + token)
   }
   return options
+}
+
+function describePrune(prune) {
+  const parts = ['kept=' + prune.kept.length, 'removed=' + (prune.removed.length ? prune.removed.join(',') : 'none')]
+  if (prune.skipped) parts.push('prune skipped: ' + prune.reason)
+  else if (prune.reason) parts.push('note: ' + prune.reason)
+  if (prune.staging.length) parts.push('staging=' + prune.staging.join(','))
+  if (prune.unreadable.length) parts.push('unreadable=' + prune.unreadable.map((x) => x.name).join(','))
+  for (const anomaly of prune.anomalies) parts.push('anomaly[' + anomaly.name + ']: ' + anomaly.reason)
+  return parts.join(' ')
 }
 
 async function main(argv) {
   const [command, ...rest] = argv
   const options = parseArguments(rest)
   const source = path.resolve(options.source || process.env.LOCALPOST_MAILBOX || 'C:/AI_ASSIST/.mailbox')
+  const retentionDays = options.retentionDays ?? RETENTION_DAYS_DEFAULT
   if (command === 'backup') {
     if (!options.targets.length) throw new Error('backup needs at least one --target')
-    const keep = options.keep ?? 7
     let failed = 0
     for (const target of options.targets) {
       const resolved = path.resolve(target)
       try {
         const result = await backupMailbox({ source, target: resolved })
-        const prune = await pruneSnapshots({ target: resolved, keep })
+        const prune = await pruneSnapshots({ target: resolved, retentionDays })
         console.log('BACKUP ok ' + result.snapshot)
         console.log('  files=' + result.fileCount + ' bytes=' + result.totalBytes + ' verified=' + result.verification.ok)
         if (result.skipped.length) console.log('  skipped=' + result.skipped.length + ' ' + JSON.stringify(result.skipped.slice(0, 5)))
-        console.log('  kept=' + prune.kept.length + ' removed=' + (prune.removed.length ? prune.removed.join(',') : 'none') + (prune.skipped ? ' (prune skipped: ' + prune.reason + ')' : ''))
+        console.log('  retention-days=' + retentionDays + ' ' + describePrune(prune))
       } catch (error) {
         failed += 1
         console.log('BACKUP failed ' + resolved + ': ' + error.message)
@@ -273,8 +344,8 @@ async function main(argv) {
     if (!options.targets.length) throw new Error('prune needs at least one --target')
     for (const target of options.targets) {
       const resolved = path.resolve(target)
-      const result = await pruneSnapshots({ target: resolved, keep: options.keep ?? 7 })
-      console.log('PRUNE ' + resolved + ' kept=' + result.kept.length + ' removed=' + (result.removed.length ? result.removed.join(',') : 'none') + (result.skipped ? ' skipped: ' + result.reason : ''))
+      const result = await pruneSnapshots({ target: resolved, retentionDays })
+      console.log('PRUNE ' + resolved + ' retention-days=' + retentionDays + ' ' + describePrune(result))
     }
     return
   }
@@ -282,9 +353,10 @@ async function main(argv) {
     if (!options.targets.length) throw new Error('status needs at least one --target')
     for (const target of options.targets) {
       const resolved = path.resolve(target)
-      const { snapshots, incomplete } = await listSnapshots(resolved)
-      console.log('STATUS ' + resolved + ' snapshots=' + snapshots.length + (incomplete.length ? ' incomplete=' + incomplete.join(',') : ''))
+      const { snapshots, staging, unreadable } = await listSnapshots(resolved)
+      console.log('STATUS ' + resolved + ' snapshots=' + snapshots.length + ' staging=' + staging.length + ' unreadable=' + unreadable.length)
       for (const snapshot of snapshots) console.log('  ' + snapshot.name + ' files=' + snapshot.fileCount + ' created=' + snapshot.createdAt)
+      for (const item of unreadable) console.log('  UNREADABLE ' + item.name + ': ' + item.reason)
     }
     return
   }
