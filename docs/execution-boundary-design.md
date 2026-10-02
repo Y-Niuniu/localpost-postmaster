@@ -139,3 +139,32 @@
 profile 的 `cordis.patch.yml` 里含**明文 API key**（第三方视觉服务的 key），
 而该文件位于用户可写、可读区。这意味着：任何以用户身份运行的进程都能读到它。
 **值不记录在任何文档/信件中**；建议作为独立事项处理（例如迁到凭据文件或环境变量）。
+
+## 9. 只读调查补充结论（2026-10-02 19:24）
+
+### 9.1 启动路径实测
+
+| 对象 | 实测 |
+|---|---|
+| 开始菜单快捷方式 | `DeepSeek Harness.lnk` → **直接指向 `DeepSeek Harness.exe`，Arguments 为空**，WorkingDir = 安装目录 |
+| `.dsh/desktop-launcher/launcher.ps1` | **由 `dsh-desktop-launcher` 自动生成**（首行注释注明）；逻辑 = 先探测 `http://127.0.0.1:3000`，起一个 WPF 启动动画，再用 `dsh` CLI 启动 |
+| `install-shortcut.ps1` | 同目录，负责装快捷方式 |
+
+**对 bootstrap 的含义**：
+
+1. 桌面版常用入口（快捷方式 → EXE）**当前不传任何参数**，也就无法从它注入 `--patch`
+   或 `DSH_HOME`。要让 dsh 带上受保护 overlay，需要**替换/包裹启动入口**（快捷方式指向 wrapper）。
+2. `launcher.ps1` 调的是 `dsh` CLI → **那里技术上可以传参数**，
+   但它是**生成物**，手改会在重新生成时被覆盖 → **不能当作受保护 bootstrap 的落点**，
+   除非改的是生成它的插件（那又是用户可写区）。
+
+**结论**：L2（`--patch` 强制注入）要求"启动路径可传参 + 该路径本身受保护"；
+在本机现状下这两条**都不天然成立**，需要用户决定是否改变启动方式（例如让快捷方式指向一个
+管理员可写的 wrapper）。这属于"改变你的日常启动习惯"，必须用户拍板。
+
+### 9.2 仍未查清的（保持只读）
+
+- `$DSH_HOME/cordis.patch.yml` 是否会被 DSH 自己重写（决定它能否当受保护注册位）。
+- 当前 `dsh-mailbox-mcp` 进程的注册来源：**扫遍所有 `cordis.patch.yml` 与 profile package.json
+  都没有匹配**，说明它来自别处（插件自带配置 / 运行时注入 / 环境变量），需继续查。
+- home patch 与 `--patch` overlay 的精确相对优先级。
