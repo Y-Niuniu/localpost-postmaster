@@ -1,8 +1,29 @@
-# 生产账本重建迁移方案（未执行 · 待授权）
+# 生产账本重建迁移方案（2026-10-02 已执行）
 
 对象：`C:/AI_ASSIST/.mailbox/ledger.json`（schema `localpost-ledger-v0.2`，kernel `0.1.0`）
 快照时的 SHA-256：`aea128220632e7a317de069c02a231abdf62d1db9615ea6a5221990dcf72b9b5`
-本文件只描述方案与证据。**本任务没有对生产做任何写入。**
+第 1–6 节是执行前写的方案与证据，原文保留（上面这个哈希是 10/1 写方案时的值）。实际执行情况见第 0 节。
+
+## 0. 执行记录（2026-10-02）
+
+执行方式：用户本人运行 claude 写的闸门脚本。claude 的权限系统不允许它自己停计划任务、写生产。
+脚本先在 3 份生产副本上完整跑通，回滚也演练过。
+
+| 项 | 值 |
+|---|---|
+| 停写 | 09:21 用户停用 `LocalPostPostmaster` / `LocalPostGC`；dsh 未运行；无在途进程，无锁 |
+| 执行 | 09:21:52–09:22:00（本地时间），每一步闸门都通过 |
+| 快照 | `runtime/snapshots/2026-10-02T08-21-56-362Z-pre-ledger-rebuild`，verify 两次 `ok:true`；六条摘要存在同名的 `.six-records.md` |
+| 迁移前 SHA-256 | ledger `0faeff73b43bc664…`，alerts `a28c832a884b0d03…`，config `9f0abd4711a9a522…`（迁移后 config 未变） |
+| 比对 | 旧内核当时的视图 vs 新内核重建：告警一致（`overdue:dsh-20260930-003`）；记录 18 → 12，移除的正好是第 2 节那六条，无新增，无状态变化 |
+| 部署 | `postmaster.mjs` + `fs-safe` / `mailbox` / `mcp-server` / `receiver` / `receiver-cli` / `gc.mjs` + 新 `localpost-gc.ps1`，与规范库 `19f447f` 逐字节一致 |
+| 备份 | `postmaster.mjs.pre-20261001.bak`（20866 B）、`localpost-gc.ps1.pre-20261001.bak`（2380 B） |
+| GC | 换成新 wrapper，计划任务参数不变（不带 `-Apply`）→ **只预览，不删除**；原位 `-WhatIf` 预览 exit 0，0 个候选 |
+| 恢复 | 09:24 用户恢复两个任务，并手动触发一轮：新内核经计划任务调用链首次正式运行，exit 1（1 条告警），无残留锁 |
+| 未启动 | receiver / MCP server 只是文件就位，没有任何东西启动它们；自动派发仍禁用 |
+
+回滚（如需要）：按第 3 节停写 → 在新内核仍在位时 `restore --snapshot runtime/snapshots/2026-10-02T08-21-56-362Z-pre-ledger-rebuild`（先预览，再 `--apply`）
+→ 把两个 `.pre-20261001.bak` 拷回原名 → 按第 3 节「恢复写入口」恢复。
 
 ## 1. 为什么需要迁移
 
@@ -57,7 +78,8 @@
 5. **保留六条历史记录摘要**：把第 2 节表格（或等价的 JSON 摘要）随快照一起归档，**不要**只留重建后的账本
 6. 进入第 4 节：先 `--dry-run` 核对，再 `--rebuild`
 
-**恢复写入口**（迁移或回滚完成后）：先 `Enable-ScheduledTask -TaskName LocalPostPostmaster, LocalPostGC`，**最后**再启动 dsh。
+**恢复写入口**（迁移或回滚完成后）：先 `Get-ScheduledTask -TaskName LocalPostPostmaster, LocalPostGC | Enable-ScheduledTask`，**最后**再启动 dsh。
+（`Enable-` / `Disable-ScheduledTask` 的 `-TaskName` 只收一个名字，两个一起操作要像这样走管道。2026-10-02 实测：直接传两个名字会报参数转换错误。）
 插件会把已加载的内核模块缓存在 dsh 进程里（`lib/index.js` 的 `loadKernel`），换过内核文件之后，只有重新启动的 dsh 才会加载磁盘上的新版本。
 
 **锁的作用范围（第二道防线，不能代替停写）**：
@@ -99,7 +121,7 @@ dry-run 实测（新内核，只读）：
 
 ## 6. 未做 / 未验证
 
-- 本任务未在生产执行 snapshot / rebuild / restore 中的任何一步（生产文件哈希未变）
-- 第 3 节停写清单里的命令（停/启计划任务、进程检查）未在生产执行过；计划任务名与启动脚本是 2026-10-01 只读查询所得
-- 快照与恢复逻辑只在隔离测试（`localpost/migrate.test.mjs`，12 项，含同名并发、29 个 manifest 篡改子用例、与新内核轮次的锁互斥、CLI 退出码）中验证过；未在生产信箱实跑过 `snapshot` 写盘
+- 2026-10-02 已在生产执行 snapshot / verify / rebuild 和内核部署（见第 0 节）；**restore 从未在生产执行过**，只在生产副本上演练过
+- 第 3 节的停/启计划任务命令已由用户在生产执行过（2026-10-02）
+- 快照与恢复逻辑除生产这一次 snapshot 外，只在隔离测试（`localpost/migrate.test.mjs`，12 项，含同名并发、29 个 manifest 篡改子用例、与新内核轮次的锁互斥、CLI 退出码）和副本演练中验证过
 - 六条记录的「当时是否真的收到过回执」无法从现有证据判定，保持为未解决事项
