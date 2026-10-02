@@ -35,3 +35,20 @@ git -C C:/AI_ASSIST/tools/dsh-localpost-postmaster for-each-ref refs/tags/milest
 ```
 
 期望：新标签建好后，它们的 `%(*objectname)` 分别等于上表「建议的正确目标」的完整 SHA；两个旧标签的对象和指向保持不变。
+
+## 执行记录：标签纠正已落地（2026-10-02 18:08 · dsh）
+
+按六步任务第 4 步执行，**只新建、不动旧**：
+
+| 标签 | tag 对象 | 指向（%(*objectname)） |
+|---|---|---|
+| `milestone/migration` | `9409fcadaed9258734435e7c4b115d8537e6cb46` | `eac20c9bc637d8c900284da8eb58dfe4f05bb015` ✅ |
+| `milestone/controlled-write` | `ec501bf31cb359f3e2d006e1ba33384add2abb28` | `721e6ef4b5d21a338c4631d53c942fb90c117b8b` ✅ |
+
+两个旧误标标签**原样保留**（对象哈希与指向均未变，可作审计证据）：
+
+- `milestone/eac20c9-migration` → obj `101e22ce4fd6ebd7f476586e4596c721fe951966`，peel `fb3ec71...`
+- `milestone/721e6ef-controlled-write` → obj `059d1a8e439aebd7a7b523aa6f2568082e70d60e`，peel `fb3ec71...`
+
+核对命令与证据：`work/localpost-six-gates-evidence/step4-tags.txt`。
+仓库内**没有**任何文件引用这两个旧标签名（`git grep` 为空），发布 manifest 只用完整 source SHA。
