@@ -1,0 +1,184 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { createSessionStore, bind } from './session-binding.mjs';
+import {
+  reserve, reserveIn, beginDispatch, beginDispatchIn, settle, settleIn, dispatchLetter, claimManual, complete,
+  resolveUncertain, requestMode, switchMode, recoverClaims, occupancy, rotationDue,
+} from './letter-claims.mjs';
+import { auditState } from './rotation.mjs';
+import { envelopeDigest } from './mailbox.mjs';
+import { createFakeHost } from './fixtures/fake-session-host.mjs';
+import { removeTreeSync } from './temp-tree.mjs';
+
+const tempRoot = path.resolve(import.meta.dirname, '../.localpost-tmp/letter-claims');
+const AUTHORITY = { scope: 'analysis-reply', source: 'policy:test' };
+const OWNER = { generation: 1, session: 'session-1' };
+async function setup(t, { identity = 'codex', mode = 'auto', capacity = 50, root } = {}) {
+  if (!root) {
+    fs.mkdirSync(tempRoot, { recursive: true });
+    root = fs.mkdtempSync(path.join(tempRoot, 'case-'));
+    const created = root;
+    t.after(() => removeTreeSync(created));
+  }
+  const store = createSessionStore({ root });
+  await bind(store, identity, { session: { host: 'fake', id: 'session-1' }, mode, capacity, authority: AUTHORITY, source: 'user:explicit-bind' });
+  return { root, store, host: createFakeHost({ root }) };
+}
+const mail = id => ({ id, digest: envelopeDigest({ id, thread_id: id, from: 'dsh', to: 'codex', type: 'task', subject: 'Analyze', body: 'Please analyze', budget: 'standard', created_at: '2026-10-02T00:00:00.000Z' }) });
+// Bulk setup through the same pure transitions the wrappers use: reserve → dispatching → accepted.
+const acceptMany = (store, count) => store.update('codex', state => {
+  for (let i = 1; i <= count; i++) {
+    const letter = mail(`letter-${i}`), at = store.at(), token = `bulk-${i}`;
+    assert.equal(reserveIn(state, letter, at).ok, true);
+    assert.equal(beginDispatchIn(state, letter.id, { token }, at).ok, true);
+    assert.equal(settleIn(state, letter.id, { token, outcome: 'accepted' }, at).ok, true);
+  }
+});
+
+test('49/50/51: the 50th acceptance makes rotation due and the 51st letter stays queued', async t => {
+  const { store, host } = await setup(t);
+  await acceptMany(store, 49);
+  let state = await store.read('codex');
+  assert.deepEqual([occupancy(state).settled, rotationDue(state)], [49, false]);
+  const fiftieth = await dispatchLetter(store, 'codex', mail('letter-50'), host);
+  assert.equal(fiftieth.claim.status, 'accepted');
+  state = await store.read('codex');
+  assert.deepEqual([occupancy(state).settled, rotationDue(state)], [50, true]);
+  const fiftyFirst = await dispatchLetter(store, 'codex', mail('letter-51'), host);
+  assert.deepEqual([fiftyFirst.ok, fiftyFirst.reason], [false, 'capacity_full']);
+  state = await store.read('codex');
+  assert.equal(Object.hasOwn(state.claims, 'letter-51'), false, 'not claimed: it stays in the queue for the next generation');
+  assert.deepEqual(host.state().submits.map(x => x.letter), ['letter-50']);
+  assert.equal(host.state().submits[0].key, 'codex:letter-50:g1');
+  assert.deepEqual(auditState(state), []);
+});
+
+test('an in-flight 50th reservation blocks the 51st; an explicit host rejection releases it', async t => {
+  const { store, host } = await setup(t);
+  await acceptMany(store, 49);
+  assert.equal((await reserve(store, 'codex', mail('letter-50'))).ok, true);
+  assert.equal((await reserve(store, 'codex', mail('letter-51'))).reason, 'capacity_full');
+  host.behavior.submit = 'reject';
+  const rejected = await dispatchLetter(store, 'codex', mail('letter-50'), host);
+  assert.deepEqual([rejected.claim.status, rejected.claim.reason], ['released', 'host_rejected']);
+  assert.equal(rotationDue(await store.read('codex')), false);
+  host.behavior.submit = 'accept';
+  assert.equal((await dispatchLetter(store, 'codex', mail('letter-51'), host)).claim.status, 'accepted');
+  assert.equal((await dispatchLetter(store, 'codex', mail('letter-50'), host)).reason, 'capacity_full', 'a released letter competes for capacity like any other');
+});
+
+test('concurrent reservations at 49 admit exactly one, and a burst never overbooks', async t => {
+  const { root, store } = await setup(t);
+  await acceptMany(store, 49);
+  const other = createSessionStore({ root });
+  const pair = await Promise.all([reserve(store, 'codex', mail('race-a')), reserve(other, 'codex', mail('race-b'))]);
+  assert.equal(pair.filter(x => x.ok).length, 1);
+  assert.equal(pair.find(x => !x.ok).reason, 'capacity_full');
+  const small = await setup(t, { identity: 'opencode', capacity: 5, root });
+  const burst = await Promise.all(Array.from({ length: 12 }, (_, i) => reserve(i % 2 ? small.store : other, 'opencode', mail(`burst-${i}`))));
+  assert.equal(burst.filter(x => x.ok).length, 5);
+  assert.ok(burst.filter(x => !x.ok).every(x => x.reason === 'capacity_full'));
+  assert.equal(occupancy(await store.read('opencode')).total, 5);
+});
+
+test('id + digest deduplicates: repeats never count twice and a changed digest is a conflict', async t => {
+  const { store, host } = await setup(t, { capacity: 3 });
+  const letter = mail('dup');
+  assert.equal((await reserve(store, 'codex', letter)).ok, true);
+  assert.equal((await reserve(store, 'codex', letter)).reused, true);
+  assert.equal(occupancy(await store.read('codex')).total, 1);
+  assert.equal((await dispatchLetter(store, 'codex', letter, host)).claim.status, 'accepted');
+  assert.equal((await dispatchLetter(store, 'codex', letter, host)).reason, 'duplicate');
+  assert.equal((await complete(store, 'codex', 'dup', OWNER)).claim.status, 'done');
+  assert.equal((await reserve(store, 'codex', letter)).reason, 'duplicate');
+  assert.equal((await reserve(store, 'codex', { id: 'dup', digest: 'a'.repeat(64) })).reason, 'digest_conflict');
+  const state = await store.read('codex');
+  assert.deepEqual([state.claims.dup.digest, state.claims.dup.status, occupancy(state).settled], [letter.digest, 'done', 1]);
+  assert.equal(host.state().submits.length, 1);
+});
+
+test('uncertain acceptance is isolated, never redispatched, and closed only by its owner or an operator', async t => {
+  const { store, host } = await setup(t);
+  host.behavior.submit = 'throw';
+  const first = await dispatchLetter(store, 'codex', mail('unsure'), host);
+  assert.deepEqual([first.claim.status, first.claim.reason], ['needs_reconcile', 'dispatch_uncertain']);
+  host.behavior.submit = 'accept';
+  assert.equal((await dispatchLetter(store, 'codex', mail('unsure'), host)).reason, 'needs_reconcile');
+  assert.equal(host.state().submits.filter(x => x.letter === 'unsure').length, 1);
+  assert.equal((await complete(store, 'codex', 'unsure', { generation: 1, session: 'intruder' })).reason, 'not_owner');
+  assert.equal((await complete(store, 'codex', 'unsure', OWNER)).claim.status, 'done');
+
+  host.behavior.submit = 'throw';
+  await dispatchLetter(store, 'codex', mail('lost'), host);
+  const { version } = (await store.read('codex')).claims.lost;
+  assert.equal((await resolveUncertain(store, 'codex', 'lost', { outcome: 'requeue', expectedVersion: version - 1 })).reason, 'version_conflict');
+  assert.equal((await resolveUncertain(store, 'codex', 'lost', { outcome: 'requeue', expectedVersion: version })).claim.status, 'released');
+  host.behavior.submit = 'accept';
+  assert.equal((await dispatchLetter(store, 'codex', mail('lost'), host)).claim.status, 'accepted');
+  assert.equal(host.state().submits.filter(x => x.letter === 'lost').length, 2, 'only an operator requeue leads to a second delivery');
+});
+
+test('a late host outcome for an isolated attempt is kept as evidence only', async t => {
+  const { store } = await setup(t);
+  await reserve(store, 'codex', mail('late'));
+  const begun = await beginDispatch(store, 'codex', 'late');
+  assert.equal(begun.ok, true);
+  // Its dispatcher died here; the next actor finds the attempt in flight and isolates it.
+  assert.deepEqual((await store.withActor('codex', () => recoverClaims(store, 'codex'))).isolated, ['late']);
+  const late = await settle(store, 'codex', 'late', { token: begun.token, outcome: 'accepted' });
+  assert.deepEqual([late.ok, late.reason], [false, 'stale_attempt']);
+  const claim = (await store.read('codex')).claims.late;
+  assert.deepEqual([claim.status, claim.reason, claim.late.outcome], ['needs_reconcile', 'dispatch_interrupted', 'accepted']);
+  assert.equal((await settle(store, 'codex', 'late', { token: 'forged', outcome: 'failed' })).reason, 'stale_attempt');
+});
+
+test('manual and auto share one ledger: one consumer at a time, and a mode switch freezes, drains and swaps by CAS', async t => {
+  const { store, host } = await setup(t);
+  const shared = mail('shared');
+  // Racing for the same letter in auto mode: only the automatic consumer may take it.
+  const [manual, automatic] = await Promise.all([claimManual(store, 'codex', { ...shared, session: 'session-1' }), dispatchLetter(store, 'codex', shared, host)]);
+  assert.equal(manual.reason, 'mode_auto');
+  assert.equal(automatic.claim.status, 'accepted');
+  await reserve(store, 'codex', mail('waiting'));
+  await reserve(store, 'codex', mail('inflight'));
+  await beginDispatch(store, 'codex', 'inflight');
+  const { version } = (await store.read('codex')).binding;
+  assert.equal((await requestMode(store, 'codex', 'manual', { expectedVersion: version - 1 })).reason, 'version_conflict');
+  assert.equal((await requestMode(store, 'codex', 'manual', { expectedVersion: version })).ok, true);
+  // Frozen for the switch: neither consumer may take new mail.
+  assert.equal((await reserve(store, 'codex', mail('during'))).reason, 'frozen');
+  assert.equal((await claimManual(store, 'codex', { ...mail('during'), session: 'session-1' })).reason, 'frozen');
+  assert.equal((await beginDispatch(store, 'codex', 'waiting')).reason, 'frozen');
+  assert.equal((await switchMode(store, 'codex', 'manual')).ok, true);
+  let state = await store.read('codex');
+  assert.deepEqual([state.binding.mode, state.binding.state, state.binding.version], ['manual', 'active', version + 2]);
+  assert.deepEqual([state.claims.inflight.status, state.claims.inflight.reason], ['needs_reconcile', 'dispatch_interrupted']);
+  // The reservation made under auto stays in the same ledger; only the bound session may now take it.
+  assert.equal((await claimManual(store, 'codex', { ...mail('waiting'), session: 'someone-else' })).reason, 'not_bound_session');
+  const [taken, refused] = await Promise.all([claimManual(store, 'codex', { ...mail('waiting'), session: 'session-1' }), dispatchLetter(store, 'codex', mail('waiting'), host)]);
+  assert.equal(taken.claim.status, 'accepted');
+  assert.equal(refused.reason, 'mode_manual');
+  assert.equal((await claimManual(store, 'codex', { ...shared, session: 'session-1' })).reused, true, 'already its own letter: not counted again');
+  assert.deepEqual(host.state().submits.map(x => x.letter), ['shared']);
+  state = await store.read('codex');
+  assert.deepEqual([occupancy(state).accepted, occupancy(state).needs_reconcile], [2, 1]);
+  assert.deepEqual(auditState(state), []);
+});
+
+test('a pending mode switch is finished by the next actor after a crash', async t => {
+  const { store, host } = await setup(t);
+  assert.equal((await requestMode(store, 'codex', 'manual')).ok, true);
+  assert.equal((await dispatchLetter(store, 'codex', mail('after-crash'), host)).reason, 'mode_manual');
+  assert.deepEqual([(await store.read('codex')).binding.mode, (await store.read('codex')).binding.state], ['manual', 'active']);
+  assert.equal(host.state().submits.length, 0);
+});
+
+test('prototype-named letter ids are ordinary ledger keys', async t => {
+  const { store, host } = await setup(t);
+  for (const id of ['constructor', 'toString', 'hasOwnProperty']) assert.equal((await dispatchLetter(store, 'codex', mail(id), host)).claim.status, 'accepted');
+  const state = await store.read('codex');
+  assert.equal(occupancy(state).accepted, 3);
+  assert.equal((await complete(store, 'codex', 'valueOf', OWNER)).reason, 'not_claimed');
+});
