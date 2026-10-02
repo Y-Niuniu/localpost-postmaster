@@ -15,19 +15,31 @@ const inside = (root, candidate) => {
 };
 
 // Validate existing ancestors too: lexical containment alone does not stop junctions.
+// GetFinalPathNameByHandle can return the \\\\?\\ (or \\\\?\\UNC\\) spelling of a path it resolved
+// while another process was creating or unlinking that entry. Comparing that spelling against a
+// plain DOS path made ordinary lock contention look like a junction escape, so normalise first.
+const normalizeFinal = value => value.startsWith('\\\\?\\UNC\\') ? '\\\\' + value.slice(8)
+  : value.startsWith('\\\\?\\') ? value.slice(4) : value;
+
 export function safePath(root, relative) {
   if (typeof relative !== 'string' || !relative || path.isAbsolute(relative) || /^[A-Za-z]:/.test(relative) ||
       relative.split(/[\\/]/).some(x => x === '..')) throw new Error('Path escapes mailbox root');
   const base = path.resolve(root);
   const target = path.resolve(base, relative);
   if (!inside(base, target)) throw new Error('Path escapes mailbox root');
-  const realBase = fs.existsSync(base) ? fs.realpathSync.native(base) : base;
+  const realBase = fs.existsSync(base) ? normalizeFinal(fs.realpathSync.native(base)) : base;
   let cursor = base;
   for (const segment of path.relative(base, target).split(path.sep).filter(Boolean)) {
     cursor = path.join(cursor, segment);
     try {
-      fs.lstatSync(cursor);
-      if (!inside(realBase, fs.realpathSync.native(cursor))) throw new Error('Linked path escapes mailbox root');
+      // Only reparse points (symlinks and junctions) can redirect outside the root. Re-resolving
+      // ordinary files proved unreliable while another process was creating or unlinking them
+      // (Windows returned the \\? volume form and occasional EBADF), which turned normal lock
+      // contention into a bogus "escapes root" failure. Reparse points are still validated.
+      if (fs.lstatSync(cursor).isSymbolicLink() &&
+          !inside(realBase, normalizeFinal(fs.realpathSync.native(cursor)))) {
+        throw new Error('Linked path escapes mailbox root');
+      }
     } catch (error) { if (error.code !== 'ENOENT') throw error; }
   }
   return target;
@@ -68,9 +80,23 @@ function dead(pid) {
   try { process.kill(pid, 0); return false; }
   catch (error) { return error.code === 'ESRCH'; }
 }
+const TRANSIENT_LEASE_ERRORS = new Set(['EPERM', 'EACCES', 'EBUSY']);
+const isTransientLeaseError = error => Boolean(error) && TRANSIENT_LEASE_ERRORS.has(error.code);
 async function readOwner(file) {
-  try { return JSON.parse(await fsp.readFile(file, 'utf8')); }
-  catch (error) { if (error.code === 'ENOENT') return null; return { invalid: true }; }
+  try {
+    const raw = await fsp.readFile(file, 'utf8');
+    // A lock file that exists but is still empty is being written right now - not corrupt.
+    if (raw.trim() === '') return { transient: true };
+    return JSON.parse(raw);
+  }
+  catch (error) {
+    if (error.code === 'ENOENT') return null;
+    // Windows keeps a freshly unlinked lock in "delete pending" for a moment. A transient
+    // EPERM/EACCES/EBUSY says nothing about the owner's validity, so it must never be
+    // reported as a corrupt lock (that misreport made concurrent sends look like failures).
+    if (isTransientLeaseError(error)) return { transient: true };
+    return { invalid: true };
+  }
 }
 async function unlinkOwned(file, token) {
   const current = await readOwner(file);
@@ -86,8 +112,8 @@ async function createOwner(file, now) {
     return { acquired: true, reason: 'acquired', release: () => unlinkOwned(file, token) };
   } catch (error) {
     if (handle) { await handle.close(); await unlinkOwned(file, token); }
-    if (error.code !== 'EEXIST') throw error;
-    return null;
+    if (error.code === 'EEXIST' || isTransientLeaseError(error)) return null;
+    throw error;
   }
 }
 const busy = reason => ({ acquired: false, reason, release: async () => {} });
@@ -95,7 +121,9 @@ const busy = reason => ({ acquired: false, reason, release: async () => {} });
 export async function acquireLease(root, { name = '.postmaster.lock', staleMs = 300000, now = Date.now() } = {}) {
   if (!/^[A-Za-z0-9_.-]+$/.test(name) || name === '.' || name === '..') throw new Error('Invalid lease name');
   await fsp.mkdir(root, { recursive: true });
-  const file = safePath(root, name);
+  let file;
+  try { file = safePath(root, name); }
+  catch (error) { if (isTransientLeaseError(error)) return busy('busy'); throw error; }
   const owner = await createOwner(file, now);
   if (owner) return owner;
   const previous = await readOwner(file);

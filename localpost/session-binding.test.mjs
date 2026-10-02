@@ -70,12 +70,14 @@ test('a state lock caught mid-release is retried within a bound; an unknown owne
   const { root, store } = fixture(t);
   await bind(store, 'codex', request());
   const lock = path.join(root, '.session-codex.lock');
-  // While a holder deletes its lock file, Windows refuses to open it (EPERM) although it still exists.
+  // A transient realpath refusal (Windows refuses to resolve an entry while a holder is
+    // releasing it) must not escape as a hard error: the store retries within a bound instead.
+    // Injected on the root path, which is always resolved, so the contract stays covered.
   fs.writeFileSync(lock, JSON.stringify({ token: 'releasing', pid: process.pid, started_at: Date.now() }));
   const realpath = fs.realpathSync.native;
   let refusals = 3;
   t.mock.method(fs.realpathSync, 'native', (target, ...rest) => {
-    if (refusals > 0 && String(target).endsWith('.session-codex.lock')) { refusals--; throw Object.assign(new Error('EPERM: operation not permitted, realpath'), { code: 'EPERM' }); }
+    if (refusals > 0 && path.resolve(String(target)) === path.resolve(root)) { refusals--; throw Object.assign(new Error('EPERM: operation not permitted, realpath'), { code: 'EPERM' }); }
     return realpath(target, ...rest);
   });
   setTimeout(() => fs.unlinkSync(lock), 80);
