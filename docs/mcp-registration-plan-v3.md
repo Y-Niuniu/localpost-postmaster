@@ -141,7 +141,7 @@ YAML 里写三项 **不等于** 其它继承变量已被移除。必须：
    - 读 `initialize` 返回的 `instructions`，确认其中 identity 为 `dsh`
    - 做**跨身份负向请求**（例如以 dsh 身份去归档/读取别人的信）必须被拒
    - `mailbox_roster` 只作辅助（它只列 agents 与数量，**不是**绑定证据）
-2. **只读**：工具列表出现 `localpost__mailbox_*`；调 `mailbox_rules` 能读到唯一源
+2. **只读**：工具列表出现 `mcp__localpost__mailbox_*`（宿主按 `mcp__<serverName>__<tool>` 注册，以真实宿主的工具列表为准）；调 `mailbox_rules` 能读到唯一源
 3. **隔离测试信**：claude 用专门 thread 投 `mcptest-` 前缀的 task 给 dsh，验证：
    - 正向：`mailbox_reply`（completed）自动归档原信；`mailbox_archive` 重复调用幂等
    - 反向：归档 claude 的信被拒；逃逸 id 被拒
