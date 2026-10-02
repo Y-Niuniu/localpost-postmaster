@@ -138,5 +138,7 @@ export function startStdio(options) {
 }
 
 if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
+  // 宿主验收用：本进程实际收到的环境变量名，只写名字不写值（见 docs/mcp-launch.md）。
+  if (process.env.MAILBOX_ENV_REPORT === '1') process.stderr.write('[mailbox-mcp] env names: ' + Object.keys(process.env).sort().join(',') + '\n');
   try { startStdio(); } catch (error) { process.stderr.write('[mailbox-mcp] ' + error.message + '\n'); process.exitCode = 2; }
 }
