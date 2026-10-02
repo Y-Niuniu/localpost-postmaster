@@ -33,6 +33,20 @@ export function safePath(root, relative) {
   return target;
 }
 
+// Windows briefly refuses a replacing rename while another writer, a scanner or an indexer holds the
+// target. Retry only those refusals, a bounded number of times (about 1.3 s in total), then fail loudly.
+const TRANSIENT_RENAME = new Set(['EPERM', 'EACCES', 'EBUSY']);
+export const RENAME_ATTEMPTS = 8;
+async function renameReplacing(from, to) {
+  for (let attempt = 1; ; attempt++) {
+    try { return await fsp.rename(from, to); }
+    catch (error) {
+      if (!TRANSIENT_RENAME.has(error.code) || attempt >= RENAME_ATTEMPTS) throw error;
+      await new Promise(resolve => setTimeout(resolve, 5 * 2 ** attempt));
+    }
+  }
+}
+
 export async function atomicWrite(file, text) {
   await fsp.mkdir(path.dirname(file), { recursive: true });
   const temporary = `${file}.${randomUUID()}.tmp`;
@@ -42,7 +56,7 @@ export async function atomicWrite(file, text) {
     await handle.writeFile(text, 'utf8');
     await handle.sync();
     await handle.close(); handle = undefined;
-    await fsp.rename(temporary, file);
+    await renameReplacing(temporary, file);
   } finally {
     if (handle) await handle.close();
     await fsp.rm(temporary, { force: true });

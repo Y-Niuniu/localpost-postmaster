@@ -37,13 +37,23 @@ export const TOOLS = [
   { name: 'mailbox_archive', description: 'Archive a processed letter; retries are idempotent.', inputSchema: schema({ agent: { type: 'string' }, id: { type: 'string' } }, ['agent', 'id']) },
 ];
 
+// MAILBOX_TOOLS: comma-separated allowlist (e.g. automated mode without mailbox_send). Unknown or empty lists fail closed.
+function allowedTools(value) {
+  const names = (Array.isArray(value) ? value : String(value).split(',')).map(name => String(name).trim()).filter(Boolean);
+  const unknown = names.filter(name => !TOOLS.some(tool => tool.name === name));
+  if (unknown.length || !names.length) throw new Error('Invalid MAILBOX_TOOLS: ' + (unknown.join(', ') || '(empty)'));
+  return TOOLS.filter(tool => names.includes(tool.name));
+}
+
 export function createMcpServer({
   root = process.env.MAILBOX_ROOT || 'C:/AI_ASSIST/.mailbox',
   identity = process.env.MAILBOX_IDENTITY || undefined,
   admin = process.env.MAILBOX_ADMIN === '1',
+  tools = process.env.MAILBOX_TOOLS || undefined,
 } = {}) {
   // An unbound server can act as any agent, so it must be an explicit operator choice, never a default.
   if (!identity && !admin) throw new Error('LocalPost MCP requires MAILBOX_IDENTITY=<agent>; administrator mode needs explicit MAILBOX_ADMIN=1 and is not for automated flows');
+  const allowed = tools === undefined ? TOOLS : allowedTools(tools);
   root = path.resolve(root);
   const mail = createMailbox({ root, identity });
   const ok = (id, result) => ({ jsonrpc: '2.0', id, result });
@@ -73,17 +83,26 @@ export function createMcpServer({
     });
     if (method?.startsWith('notifications/')) return null;
     if (method === 'ping') return ok(id, {});
-    if (method === 'tools/list') return ok(id, { tools: TOOLS });
+    if (method === 'tools/list') return ok(id, { tools: allowed });
     if (method === 'tools/call') {
       try {
         const tool = TOOLS.find(tool => tool.name === params?.name);
         if (!tool) throw new Error('Unknown tool: ' + params?.name);
+        // Enforced on call, not only hidden from tools/list.
+        if (!allowed.includes(tool)) throw new Error('Tool not allowed in this deployment: ' + tool.name);
         const args = params?.arguments || {};
         for (const key of Object.keys(args)) if (!Object.hasOwn(tool.inputSchema.properties, key)) throw new Error('Unknown argument: ' + key);
         for (const key of tool.inputSchema.required) if (args[key] === undefined) throw new Error('Missing argument: ' + key);
         const out = await callTool(tool.name, args);
         return ok(id, { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] });
-      } catch (error) { return ok(id, { content: [{ type: 'text', text: 'Error: ' + error.message }], isError: true }); }
+      } catch (error) {
+        // A published result must stay machine-recognizable; only these fields cross the boundary.
+        const text = error.code === 'REPLIED_ARCHIVE_PENDING'
+          ? JSON.stringify({ status: 'partial_failure', code: error.code, reply_delivered: true, reply_id: error.reply.id,
+            outcome: error.reply.outcome, archive_pending: error.pending, retry_action: 'mailbox_archive', message: error.message }, null, 2)
+          : 'Error: ' + error.message;
+        return ok(id, { content: [{ type: 'text', text }], isError: true });
+      }
     }
     return { jsonrpc: '2.0', id, error: { code: -32601, message: 'Unknown method: ' + method } };
   }

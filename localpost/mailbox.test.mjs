@@ -248,3 +248,113 @@ test('the identity-bound MCP process enforces own-archive, idempotence, identity
   assert.equal(JSON.parse(text(4)).letters.length, 0);
   assert.ok(fs.existsSync(path.join(root, 'agents/dsh/inbox/task-two.json')));
 });
+
+test('MCP reports a published but unarchived reply as a structured partial failure that archive finishes', async t => {
+  const { root } = fixture(t);
+  const admin = createMailbox({ root });
+  await admin.deliver(letter());
+  const { createMcpServer } = await import('./mcp-server.mjs');
+  const server = createMcpServer({ root, identity: 'codex' });
+  const rename = fs.renameSync;
+  let failNextArchive = true;
+  t.mock.method(fs, 'renameSync', (from, to) => {
+    if (failNextArchive && String(to).includes(`${path.sep}archive${path.sep}`)) {
+      failNextArchive = false;
+      throw Object.assign(new Error('EPERM: operation not permitted, rename'), { code: 'EPERM' });
+    }
+    return rename(from, to);
+  });
+  const call = (id, name, args) => server.handle({ id, method: 'tools/call', params: { name, arguments: args } });
+  const reply = { agent: 'codex', reply_to: 'task-one', body: 'Reviewed', outcome: 'completed' };
+  const partial = await call(1, 'mailbox_reply', reply);
+  assert.equal(partial.result.isError, true);
+  const state = JSON.parse(partial.result.content[0].text);
+  assert.deepEqual({ ...state, message: undefined }, { status: 'partial_failure', code: 'REPLIED_ARCHIVE_PENDING', reply_delivered: true,
+    reply_id: 'task-one.result', outcome: 'completed', archive_pending: 'task-one', retry_action: 'mailbox_archive', message: undefined });
+  assert.equal(admin.read('dsh', 'task-one.result').envelope.outcome, 'completed');
+  assert.equal(admin.inbox('codex').length, 1);
+  const archived = await call(2, 'mailbox_archive', { agent: 'codex', id: 'task-one' });
+  assert.equal(JSON.parse(archived.result.content[0].text).archived, 'task-one');
+  assert.equal(JSON.parse((await call(3, 'mailbox_reply', reply)).result.content[0].text).idempotent, true);
+  assert.equal(admin.inbox('codex').length, 0);
+  assert.equal(admin.inbox('dsh').length, 1);
+  const plain = await call(4, 'mailbox_archive', { agent: 'codex', id: 'missing' });
+  assert.match(plain.result.content[0].text, /^Error: letter not found/);
+});
+
+test('MCP identity and administrator combinations fail closed', { timeout: 10000 }, async t => {
+  const { root } = fixture(t);
+  await createMailbox({ root }).deliver(letter({ id: 'task-two', from: 'codex', to: 'dsh' }));
+  const { createMcpServer } = await import('./mcp-server.mjs');
+  assert.throws(() => createMcpServer({ root, identity: '../dsh' }), /invalid agent identity/);
+  assert.throws(() => createMcpServer({ root, identity: '', admin: false }), /MAILBOX_IDENTITY/);
+  const bound = createMcpServer({ root, identity: 'codex', admin: true });
+  const crossed = await bound.handle({ id: 1, method: 'tools/call', params: { name: 'mailbox_inbox', arguments: { agent: 'dsh' } } });
+  assert.equal(crossed.result.isError, true);
+  assert.match(crossed.result.content[0].text, /does not own mailbox/);
+  const { code, stderr, responses } = await runMcp(t, { MAILBOX_ROOT: root, MAILBOX_ADMIN: '1', MAILBOX_TOOLS: 'mailbox_rules, mailbox_roster' }, [
+    { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }, { jsonrpc: '2.0', id: 2, method: 'tools/list' }]);
+  assert.equal(code, 0, stderr);
+  assert.match(responses[0].result.instructions, /administrator mode/);
+  assert.deepEqual(responses[1].result.tools.map(tool => tool.name), ['mailbox_rules', 'mailbox_roster']);
+});
+
+test('an MCP tool allowlist is enforced on call, not only hidden from the list', async t => {
+  const { root } = fixture(t);
+  const { createMcpServer } = await import('./mcp-server.mjs');
+  assert.throws(() => createMcpServer({ root, identity: 'dsh', tools: 'mailbox_reply,mailbox_sned' }), /Invalid MAILBOX_TOOLS: mailbox_sned/);
+  assert.throws(() => createMcpServer({ root, identity: 'dsh', tools: ' , ' }), /Invalid MAILBOX_TOOLS/);
+  const server = createMcpServer({ root, identity: 'dsh', tools: 'mailbox_inbox,mailbox_read,mailbox_reply,mailbox_archive' });
+  const names = (await server.handle({ id: 1, method: 'tools/list' })).result.tools.map(tool => tool.name);
+  assert.deepEqual(names, ['mailbox_inbox', 'mailbox_read', 'mailbox_reply', 'mailbox_archive']);
+  const send = await server.handle({ id: 2, method: 'tools/call', params: { name: 'mailbox_send', arguments: letter({ from: 'dsh', to: 'codex' }) } });
+  assert.equal(send.result.isError, true);
+  assert.match(send.result.content[0].text, /not allowed in this deployment: mailbox_send/);
+  assert.equal(fs.existsSync(path.join(root, 'agents/codex/inbox/task-one.json')), false);
+  const inbox = await server.handle({ id: 3, method: 'tools/call', params: { name: 'mailbox_inbox', arguments: { agent: 'dsh' } } });
+  assert.equal(inbox.result.isError, undefined);
+});
+
+test('a process killed between publishing a reply and archiving recovers by rule: one result, original archived, dead lease reclaimed', { timeout: 15000 }, async t => {
+  const { root, mail } = fixture(t, 'codex');
+  await createMailbox({ root }).deliver(letter());
+  const barrier = path.join(root, 'published.barrier');
+  const reply = { reply_to: 'task-one', body: 'Reviewed', outcome: 'completed' };
+  // The child blocks synchronously inside the archive rename, i.e. after the result is public.
+  const script = `
+    import fs from 'node:fs'; import path from 'node:path';
+    const { createMailbox } = await import(process.env.LP_MAILBOX_URL);
+    const rename = fs.renameSync;
+    fs.renameSync = (from, to) => {
+      if (String(to).includes(path.sep + 'archive' + path.sep)) {
+        fs.writeFileSync(process.env.LP_BARRIER, 'published');
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+      }
+      return rename(from, to);
+    };
+    await createMailbox({ root: process.env.LP_ROOT, identity: 'codex' }).reply('codex', JSON.parse(process.env.LP_REPLY));`;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', script], { windowsHide: true, stdio: 'ignore', env: {
+    ...process.env, LP_ROOT: root, LP_BARRIER: barrier, LP_REPLY: JSON.stringify(reply), LP_MAILBOX_URL: new URL('./mailbox.mjs', import.meta.url).href } });
+  t.after(() => { if (child.exitCode === null) child.kill(); });
+  const exited = new Promise(resolve => child.on('close', resolve));
+  const deadline = Date.now() + 10000;
+  while (!fs.existsSync(barrier)) {
+    assert.ok(Date.now() < deadline && child.exitCode === null, 'child never reached the archive step');
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  child.kill();
+  await exited;
+  const lease = path.join(root, '.mailbox-write.lock');
+  assert.ok(fs.existsSync(path.join(root, 'agents/dsh/inbox/task-one.result.json')), 'result is public');
+  assert.equal(mail.inbox('codex').length, 1, 'original still pending');
+  assert.ok(fs.existsSync(lease), 'dead owner left its lease');
+  const { acquireLease } = await import('./fs-safe.mjs');
+  assert.equal((await acquireLease(root, { name: '.mailbox-write.lock', staleMs: 60000 })).acquired, false, 'a fresh lease is not stolen');
+  const owner = JSON.parse(fs.readFileSync(lease, 'utf8'));
+  fs.writeFileSync(lease, JSON.stringify({ ...owner, started_at: Date.now() - 61000 }));
+  const repaired = await mail.reply('codex', reply);
+  assert.equal(repaired.idempotent, true);
+  assert.equal(mail.inbox('codex').length, 0);
+  assert.equal(createMailbox({ root }).inbox('dsh').length, 1);
+  assert.equal(fs.existsSync(lease), false);
+});

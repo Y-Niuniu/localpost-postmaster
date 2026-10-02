@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { acquireLease, assertId, safePath, atomicWrite } from './fs-safe.mjs';
+import { acquireLease, assertId, safePath, atomicWrite, RENAME_ATTEMPTS } from './fs-safe.mjs';
 import { removeTree } from './temp-tree.mjs';
 
 test('exclusive lease has exactly one concurrent owner', async () => {
@@ -60,4 +60,35 @@ test('stale dead ISO owner is recovered once, unknown owner is retained', async 
     assert.match(unknown.reason, /reconcile/);
     assert.equal(await fs.readFile(path.join(root, '.postmaster.lock'), 'utf8'), '{bad');
   } finally { await removeTree(root); }
+});
+
+test('a transient replacing-rename refusal is retried within a bound and leaves no temporary', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'localpost-rename-'));
+  t.after(() => removeTree(root));
+  const target = safePath(root, 'x.json');
+  const rename = fs.rename;
+  let refusals = 2;
+  t.mock.method(fs, 'rename', async (from, to) => {
+    if (refusals > 0) { refusals--; throw Object.assign(new Error('EPERM: operation not permitted, rename'), { code: 'EPERM' }); }
+    return rename(from, to);
+  });
+  await atomicWrite(target, '{"ok":true}');
+  assert.equal(refusals, 0);
+  assert.deepEqual(JSON.parse(await fs.readFile(target, 'utf8')), { ok: true });
+  assert.deepEqual(await fs.readdir(root), ['x.json']);
+});
+
+test('a persistent rename refusal fails after the bound; other rename errors are not retried', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'localpost-rename-'));
+  t.after(() => removeTree(root));
+  const target = safePath(root, 'x.json');
+  let calls = 0, code = 'EPERM';
+  t.mock.method(fs, 'rename', async () => { calls++; throw Object.assign(new Error(code), { code }); });
+  await assert.rejects(atomicWrite(target, '{}'), { code: 'EPERM' });
+  assert.equal(calls, RENAME_ATTEMPTS);
+  assert.deepEqual(await fs.readdir(root), []);
+  calls = 0; code = 'ENOENT';
+  await assert.rejects(atomicWrite(target, '{}'), { code: 'ENOENT' });
+  assert.equal(calls, 1);
+  assert.deepEqual(await fs.readdir(root), []);
 });

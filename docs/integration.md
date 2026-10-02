@@ -16,7 +16,15 @@ main integrator. Keep the authoritative mailbox operations in
   server refuses to start unbound unless `MAILBOX_ADMIN=1` is set explicitly.
   If a terminal reply is published but archiving the original fails, the tool
   reports `REPLIED_ARCHIVE_PENDING` (已回执但待归档) instead of a plain failure;
-  retrying the same `mailbox_reply` or `mailbox_archive` finishes it.
+  over MCP this is `isError` with a JSON body (`status: partial_failure`,
+  `reply_delivered: true`, `archive_pending`, `retry_action: mailbox_archive`).
+  Retrying the same `mailbox_reply` (same id and content) or `mailbox_archive` finishes it.
+  `MAILBOX_TOOLS` (comma list) restricts the tools a deployment exposes, enforced on
+  call as well as in `tools/list`; unknown or empty lists refuse to start. Manual use
+  keeps all seven; an automated reader should not get `mailbox_send`.
+- `localpost/fs-safe.mjs` `atomicWrite`: a replacing rename that Windows refuses
+  transiently (`EPERM`/`EACCES`/`EBUSY`) is retried a bounded number of times (~1.3 s),
+  then fails loudly; callers still serialize writers per target with leases.
 - `localpost/receiver.mjs` + `receiver-cli.mjs`: watch + 30-second repair scans and
   metadata-only durable queues in `runtime/queues`. Empty polling calls no model.
 - `localpost/dsh-adapter.mjs`: injectable rc.2 contract, disabled without verified
