@@ -174,6 +174,9 @@ export async function acquireLease(root, { name = '.postmaster.lock', staleMs = 
     const current = await readOwner(file);
     if (current && !stale(current)) return busy('busy');
     if (current) await fsp.unlink(file);
-    return await createOwner(file, now) || busy('busy');
   } finally { await gate.release(); }
+  // Create the new main lock only after the gate is released. If the release throws, this actor has
+  // not created a main lock yet, so it never strands one that it owns but holds no lease for.
+  // From here it is an ordinary exclusive create: whoever gets there first wins, the rest are busy.
+  return await createOwner(file, now) || busy('busy');
 }

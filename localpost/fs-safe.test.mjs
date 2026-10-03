@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
+import { spawn } from 'node:child_process';
 import { acquireLease, assertId, safePath, atomicWrite, RENAME_ATTEMPTS } from './fs-safe.mjs';
 import { removeTree } from './temp-tree.mjs';
 
@@ -62,33 +63,31 @@ test('stale dead ISO owner is recovered once, unknown owner is retained', async 
   } finally { await removeTree(root); }
 });
 
+// 替换 rename 的故障注入放进子进程 fixture：测试进程里不改共享的内置模块方法。
+const fault = (scenario, root) => new Promise((resolve, reject) => {
+  const child = spawn(process.execPath, [path.join(import.meta.dirname, 'fixtures', 'fs-safe-fault.mjs'), scenario, root],
+    { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+  let out = '', err = '';
+  child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
+  child.stdout.on('data', d => { out += d; }); child.stderr.on('data', d => { err += d; });
+  child.on('error', reject);
+  child.on('close', code => code === 0 ? resolve(JSON.parse(out)) : reject(new Error(`fixture ${scenario} exited ${code}: ${err}`)));
+});
+
 test('a transient replacing-rename refusal is retried within a bound and leaves no temporary', async t => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'localpost-rename-'));
   t.after(() => removeTree(root));
-  const target = safePath(root, 'x.json');
-  const rename = fs.rename;
-  let refusals = 2;
-  t.mock.method(fs, 'rename', async (from, to) => {
-    if (refusals > 0) { refusals--; throw Object.assign(new Error('EPERM: operation not permitted, rename'), { code: 'EPERM' }); }
-    return rename(from, to);
-  });
-  await atomicWrite(target, '{"ok":true}');
-  assert.equal(refusals, 0);
-  assert.deepEqual(JSON.parse(await fs.readFile(target, 'utf8')), { ok: true });
-  assert.deepEqual(await fs.readdir(root), ['x.json']);
+  const r = await fault('rename-transient', root);
+  assert.equal(r.refusalsLeft, 0);
+  assert.deepEqual(r.content, { ok: true });
+  assert.deepEqual(r.entries, ['x.json']);
 });
 
 test('a persistent rename refusal fails after the bound; other rename errors are not retried', async t => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'localpost-rename-'));
   t.after(() => removeTree(root));
-  const target = safePath(root, 'x.json');
-  let calls = 0, code = 'EPERM';
-  t.mock.method(fs, 'rename', async () => { calls++; throw Object.assign(new Error(code), { code }); });
-  await assert.rejects(atomicWrite(target, '{}'), { code: 'EPERM' });
-  assert.equal(calls, RENAME_ATTEMPTS);
-  assert.deepEqual(await fs.readdir(root), []);
-  calls = 0; code = 'ENOENT';
-  await assert.rejects(atomicWrite(target, '{}'), { code: 'ENOENT' });
-  assert.equal(calls, 1);
-  assert.deepEqual(await fs.readdir(root), []);
+  const r = await fault('rename-persistent', root);
+  assert.equal(r.attempts, RENAME_ATTEMPTS);
+  assert.deepEqual(r.transient, { error: 'EPERM', calls: RENAME_ATTEMPTS, entries: [] });
+  assert.deepEqual(r.other, { error: 'ENOENT', calls: 1, entries: [] });
 });
