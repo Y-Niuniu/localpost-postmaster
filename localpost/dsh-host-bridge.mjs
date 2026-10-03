@@ -55,6 +55,7 @@ export function createDshHostBridge({ ctx, runtimeVersion, store, identity, host
   const capabilities = Object.freeze({ runtimeVersion: versionOk, commandRegistry: canRegister, liveAgentLookup: canLookup, chatBinding });
   const actions = new Map();
   let registration = null;
+  const registered = new Map();
 
   const bridge = {
     capabilities,
@@ -103,18 +104,34 @@ export function createDshHostBridge({ ctx, runtimeVersion, store, identity, host
     if (typeof commands.find === 'function') {
       for (const name of names) {
         let existing;
-        try { existing = commands.find(undefined, name); } catch { existing = undefined; }
+        // An unreadable lookup is not "no existing definition": it must stop registration.
+        try { existing = commands.find(undefined, name); }
+        catch (error) { return { ok: false, reason: 'lookup_failed', name, message: String(error?.message ?? error), dispose: () => {} }; }
         if (existing !== undefined) return { ok: false, reason: 'command_name_taken', name, dispose: () => {} };
       }
     }
     const disposers = [];
+    // A scoped registration can shadow a global one, so the command that actually runs for THIS agent must
+    // still be the handler this bridge registered; anything else refuses instead of acting.
+    const guard = (name, invocation) => {
+      const ours = registered.get(name);
+      if (!ours || typeof commands.find !== 'function') return null;
+      let effective;
+      try { effective = commands.find(invocation?.agent, name); }
+      catch (error) { return { kind: 'error', text: 'LocalPost: the host could not resolve /' + name + ' (' + String(error?.message ?? error) + ').' }; }
+      if (!effective || effective.handler !== ours.handler) return { kind: 'error', text: 'LocalPost: /' + name + ' is shadowed by another definition, so nothing was done.' };
+      return null;
+    };
     const define = (name, description, handler) => {
       const dispose = commands.register({ name, description, recordInput: false, handler });
       disposers.push(typeof dispose === 'function' ? dispose : () => {});
+      registered.set(name, { handler });
     };
     const release = () => { for (const dispose of disposers.splice(0).reverse()) { try { dispose(); } catch { /* release is best effort */ } } };
     try {
       define(COMMANDS.bind, 'Bind this chat as the LocalPost mail chat (no arguments).', async invocation => {
+        const shadowed = guard(COMMANDS.bind, invocation);
+        if (shadowed) return shadowed;
         const session = chatSessionOf(invocation);
         if (!session) return { kind: 'error', text: 'LocalPost: the host did not expose this chat' + String.fromCharCode(39) + 's identity and absolute workspace, so no binding was created.' };
         const actionId = randomUUID();
@@ -141,7 +158,9 @@ export function createDshHostBridge({ ctx, runtimeVersion, store, identity, host
         return { kind: 'error', text: 'LocalPost: binding refused (' + reason + '). Nothing changed.' };
       });
 
-      define(COMMANDS.status, 'Show the current LocalPost mail binding for this host (no arguments).', async () => {
+      define(COMMANDS.status, 'Show the current LocalPost mail binding for this host (no arguments).', async invocation => {
+        const shadowed = guard(COMMANDS.status, invocation);
+        if (shadowed) return shadowed;
         const state = await store.read(identity);
         if (!state) return { kind: 'error', text: 'LocalPost: this identity has no binding state yet.' };
         const { binding } = state;
@@ -151,6 +170,8 @@ export function createDshHostBridge({ ctx, runtimeVersion, store, identity, host
       });
 
       define(COMMANDS.unbind, 'Stop routing NEW mail automatically for this identity (no arguments).', async invocation => {
+        const shadowed = guard(COMMANDS.unbind, invocation);
+        if (shadowed) return shadowed;
         const session = chatSessionOf(invocation);
         const state = await store.read(identity);
         if (!state) return { kind: 'error', text: 'LocalPost: this identity has no binding to unbind.' };

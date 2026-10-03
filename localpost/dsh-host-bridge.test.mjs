@@ -30,7 +30,8 @@ function fakeHost({ version = '0.2.0-rc.2', agents = new Map(), commands = true,
         const dispose = () => released.push(definition.name);
         return dispose;
       },
-      find: () => (existing === null ? undefined : existing),
+      // Like the real host: find resolves the effective definition for an agent, which is the one just registered.
+      find: (agent, name) => (existing === null ? definitions.find(entry => entry.name === name) : (name === existing.name ? existing : undefined)),
     };
   }
   if (agents !== null) ctx.agents = { get: id => agents.get(id) };
