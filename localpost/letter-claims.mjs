@@ -69,6 +69,7 @@ export function beginDispatchIn(state, id, { token, expectedVersion } = {}, at) 
   if (binding.mode !== 'auto') return { ok: false, reason: 'mode_manual', claim };
   if (claim.status !== 'reserved' || claim.owner.generation !== binding.generation || claim.owner.session !== binding.session.id)
     return { ok: false, reason: 'not_reserved', claim };
+  if (claim.hold) return { ok: false, reason: 'held', claim };
   if (expectedVersion !== undefined && claim.version !== expectedVersion) return { ok: false, reason: 'version_conflict', claim };
   claim.attempts += 1;
   move(claim, 'dispatching', at, { attempt: { token, at } });
@@ -97,6 +98,7 @@ export function claimManualIn(state, { id, digest, session }, at) {
   const { binding } = state, { claim } = checked;
   if (binding.mode !== 'manual') return { ok: false, reason: 'mode_auto' };
   if (session !== binding.session.id) return { ok: false, reason: 'not_bound_session' };
+  if (claim?.hold) return { ok: false, reason: 'held', claim };
   const mine = claim?.owner.generation === binding.generation && claim.owner.session === session;
   if (mine && claim.status === 'accepted') return { ok: true, reused: true, claim };
   if (mine && claim.status === 'reserved') return { ok: true, claim: move(claim, 'accepted', at) };
@@ -105,11 +107,22 @@ export function claimManualIn(state, { id, digest, session }, at) {
   return opened.ok ? { ok: true, claim: move(opened.claim, 'accepted', at) } : opened;
 }
 
-/** The owner's terminal result closes a letter; an uncertain one can be closed this way only by its pinned generation. */
+/**
+ * The owner's terminal result closes a letter; an uncertain one can be closed this way only by its pinned generation.
+ * A late result from the generation a letter was transferred away from is kept as reconciliation evidence, never as a
+ * completion: two sessions can never both finish one letter.
+ */
 export function completeIn(state, id, { generation, session } = {}, at) {
   const claim = claimOf(state, id);
   if (!claim) return { ok: false, reason: 'not_claimed' };
-  if (claim.owner.generation !== generation || claim.owner.session !== session) return { ok: false, reason: 'not_owner', claim };
+  if (claim.owner.generation !== generation || claim.owner.session !== session) {
+    if (claim.transferred_from?.generation === generation && claim.transferred_from.session === session) {
+      claim.late_results = [...(claim.late_results ?? []), { generation, session, at }];
+      claim.version += 1;
+      return { ok: false, reason: 'not_owner', evidence: true, claim };
+    }
+    return { ok: false, reason: 'not_owner', claim };
+  }
   if (claim.status === 'done') return { ok: true, reused: true, claim };
   if (!['accepted', 'needs_reconcile'].includes(claim.status)) return { ok: false, reason: 'not_accepted', claim };
   return { ok: true, claim: move(claim, 'done', at) };
@@ -135,25 +148,56 @@ export function isolateInterruptedIn(state, at, generation) {
 
 /**
  * Ownership moves at the switch, letter by letter, each checked against its current status and owner.
- * Accepted but unfinished letters go to the new session once (maxTransfers); after that they are pinned
- * for an operator instead of cascading through generation after generation. Reservations that never
- * reached the old session carry over without counting as a transfer. The handoff text plays no part.
+ * Reservations that never reached the old session carry over without counting as a transfer.
+ * An accepted but unfinished letter is in the old session's hands, so it moves only when the host has proven
+ * (`revoked`) that the old session finished its turn and lost the letter; without that proof it stays pinned to
+ * its generation for reconciliation. A moved letter goes to the new session once (maxTransfers), and stays held
+ * until the host retires the old session (releaseHoldsIn / pinTransfersIn). The handoff text plays no part.
  */
-export function transferForSwitchIn(state, from, to, { maxTransfers = 1 } = {}, at) {
+export function transferForSwitchIn(state, from, to, { maxTransfers = 1, revoked = false } = {}, at) {
   const moved = { transferred: [], carried: [], pinned: [] };
   for (const claim of Object.values(state.claims)) {
     if (claim.owner.generation !== from) continue;
     if (claim.status === 'reserved') {
       claim.owner = { ...to };
       moved.carried.push(move(claim, 'reserved', at, { reason: 'carried' }).letter);
-    } else if (claim.status === 'accepted' && claim.transfers < maxTransfers) {
-      Object.assign(claim, { owner: { ...to }, transfers: claim.transfers + 1 });
+    } else if (claim.status === 'accepted' && revoked && claim.transfers < maxTransfers) {
+      Object.assign(claim, { transferred_from: { ...claim.owner }, owner: { ...to }, transfers: claim.transfers + 1, hold: 'retire' });
       moved.transferred.push(move(claim, 'reserved', at, { reason: 'transferred' }).letter);
     } else if (['accepted', 'dispatching'].includes(claim.status)) {
-      moved.pinned.push(move(claim, 'needs_reconcile', at, { reason: claim.status === 'accepted' ? 'transfer_limit' : 'dispatch_interrupted' }).letter);
+      const reason = claim.status === 'dispatching' ? 'dispatch_interrupted' : revoked ? 'transfer_limit' : 'revocation_unproven';
+      moved.pinned.push(move(claim, 'needs_reconcile', at, { reason }).letter);
     }
   }
   return moved;
+}
+
+/** The host retired the old session: letters moved away from it may now reach their new owner. */
+export function releaseHoldsIn(state, letters, at) {
+  const released = [];
+  for (const id of letters) {
+    const claim = claimOf(state, id);
+    if (claim?.hold !== 'retire') continue;
+    delete claim.hold;
+    released.push(move(claim, claim.status, at, { reason: 'hold_released' }).letter);
+  }
+  return released;
+}
+
+/**
+ * The old session could not be retired, so it may still act on letters it already had: each held letter goes back
+ * to the owner it was moved from, pinned for reconciliation, and never reaches the new session.
+ */
+export function pinTransfersIn(state, letters, at) {
+  const pinned = [];
+  for (const id of letters) {
+    const claim = claimOf(state, id);
+    if (claim?.hold !== 'retire' || !claim.transferred_from) continue;
+    delete claim.hold;
+    claim.owner = { ...claim.transferred_from };
+    pinned.push(move(claim, 'needs_reconcile', at, { reason: 'retire_unconfirmed' }).letter);
+  }
+  return pinned;
 }
 
 export function requestModeIn(state, mode, { expectedVersion } = {}, at) {

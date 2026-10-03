@@ -2,7 +2,7 @@ import fsp from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { atomicWrite, assertId, safePath } from './fs-safe.mjs';
 import { ROTATION_STATES } from './session-binding.mjs';
-import { occupancy, rotationDue, isolateInterruptedIn, transferForSwitchIn, recoverClaims } from './letter-claims.mjs';
+import { occupancy, rotationDue, isolateInterruptedIn, transferForSwitchIn, releaseHoldsIn, pinTransfersIn, recoverClaims } from './letter-claims.mjs';
 
 export { ROTATION_STATES };
 
@@ -17,12 +17,19 @@ export { ROTATION_STATES };
  * authority is copied from the trusted binding record, never read from the handoff.
  *
  * Host adapter (all asynchronous; a throw means "outcome unknown"):
- *   createSession({ id, identity, generation, handoff }) → { created: true, session? } | { created: false, definitive: true }
+ *   createSession({ id, identity, generation, handoff, authority, cwd? }) → { created: true, session? } | { created: false, definitive: true }
  *   findSession(id) → { exists }      capabilities.lookupAuthoritative: is "absent" proof that it was never created?
- *   verifySession(id, expected) → { identity, generation, handoffDigest, tools, crossIdentityRejected }
- *   retireSession(id)                  optional, best effort: the ledger stops all mail to the old session anyway
+ *   verifySession(id, expected) → the values the host actually sees, compared one by one with `expected`:
+ *     { hostId, cwd, identity, generation, sessionId, authority, handoffDigest, tools: [names], crossIdentityRejected }
+ *   revokeSession(id, { sessionId, generation, letters }) → { revoked: true, sessionId, generation, barrier }
+ *     capabilities.revocationBarrier: proof that the old session finished its turn and lost these letters.
+ *     Without that proof, letters the old session accepted stay pinned to it and never move.
+ *   retireSession(id)                  letters moved away from the old session are held until it succeeds; a failure
+ *     sends them back to their original owner, pinned, and stops the rotation for an operator (fail closed).
  */
 const REASONS = ['capacity', 'context', 'operator'];
+// The mailbox tools a verified session must actually have (hosts may prefix them, e.g. mcp__localpost__).
+const MAILBOX_TOOLS = ['mailbox_inbox', 'mailbox_read', 'mailbox_reply', 'mailbox_archive'];
 const sha256 = text => createHash('sha256').update(text).digest('hex');
 
 export function candidateSessionId(identity, generation, attempt) {
@@ -119,10 +126,11 @@ export function createRotation({ store, host, handoffWriter, maxTransfers = 1 } 
     return recorded.progressed ? { ok: true, handoff: (await journalOf(identity, generation)).handoff } : { ok: false, result: recorded };
   }
 
+  // The new session serves the same workspace as the binding it replaces.
   const markCreated = (identity, generation, id, session) => step(identity, generation, 'handoff_written', (draft, j) => {
     if (j.candidate?.id !== id || (session && session.id !== id)) return { failure: { code: 'candidate_mismatch', needs: 'operator' } };
     j.candidate.status = 'created';
-    j.candidate.session = { host: session?.host ?? j.from.host, id };
+    j.candidate.session = { host: session?.host ?? j.from.host, id, ...(j.from.cwd !== undefined ? { cwd: j.from.cwd } : {}) };
     return { to: 'candidate_created' };
   });
   // The host is asked, never assumed: found → created; absent → create again only if "absent" is authoritative (null).
@@ -152,8 +160,10 @@ export function createRotation({ store, host, handoffWriter, maxTransfers = 1 } 
     }
     let created;
     try {
+      const { binding } = await store.read(identity);
       created = await host.createSession({ id: candidate.id, identity, generation: journal.next,
-        handoff: { file: checked.handoff.file, digest: checked.handoff.digest } });
+        handoff: { file: checked.handoff.file, digest: checked.handoff.digest }, authority: { ...binding.authority },
+        ...(journal.from.cwd !== undefined ? { cwd: journal.from.cwd } : {}) });
     } catch (error) {
       return await lookupCandidate(identity, g, candidate.id, error) ?? fail(identity, g, 'handoff_written', 'candidate_create_uncertain', 'retry', error);
     }
@@ -169,12 +179,19 @@ export function createRotation({ store, host, handoffWriter, maxTransfers = 1 } 
     const g = journal.generation;
     const checked = await ensureHandoff(identity, g);
     if (!checked.ok) return checked.result;
-    const expected = { identity, generation: journal.next, handoffDigest: checked.handoff.digest };
+    const { binding } = await store.read(identity);
+    const expected = { hostId: journal.candidate.session.host, cwd: journal.from.cwd ?? null, identity, generation: journal.next,
+      sessionId: journal.candidate.id, authority: { scope: binding.authority.scope, source: binding.authority.source },
+      handoffDigest: checked.handoff.digest };
     let echo;
     try { echo = await host.verifySession(journal.candidate.id, expected); }
     catch (error) { return fail(identity, g, 'candidate_created', 'verify_unavailable', 'retry', error); }
-    const verified = echo?.identity === expected.identity && echo.generation === expected.generation &&
-      echo.handoffDigest === expected.handoffDigest && echo.tools === true && echo.crossIdentityRejected === true;
+    // Every value is compared with what was expected; a boolean "all good" from the host is not evidence.
+    const verified = echo?.hostId === expected.hostId && (echo.cwd ?? null) === expected.cwd && echo.identity === expected.identity &&
+      echo.generation === expected.generation && echo.sessionId === expected.sessionId &&
+      echo.authority?.scope === expected.authority.scope && echo.authority?.source === expected.authority.source &&
+      echo.handoffDigest === expected.handoffDigest && echo.crossIdentityRejected === true && Array.isArray(echo.tools) &&
+      MAILBOX_TOOLS.every(name => echo.tools.some(tool => tool === name || String(tool).endsWith(`__${name}`)));
     return step(identity, g, 'candidate_created', (draft, j) => {
       if (!verified) { j.candidate.status = 'rejected'; return { failure: { code: 'verification_failed', needs: 'operator' } }; }
       j.candidate.status = 'verified';
@@ -182,19 +199,42 @@ export function createRotation({ store, host, handoffWriter, maxTransfers = 1 } 
     });
   }
 
-  const switchOver = (identity, journal) => step(identity, journal.generation, 'verified', (state, j, at) => {
-    const { binding } = state;
-    if (binding.generation !== j.generation || binding.state !== 'frozen' || binding.frozen?.for !== 'rotation' ||
-        binding.version !== j.binding_version || binding.session.id !== j.from.id)
-      return { failure: { code: 'switch_conflict', needs: 'operator', message: 'the binding changed while the rotation was in progress' } };
-    const session = j.candidate.session;
-    const transfer = transferForSwitchIn(state, j.generation, { generation: j.next, session: session.id }, { maxTransfers }, at);
-    Object.assign(binding, { version: binding.version + 1, generation: j.next, session: { ...session }, state: 'active', frozen: null,
-      source: `rotation:${state.identity}:g${j.generation}`, since: at });
-    state.context = null;
-    j.transfer = transfer;
-    return { to: 'switched', detail: transfer };
-  });
+  // Asks the host to prove the old session lost the letters it accepted. Repeating it after a crash asks again.
+  async function revoke(journal, letters) {
+    if (host.capabilities?.revocationBarrier !== true || typeof host.revokeSession !== 'function') return { proven: false, reason: 'not_supported', letters };
+    const expected = { sessionId: journal.from.id, generation: journal.generation, letters };
+    let answer;
+    try { answer = await host.revokeSession(journal.from.id, expected); }
+    catch (error) { return { proven: false, reason: 'revoke_failed', message: String(error.message ?? error), letters }; }
+    const proven = answer?.revoked === true && answer.sessionId === expected.sessionId && answer.generation === expected.generation &&
+      typeof answer.barrier === 'string' && answer.barrier.trim() !== '';
+    return proven ? { proven: true, barrier: answer.barrier, letters } : { proven: false, reason: 'revoke_unproven', letters };
+  }
+
+  async function switchOver(identity, journal) {
+    const state = await store.read(identity);
+    const accepted = Object.values(state.claims).filter(claim => claim.owner.generation === journal.generation && claim.status === 'accepted')
+      .map(claim => claim.letter).sort();
+    const revocation = accepted.length ? await revoke(journal, accepted) : { proven: false, reason: 'nothing_to_revoke', letters: [] };
+    return step(identity, journal.generation, 'verified', (draft, j, at) => {
+      const { binding } = draft;
+      if (binding.generation !== j.generation || binding.state !== 'frozen' || binding.frozen?.for !== 'rotation' ||
+          binding.version !== j.binding_version || binding.session.id !== j.from.id)
+        return { failure: { code: 'switch_conflict', needs: 'operator', message: 'the binding changed while the rotation was in progress' } };
+      const session = j.candidate.session;
+      // The proof covers exactly the letters it was asked for; anything accepted since then is not covered.
+      const current = Object.values(draft.claims).filter(claim => claim.owner.generation === j.generation && claim.status === 'accepted')
+        .map(claim => claim.letter).sort();
+      const covered = revocation.proven === true && JSON.stringify(current) === JSON.stringify(revocation.letters);
+      const transfer = transferForSwitchIn(draft, j.generation, { generation: j.next, session: session.id }, { maxTransfers, revoked: covered }, at);
+      Object.assign(binding, { version: binding.version + 1, generation: j.next, session: { ...session }, state: 'active', frozen: null,
+        source: `rotation:${draft.identity}:g${j.generation}`, since: at });
+      draft.context = null;
+      j.revocation = covered || !revocation.proven ? revocation : { proven: false, reason: 'revocation_stale', letters: revocation.letters };
+      j.transfer = transfer;
+      return { to: 'switched', detail: transfer };
+    });
+  }
 
   async function retire(identity, journal) {
     let retired = 'not_supported', error;
@@ -202,10 +242,15 @@ export function createRotation({ store, host, handoffWriter, maxTransfers = 1 } 
       try { await host.retireSession(journal.from.id); retired = true; }
       catch (cause) { retired = false; error = String(cause.message ?? cause); }
     }
-    return step(identity, journal.generation, 'switched', (draft, j) => {
+    return step(identity, journal.generation, 'switched', (draft, j, at) => {
       j.host_retired = retired;
       if (error) j.retire_error = error;
-      return { to: 'retired' };
+      const held = (j.transfer?.transferred ?? []).filter(id => draft.claims[id]?.hold === 'retire');
+      if (retired === true) { j.released = releaseHoldsIn(draft, held, at); return { to: 'retired' }; }
+      if (!held.length) return { to: 'retired' };
+      // Fail closed: the old session may still act on letters it had, so they never reach the new session.
+      j.pinned_after_retire = pinTransfersIn(draft, held, at);
+      return { failure: { code: 'retire_unconfirmed', needs: 'operator', message: error ?? 'the host cannot retire sessions' } };
     });
   }
 
@@ -245,6 +290,18 @@ export function createRotation({ store, host, handoffWriter, maxTransfers = 1 } 
         return result;
       });
     },
+    /**
+     * Operator decision after a failed retire: the operator has made sure the old session is gone. Closes the rotation;
+     * the letters pinned by the failure stay for reconciliation (resolveUncertain), they are not released by this.
+     */
+    confirmRetired: identity => store.update(identity, state => {
+      const journal = openRotation(state);
+      if (journal?.state !== 'switched' || journal.failure?.code !== 'retire_unconfirmed') return { ok: false, reason: 'no_retire_awaiting_operator' };
+      const at = store.at();
+      Object.assign(journal, { state: 'retired', host_retired: 'operator', failure: null });
+      journal.history.push({ state: 'retired', at, by: 'operator_confirmed' });
+      return { ok: true };
+    }),
     /** Operator decision after an unprovable or rejected candidate: abandon it and derive the next attempt's id. */
     retryCandidate: identity => store.update(identity, state => {
       const journal = openRotation(state);
@@ -274,7 +331,8 @@ export function deriveAlerts(state) {
     }
   }
   for (const claim of Object.values(state.claims))
-    if (claim.status === 'needs_reconcile') alerts.push({ level: claim.reason === 'transfer_limit' ? 'error' : 'warn', kind: 'needs_reconcile', id: claim.letter, generation: claim.owner.generation, reason: claim.reason });
+    if (claim.status === 'needs_reconcile') alerts.push({ level: ['transfer_limit', 'retire_unconfirmed'].includes(claim.reason) ? 'error' : 'warn',
+      kind: 'needs_reconcile', id: claim.letter, generation: claim.owner.generation, reason: claim.reason });
   if (rotationDue(state) && !openRotation(state)) alerts.push({ level: 'warn', kind: 'rotation_due', generation: state.binding.generation });
   return alerts;
 }
@@ -294,6 +352,9 @@ export function auditState(state) {
     if (generation > binding.generation) problems.push(`future_owner:${claim.letter}`);
     else if (sessionOf.get(generation) !== session) problems.push(`owner_session_mismatch:${claim.letter}`);
     if (['reserved', 'dispatching', 'accepted'].includes(claim.status) && generation !== binding.generation) problems.push(`stale_owner:${claim.letter}`);
+    // A hold exists only between the switch and the retire of the rotation that moved the letter.
+    if (claim.hold && !(claim.status === 'reserved' && journals.some(journal => journal.state === 'switched' && journal.transfer?.transferred?.includes(claim.letter))))
+      problems.push(`stray_hold:${claim.letter}`);
   }
   return problems;
 }
