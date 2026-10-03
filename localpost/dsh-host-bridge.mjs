@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { isAbsolute } from 'node:path';
 import { assertId } from './fs-safe.mjs';
-import { ANALYSIS_REPLY } from './session-binding.mjs';
+import { ANALYSIS_REPLY, bindingIdentity } from './session-binding.mjs';
 import { bindFromChatAction, attestedNow } from './binding-provider.mjs';
 import { switchMode } from './letter-claims.mjs';
 
@@ -206,10 +206,11 @@ export function createDshHostBridge({ ctx, runtimeVersion, store, identity, host
         }
         // The mode switch protocol (letter-claims.mjs switchMode): freeze → drain → CAS under the identity's actor lease, so no
         // dispatch is in flight, an interrupted one is isolated for reconciliation, and the binding version moves with the mode.
-        // The CAS names the version this caller was checked against: if the binding moved since (a rotation to B), nothing changes.
-        const switched = await switchMode(store, identity, 'manual', { expectedVersion: state.binding.version });
+        // The CAS names the very binding this caller was checked against (version, generation, session, since, bind action):
+        // if it moved since - a rotation to B, or a fresh binding at the same version (ABA) - nothing changes at all.
+        const switched = await switchMode(store, identity, 'manual', { expectedBinding: bindingIdentity(state.binding) });
         if (switched?.skipped) return { kind: 'error', text: 'LocalPost: mail is being delivered right now, so nothing changed. Run the unbind again in a moment.' };
-        if (switched?.reason === 'version_conflict') return { kind: 'error', text: 'LocalPost: the binding changed since this chat was checked (for example a rotation), so nothing changed.' };
+        if (switched?.reason === 'binding_conflict') return { kind: 'error', text: 'LocalPost: the binding changed since this chat was checked (for example a rotation), so nothing changed.' };
         if (!switched?.ok) return { kind: 'error', text: 'LocalPost: the unbind was refused (' + String(switched?.reason ?? 'unknown') + '); nothing changed.' };
         // Confirm against what was actually persisted: the very binding this caller proved, now in manual mode.
         const after = await store.read(identity);

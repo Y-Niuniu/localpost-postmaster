@@ -248,28 +248,36 @@ test('unbind is a CAS on the binding the caller proved: a rotation in between fa
   assert.deepEqual([binding.session.id, binding.mode], ['chat-B', 'auto'], 'B keeps automatic routing');
 });
 
-test('after an equal-version replacement (ABA) the unbind never reports success for a binding the caller did not prove', async () => {
-  const root = await scratch('unbind-aba');
-  const real = createSessionStore({ root, waitMs: 500 });
-  let swap = null;
-  const store = { ...real, read: async identity => {
-    const snapshot = await real.read(identity);
-    if (swap) { const run = swap; swap = null; await run(); }
-    return snapshot;
-  } };
-  const host = fakeHost();
-  const bridge = createDshHostBridge({ ctx: host.ctx, runtimeVersion: '0.2.0-rc.2', store, identity: 'dsh' });
-  bridge.registerCommands();
-  await find(host.definitions, COMMANDS.bind).handler({ agent: chatAgent('chat-A', 'C:/work/A') });
-  // The binding record is removed and chat B binds afresh: a new binding starts at the same version, which a version CAS
-  // cannot tell apart (known limit, see the R6 report). The final check must still refuse to call this a success.
-  swap = async () => {
-    await fs.rm(path.join(root, 'runtime', 'sessions', 'dsh.json'));
-    assert.equal((await find(host.definitions, COMMANDS.bind).handler({ agent: chatAgent('chat-B', 'C:/work/B') })).kind, 'success');
-  };
-  const answer = await find(host.definitions, COMMANDS.unbind).handler({ agent: live.get('chat-A') });
-  assert.equal(answer.kind, 'error');
-});
+// Equal-version ABA (codex R6 final review): the binding record is removed and a chat binds afresh, so the successor starts at
+// the very version the unbind was checked against. The CAS compares the binding's identity, so the successor is left untouched.
+for (const [label, chat, cwd] of [['another chat', 'chat-B', 'C:/work/B'], ['the same chat bound afresh', 'chat-A', 'C:/work/A']]) {
+  test(`after an equal-version replacement by ${label} (ABA) the unbind changes nothing: still automatic, same version`, async () => {
+    const root = await scratch('unbind-aba');
+    const real = createSessionStore({ root, waitMs: 500 });
+    let swap = null;
+    const store = { ...real, read: async identity => {
+      const snapshot = await real.read(identity);
+      if (swap) { const run = swap; swap = null; await run(); }
+      return snapshot;
+    } };
+    const host = fakeHost();
+    const bridge = createDshHostBridge({ ctx: host.ctx, runtimeVersion: '0.2.0-rc.2', store, identity: 'dsh' });
+    bridge.registerCommands();
+    const a = chatAgent('chat-A', 'C:/work/A');
+    await find(host.definitions, COMMANDS.bind).handler({ agent: a });
+    const checked = (await real.read('dsh')).binding;
+    let successor;
+    swap = async () => {
+      await fs.rm(path.join(root, 'runtime', 'sessions', 'dsh.json'));
+      assert.equal((await find(host.definitions, COMMANDS.bind).handler({ agent: chatAgent(chat, cwd) })).kind, 'success');
+      successor = structuredClone((await real.read('dsh')).binding);
+    };
+    const answer = await find(host.definitions, COMMANDS.unbind).handler({ agent: a });
+    assert.equal(answer.kind, 'error');
+    assert.equal(successor.version, checked.version, 'a real ABA: the successor carries the version the unbind was checked against');
+    assert.deepEqual((await real.read('dsh')).binding, successor, 'zero change: the successor is still automatic, same version');
+  });
+}
 
 test('a stale command disposer releases only its own registration: the successor stays registered and usable', async () => {
   const { bridge, host } = await bridgeFor('stale-command-dispose', { unregister: true });

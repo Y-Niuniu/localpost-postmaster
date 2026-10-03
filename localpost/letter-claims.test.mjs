@@ -2,10 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { createSessionStore, bind } from './session-binding.mjs';
+import { createSessionStore, bind, bindingIdentity } from './session-binding.mjs';
 import {
   reserve, reserveIn, beginDispatch, beginDispatchIn, settle, settleIn, dispatchLetter, claimManual, complete,
-  resolveUncertain, requestMode, switchMode, recoverClaims, occupancy, rotationDue,
+  resolveUncertain, requestMode, requestModeIn, switchMode, recoverClaims, occupancy, rotationDue,
 } from './letter-claims.mjs';
 import { auditState } from './rotation.mjs';
 import { envelopeDigest } from './mailbox.mjs';
@@ -181,4 +181,30 @@ test('prototype-named letter ids are ordinary ledger keys', async t => {
   const state = await store.read('codex');
   assert.equal(occupancy(state).accepted, 3);
   assert.equal((await complete(store, 'codex', 'valueOf', OWNER)).reason, 'not_claimed');
+});
+
+test('a mode switch for a proven binding identity switches that binding or nothing, checked before any write (ABA-safe)', () => {
+  const at = '2026-10-03T00:00:00.000Z';
+  const binding = { version: 1, generation: 1, session: { host: 'local', id: 'chat-A', cwd: 'C:/work/A' }, since: at,
+    attestation: { kind: 'chat-action', actionId: 'a1' }, mode: 'auto', state: 'active', frozen: null, capacity: 50 };
+  const proven = bindingIdentity(binding);
+  // One field different at a time, so every part of the identity is shown to matter on its own.
+  for (const replaced of [
+    { since: '2026-10-03T00:00:01.000Z' },                                     // bound afresh later, at the same version
+    { attestation: { kind: 'chat-action', actionId: 'a2' } },                  // bound afresh within the same millisecond
+    { session: { host: 'other-host', id: 'chat-A', cwd: 'C:/work/A' } },       // another host
+    { session: { host: 'local', id: 'chat-B', cwd: 'C:/work/A' } },            // another chat
+    { session: { host: 'local', id: 'chat-A', cwd: 'C:/work/elsewhere' } },    // another workspace
+    { generation: 2 },                                                         // another generation
+    { version: 5 },                                                            // the same binding, modes switched since
+    { state: 'frozen', frozen: { for: 'mode', mode: 'manual', at }, attestation: { kind: 'chat-action', actionId: 'a2' } }, // another's pending switch
+  ]) {
+    const state = { binding: { ...binding, ...replaced }, rotations: {}, claims: {} };
+    const before = structuredClone(state);
+    assert.deepEqual(requestModeIn(state, 'manual', { expectedBinding: proven }, at), { ok: false, reason: 'binding_conflict' }, JSON.stringify(replaced));
+    assert.deepEqual(state, before, 'zero change for ' + JSON.stringify(replaced));
+  }
+  const state = { binding: { ...binding }, rotations: {}, claims: {} };
+  assert.equal(requestModeIn(state, 'manual', { expectedBinding: proven }, at).ok, true, 'the proven binding itself is switched');
+  assert.deepEqual([state.binding.state, state.binding.frozen.mode], ['frozen', 'manual']);
 });
