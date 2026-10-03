@@ -1,29 +1,42 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 import { COMMANDS, chatSessionOf, createDshHostBridge } from './dsh-host-bridge.mjs';
 import { createSessionStore } from './session-binding.mjs';
 import { arrivalRoute, createBindingProvider } from './binding-provider.mjs';
 import { removeTree } from './temp-tree.mjs';
 
-const roots = [];
+// Codex R2: tests must not depend on the system temp dir (its EPERM/realpath behaviour made runs flaky).
+const TMP = path.resolve(import.meta.dirname, '..', '.localpost-tmp', 'dsh-host-bridge');
+const created = [];
 async function scratch(name) {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'localpost-bridge-' + name + '-'));
-  roots.push(dir);
+  const dir = path.join(TMP, name + '-' + Math.random().toString(16).slice(2, 8));
+  await fs.mkdir(dir, { recursive: true });
+  created.push(dir);
   return dir;
 }
-test.after(async () => { for (const dir of roots) await removeTree(dir); });
+test.after(async () => { for (const dir of created) await removeTree(dir); await removeTree(TMP); });
 
-function fakeHost({ version = '0.2.0-rc.2', agents = new Map(), commands = true } = {}) {
+function fakeHost({ version = '0.2.0-rc.2', agents = new Map(), commands = true, failOn = 0, existing = null } = {}) {
   const definitions = [];
+  const released = [];
   const ctx = {};
-  if (commands) ctx.commands = { register: definition => { definitions.push(definition); return () => {}; } };
-  ctx.agents = { get: id => agents.get(id) };
-  return { ctx, definitions, agents };
+  if (commands) {
+    ctx.commands = {
+      register: definition => {
+        if (failOn && definitions.length + 1 === failOn) throw new Error('registry refused');
+        definitions.push(definition);
+        const dispose = () => released.push(definition.name);
+        return dispose;
+      },
+      find: () => (existing === null ? undefined : existing),
+    };
+  }
+  if (agents !== null) ctx.agents = { get: id => agents.get(id) };
+  return { ctx, definitions, released, agents };
 }
-const liveAgent = (id, cwd) => ({ session: { id, cwd }, status: 'running', followup: async () => {} });
+const chatAgent = (id, cwd) => ({ session: { id, header: { cwd } }, status: 'running', followup: async () => {} });
 const find = (definitions, name) => definitions.find(entry => entry.name === name);
 
 async function bridgeFor(name, options = {}) {
@@ -34,114 +47,146 @@ async function bridgeFor(name, options = {}) {
   return { root, store, host, bridge };
 }
 
-test('the bridge refuses to look trustworthy when the host cannot supply a chat identity', async () => {
-  const noCommands = await bridgeFor('nocmd', { commands: false });
-  assert.equal(noCommands.bridge.capabilities.chatBinding, false);
-  assert.throws(() => noCommands.bridge.registerCommands(), { code: 'command_registry_unavailable' });
+test('an untrusted host registers nothing, writes nothing, and confirms nothing', async () => {
+  for (const options of [{ commands: false }, { version: '0.1.5-rc.1' }, { agents: null }]) {
+    const { bridge, host, store } = await bridgeFor('gate', options);
+    assert.equal(bridge.capabilities.chatBinding, false);
+    const registered = bridge.registerCommands();
+    assert.equal(registered.ok, false);
+    assert.equal(registered.reason, 'host_cannot_attest');
+    assert.equal(host.definitions.length, 0, 'no command may be registered on an untrusted host');
+    assert.equal(await store.read('dsh'), null, 'nothing may be written on an untrusted host');
+    const confirmed = await bridge.confirmBindAction({ actionId: 'x', hostId: 'local', threadId: 'a', cwd: 'C:/w' });
+    assert.deepEqual(confirmed, { confirmed: false, reason: 'host_untrusted' });
+  }
+});
 
-  const wrongVersion = await bridgeFor('badver', { version: '0.1.5-rc.1' });
-  assert.equal(wrongVersion.bridge.capabilities.chatBinding, false);
-
-  const good = await bridgeFor('good');
-  assert.equal(good.bridge.capabilities.chatBinding, true);
+test('diagnostics name every reason a binding cannot be trusted', async () => {
+  const bad = await bridgeFor('reasons', { version: '0.1.5-rc.1' });
+  const reasons = bad.bridge.diagnostics().reasons;
+  assert.ok(reasons.includes('runtime_version_mismatch'), 'a version mismatch must be reported, not filtered out');
+  const noLookup = await bridgeFor('reasons2');
+  delete noLookup.host.ctx.agents;
+  const second = createDshHostBridge({ ctx: noLookup.host.ctx, runtimeVersion: '0.2.0-rc.2', store: noLookup.store, identity: 'dsh' });
+  assert.deepEqual(second.diagnostics().reasons, ['live_agent_lookup_unavailable']);
+  const good = await bridgeFor('reasons3');
   assert.deepEqual(good.bridge.diagnostics().reasons, []);
 });
 
-test('reading a chat identity needs both the session id and an absolute workspace from the host', () => {
-  assert.deepEqual(chatSessionOf({ agent: { session: { id: 'a', cwd: 'C:/w' } } }), { id: 'a', cwd: 'C:/w' });
-  assert.equal(chatSessionOf({ agent: { session: { id: 'a' } } }), null);
-  assert.equal(chatSessionOf({ agent: { session: { cwd: 'C:/w' } } }), null);
-  assert.equal(chatSessionOf({ agent: {} }), null);
-  assert.equal(chatSessionOf({}), null);
-});
-
-test('every command takes no input, so nothing about a binding is model-controllable', async () => {
-  const { bridge, host } = await bridgeFor('noinput');
-  bridge.registerCommands();
+test('the trusted host gets exactly three argument-free commands that are not logged', async () => {
+  const { bridge, host } = await bridgeFor('register');
+  const registered = bridge.registerCommands();
+  assert.equal(registered.ok, true);
   assert.equal(host.definitions.length, 3);
   for (const definition of host.definitions) {
     assert.equal(definition.input, undefined, definition.name + ' must take no input');
-    assert.equal(definition.recordInput, false, definition.name + ' must not record its input');
+    assert.equal(definition.recordInput, false, definition.name + ' must not record input');
   }
   assert.deepEqual(host.definitions.map(entry => entry.name).sort(), [COMMANDS.bind, COMMANDS.status, COMMANDS.unbind].sort());
+  assert.equal(bridge.registerCommands().existing, true, 'registering twice must not duplicate');
+  assert.equal(host.definitions.length, 3);
 });
 
-test('binding happens only from the chat the host hands to the handler, and it is attested', async () => {
+test('a taken command name and a mid-way registry failure both leave zero commands registered', async () => {
+  const taken = await bridgeFor('taken', { existing: { name: COMMANDS.bind } });
+  const refused = taken.bridge.registerCommands();
+  assert.equal(refused.ok, false);
+  assert.equal(refused.reason, 'command_name_taken');
+  assert.equal(taken.host.definitions.length, 0);
+
+  const partial = await bridgeFor('partial', { failOn: 2 });
+  const failed = partial.bridge.registerCommands();
+  assert.equal(failed.ok, false);
+  assert.equal(failed.reason, 'registration_failed');
+  assert.deepEqual(partial.host.released, [COMMANDS.bind], 'the first registration must be released when a later one fails');
+});
+
+test('a chat identity needs the session id and an absolute workspace from the host', () => {
+  assert.deepEqual(chatSessionOf({ agent: chatAgent('a', 'C:/w') }), { id: 'a', cwd: 'C:/w' });
+  assert.equal(chatSessionOf({ agent: { session: { id: 'a', header: { cwd: 'relative/w' } } } }), null, 'a relative workspace is not bindable');
+  assert.equal(chatSessionOf({ agent: { session: { id: 'a', header: {} } } }), null);
+  assert.equal(chatSessionOf({ agent: { session: { id: 'a', cwd: 'C:/w' } } }), null, 'the workspace lives in the session header, not at the top level');
+  assert.equal(chatSessionOf({}), null);
+});
+
+test('binding comes only from the chat the host hands to the handler, and repeating it changes nothing', async () => {
   const { bridge, host, store } = await bridgeFor('bind');
   bridge.registerCommands();
-  const result = await find(host.definitions, COMMANDS.bind).handler({ agent: liveAgent('chat-A', 'C:/work/A') });
-  assert.equal(result.kind, 'success');
-  const state = await store.read('dsh');
-  assert.equal(state.binding.mode, 'auto');
-  assert.equal(state.binding.session.id, 'chat-A');
-  assert.equal(state.binding.session.cwd, 'C:/work/A');
-  assert.equal(state.binding.attestation.kind, 'chat-action');
-  assert.match(state.binding.source, /^chat-action:/);
-  assert.deepEqual(arrivalRoute(state).route.threadId, 'chat-A');
-});
-
-test('a chat whose identity or workspace the host cannot attest is refused, and nothing is written', async () => {
-  const { bridge, host, store } = await bridgeFor('noident');
-  bridge.registerCommands();
-  const result = await find(host.definitions, COMMANDS.bind).handler({ agent: { session: { id: 'chat-X' } } });
-  assert.equal(result.kind, 'error');
+  const bind = find(host.definitions, COMMANDS.bind);
+  assert.equal((await bind.handler({})).kind, 'error', 'no host chat means no binding');
   assert.equal(await store.read('dsh'), null);
+
+  const first = await bind.handler({ agent: chatAgent('chat-A', 'C:/work/A') });
+  assert.equal(first.kind, 'success');
+  const one = await store.read('dsh');
+  assert.equal(one.binding.mode, 'auto');
+  assert.deepEqual([one.binding.session.id, one.binding.session.cwd], ['chat-A', 'C:/work/A']);
+  assert.match(one.binding.source, /^chat-action:[0-9a-f-]{36}$/);
+
+  const repeat = await bind.handler({ agent: chatAgent('chat-A', 'C:/work/A') });
+  assert.equal(repeat.kind, 'success', 'repeating the same bind is an idempotent success');
+  const two = await store.read('dsh');
+  assert.equal(two.binding.source, one.binding.source, 'a repeat must not change source');
+  assert.equal(two.binding.generation, one.binding.generation);
+  assert.deepEqual(two.binding.attestation, one.binding.attestation);
+
+  const moved = await bind.handler({ agent: chatAgent('chat-B', 'C:/work/B') });
+  assert.equal(moved.kind, 'error', 'T1 cannot move a binding to another chat');
+  assert.match(moved.text, /another chat/);
+  assert.equal((await store.read('dsh')).binding.session.id, 'chat-A');
 });
 
-test('a hand-made action is never trusted; repeats are refused and a rebind mints its own action', async () => {
-  const { bridge, host, store } = await bridgeFor('actions');
+test('a forged or stale bind action is refused, and so is a chat the host does not know', async () => {
+  const { bridge, host } = await bridgeFor('forge');
   bridge.registerCommands();
-  // Nothing a model could pass looks like an action: unknown, empty and blank ids all fail.
   assert.equal((await bridge.confirmBindAction({ actionId: 'forged', hostId: 'local', threadId: 'chat-A', cwd: 'C:/work/A' })).confirmed, false);
   assert.equal((await bridge.confirmBindAction({})).confirmed, false);
-  assert.equal((await bridge.confirmBindAction({ actionId: '', hostId: 'local', threadId: '', cwd: '' })).confirmed, false);
-  const first = await find(host.definitions, COMMANDS.bind).handler({ agent: liveAgent('chat-A', 'C:/work/A') });
-  assert.equal(first.kind, 'success');
-  const one = (await store.read('dsh')).binding.source;
-  assert.match(one, /^chat-action:[0-9a-f-]{36}$/);
-  const repeat = await find(host.definitions, COMMANDS.bind).handler({ agent: liveAgent('chat-A', 'C:/work/A') });
-  assert.equal(repeat.kind, 'error', 'repeating the same bind must be refused, not silently re-attested');
-  const moved = await find(host.definitions, COMMANDS.bind).handler({ agent: liveAgent('chat-B', 'C:/work/B') });
-  // A second bind is refused by the store (already_bound). Moving the mail chat to another chat therefore has
-  // NO path today: it is not a rebind, it must be an operational change with its own contract. Recorded as a gap.
-  assert.equal(moved.kind, 'error', 'rebinding to another chat is not supported yet');
-  const state = await store.read('dsh');
-  assert.equal(state.binding.session.id, 'chat-A', 'a refused rebind must leave the original binding untouched');
-  assert.equal(state.binding.source, one);
+  assert.equal((await bridge.confirmBindAction({ actionId: '', hostId: '', threadId: '', cwd: '' })).confirmed, false);
+  const result = await find(host.definitions, COMMANDS.bind).handler({ agent: { session: { id: 'chat-A' } } });
+  assert.equal(result.kind, 'error');
 });
 
-test('describeThread reports online only for a live agent that still reports the same workspace', async () => {
+test('describeThread answers online only for the very session we asked about', async () => {
   const { bridge, host } = await bridgeFor('describe');
-  host.agents.set('chat-A', liveAgent('chat-A', 'C:/work/A'));
-  host.agents.set('chat-B', { session: { id: 'chat-B' } });
+  host.agents.set('chat-A', chatAgent('chat-A', 'C:/work/A'));
+  host.agents.set('mismatch', chatAgent('other-id', 'C:/work/B'));
+  host.agents.set('relative', chatAgent('relative', 'somewhere'));
   assert.deepEqual(await bridge.describeThread('chat-A'), { hostId: 'local', threadId: 'chat-A', cwd: 'C:/work/A', online: true });
-  assert.equal((await bridge.describeThread('chat-B')).online, false);
+  assert.equal((await bridge.describeThread('mismatch')).online, false, 'a live agent whose session id differs is not this chat');
+  assert.equal((await bridge.describeThread('relative')).online, false);
   assert.equal((await bridge.describeThread('gone')).online, false);
   assert.equal((await bridge.describeThread('')).online, false);
 });
 
-test('the provider stays untrusted until the bridge can attest, and verifies the bound chat through it', async () => {
+test('the provider trusts the bridge only when it can attest, and verifies the bound chat through it', async () => {
   const { bridge, host, store } = await bridgeFor('provider');
   bridge.registerCommands();
   const provider = createBindingProvider({ store, identity: 'dsh', host: bridge });
   assert.equal(provider.trusted, true);
-  await find(host.definitions, COMMANDS.bind).handler({ agent: liveAgent('chat-A', 'C:/work/A') });
-  const state = await store.read('dsh');
-  const route = arrivalRoute(state).route;
+  await find(host.definitions, COMMANDS.bind).handler({ agent: chatAgent('chat-A', 'C:/work/A') });
+  const route = arrivalRoute(await store.read('dsh')).route;
   const resolved = await provider.resolve(route);
   assert.equal(resolved.ok, true);
-  host.agents.set('chat-A', liveAgent('chat-A', 'C:/work/A'));
+  host.agents.set('chat-A', chatAgent('chat-A', 'C:/work/A'));
   assert.equal(await provider.verifyBinding(resolved.target), true);
+  host.agents.set('chat-A', chatAgent('chat-A', 'C:/other-workspace'));
+  assert.equal(await provider.verifyBinding(resolved.target), false, 'a workspace change must fail closed');
   host.agents.delete('chat-A');
   assert.equal(await provider.verifyBinding(resolved.target), false, 'an offline chat must fail closed');
 });
 
-test('unbind turns automatic routing off and leaves the mail for manual reading', async () => {
+test('unbind works only from the bound chat and only stops routing for new mail', async () => {
   const { bridge, host, store } = await bridgeFor('unbind');
   bridge.registerCommands();
-  await find(host.definitions, COMMANDS.bind).handler({ agent: liveAgent('chat-A', 'C:/work/A') });
-  const result = await find(host.definitions, COMMANDS.unbind).handler({});
-  assert.equal(result.kind, 'success');
+  await find(host.definitions, COMMANDS.bind).handler({ agent: chatAgent('chat-A', 'C:/work/A') });
+  const wrongChat = await find(host.definitions, COMMANDS.unbind).handler({ agent: chatAgent('chat-B', 'C:/work/B') });
+  assert.equal(wrongChat.kind, 'error');
+  assert.match(wrongChat.text, /only the currently bound chat/);
+  assert.equal((await store.read('dsh')).binding.mode, 'auto', 'a refused unbind must change nothing');
+
+  const ok = await find(host.definitions, COMMANDS.unbind).handler({ agent: chatAgent('chat-A', 'C:/work/A') });
+  assert.equal(ok.kind, 'success');
+  assert.match(ok.text, /NEW mail/);
   const state = await store.read('dsh');
   assert.equal(state.binding.mode, 'manual');
   assert.deepEqual(arrivalRoute(state), { route: null, reason: 'binding_manual' });
@@ -150,9 +195,8 @@ test('unbind turns automatic routing off and leaves the mail for manual reading'
 test('status reports the binding without claiming more than the host can prove', async () => {
   const { bridge, host } = await bridgeFor('status');
   bridge.registerCommands();
-  const empty = await find(host.definitions, COMMANDS.status).handler({});
-  assert.equal(empty.kind, 'error');
-  await find(host.definitions, COMMANDS.bind).handler({ agent: liveAgent('chat-A', 'C:/work/A') });
+  assert.equal((await find(host.definitions, COMMANDS.status).handler({})).kind, 'error');
+  await find(host.definitions, COMMANDS.bind).handler({ agent: chatAgent('chat-A', 'C:/work/A') });
   const shown = await find(host.definitions, COMMANDS.status).handler({});
   assert.equal(shown.kind, 'success');
   assert.match(shown.text, /mode=auto/);

@@ -1,37 +1,42 @@
 import { randomUUID } from 'node:crypto';
+import { isAbsolute } from 'node:path';
 import { assertId } from './fs-safe.mjs';
 import { ANALYSIS_REPLY } from './session-binding.mjs';
-
-// The only authority a chat bind may carry: the trusted analysis-reply policy, provenance recorded.
-const BIND_AUTHORITY = Object.freeze({ scope: ANALYSIS_REPLY, source: 'policy:explicit-chat-command' });
 import { bindFromChatAction, attestedNow } from './binding-provider.mjs';
 
 /**
  * The caller-attested native host bridge for the installed DSH.
  *
  * Everything the binding provider trusts comes from the host, never from command arguments:
- *   - the chat identity and workspace are read off the Agent the host hands to a command handler
- *     (`invocation.agent.session.id` / `.cwd`; the session header records cwd and validates it is absolute);
+ *   - the chat identity and workspace are read off the Agent the host hands to a handler
+ *     (`invocation.agent.session.id` and `invocation.agent.session.header.cwd`; the session header records
+ *     cwd and the host requires it to be absolute - see dsh-session/lib/types/index.js:45);
  *   - a bind action exists only because this module minted it while running INSIDE that chat's handler,
  *     so a model cannot fabricate one by passing a path, an id or any other parameter - the commands
  *     take no input at all;
  *   - a minted action is single-use and expires, so a replayed handler call confirms nothing.
  *
- * The bridge refuses to look trustworthy when the host cannot supply the pieces: without a command
- * registry and a live agent lookup, `capabilities.chatBinding` is false and the provider reports
- * itself untrusted, which keeps automatic dispatch disabled (fail closed).
+ * The capability gate is enforced three times over - on the reported capability, on registration and on
+ * confirmation - because a host that cannot attest a chat must not end up with registered commands or
+ * an automatic binding written. Without the gate the bridge would look trustworthy while proving nothing.
  */
 export const SUPPORTED_VERSION = '0.2.0-rc.2';
 export const COMMANDS = Object.freeze({ bind: 'localpost-bind', status: 'localpost-status', unbind: 'localpost-unbind' });
 const ACTION_TTL_MS = 120000;
+
+// The only authority a chat bind may carry: the trusted analysis-reply policy, provenance recorded.
+const BIND_AUTHORITY = Object.freeze({ scope: ANALYSIS_REPLY, source: 'policy:explicit-chat-command' });
 const text = value => typeof value === 'string' && value.trim() !== '';
 
-/** The identity and workspace of the chat a command ran in, or null when the host does not expose both. */
+/**
+ * The identity and workspace of the chat a handler ran in, or null when the host does not expose both.
+ * The workspace must be an absolute path: a relative or empty one is not a workspace we may bind to.
+ */
 export function chatSessionOf(invocation) {
   const session = invocation?.agent?.session;
   const id = session?.id;
-  const cwd = session?.cwd;
-  if (!text(id) || !text(cwd)) return null;
+  const cwd = session?.header?.cwd;
+  if (!text(id) || !text(cwd) || !isAbsolute(cwd)) return null;
   return Object.freeze({ id, cwd });
 }
 
@@ -42,26 +47,26 @@ export function createDshHostBridge({ ctx, runtimeVersion, store, identity, host
   const versionOk = runtimeVersion === SUPPORTED_VERSION;
   const canRegister = typeof commands?.register === 'function';
   const canLookup = typeof agents?.get === 'function';
-  const capabilities = Object.freeze({
-    runtimeVersion: versionOk,
-    commandRegistry: canRegister,
-    liveAgentLookup: canLookup,
-    chatBinding: versionOk && canRegister && canLookup,
-  });
+  const chatBinding = versionOk && canRegister && canLookup;
+  const reasons = [];
+  if (!versionOk) reasons.push('runtime_version_mismatch');
+  if (!canRegister) reasons.push('command_registry_unavailable');
+  if (!canLookup) reasons.push('live_agent_lookup_unavailable');
+  const capabilities = Object.freeze({ runtimeVersion: versionOk, commandRegistry: canRegister, liveAgentLookup: canLookup, chatBinding });
   const actions = new Map();
-  const disposers = [];
+  let registration = null;
 
   const bridge = {
     capabilities,
     diagnostics: () => ({
-      supportedVersion: SUPPORTED_VERSION,
-      runtimeVersion,
-      chatBinding: capabilities.chatBinding,
-      reasons: Object.entries(capabilities).filter(([name, value]) => name !== 'runtimeVersion' && value !== true).map(([name]) => name),
+      supportedVersion: SUPPORTED_VERSION, runtimeVersion, chatBinding, reasons: [...reasons],
+      // Whether the host lets us see an existing definition before registering; recorded, never assumed.
+      collisionPreflight: typeof commands?.find === 'function',
     }),
 
-    /** Confirms one action this bridge minted inside a chat handler; single use, bounded by TTL, exact values. */
+    /** Confirms one action this bridge minted inside a chat handler; gated, single use, bounded, exact. */
     async confirmBindAction(action) {
+      if (!chatBinding) return { confirmed: false, reason: 'host_untrusted' };
       const recorded = actions.get(action?.actionId);
       if (!recorded) return { confirmed: false, reason: 'unknown_action' };
       actions.delete(action.actionId);
@@ -72,59 +77,99 @@ export function createDshHostBridge({ ctx, runtimeVersion, store, identity, host
       return { confirmed: true, actionId: action.actionId, hostId: recorded.hostId, threadId: recorded.threadId, cwd: recorded.cwd };
     },
 
-    /** What the host sees for one chat right now: online only when the live agent still reports the same workspace. */
+    /** What the host sees for one chat right now; the live agent must still be the very session we ask about. */
     async describeThread(threadId) {
       if (!text(threadId) || !canLookup) return { hostId, threadId: text(threadId) ? threadId : null, cwd: null, online: false };
       const agent = agents.get(threadId);
       if (!agent) return { hostId, threadId, cwd: null, online: false };
-      const cwd = agent?.session?.cwd;
-      if (!text(cwd)) return { hostId, threadId, cwd: null, online: false };
+      if (agent?.session?.id !== threadId) return { hostId, threadId, cwd: null, online: false };
+      const cwd = agent?.session?.header?.cwd;
+      if (!text(cwd) || !isAbsolute(cwd)) return { hostId, threadId, cwd: null, online: false };
       return { hostId, threadId, cwd, online: true };
     },
   };
 
-  /** Registers the three human commands; every one of them takes no input, so nothing is model-controllable. */
+  /**
+   * Registers the three human commands. Every one takes no input, so nothing about a binding is
+   * model-controllable. Registration is all-or-nothing: a conflict or a mid-way failure releases
+   * whatever was registered, in reverse order, and leaves the host with none of our commands.
+   */
   function registerCommands() {
-    if (!canRegister) throw Object.assign(new Error('The host has no command registry; the LocalPost bridge cannot register its commands'), { code: 'command_registry_unavailable' });
+    if (!chatBinding) {
+      return { ok: false, reason: 'host_cannot_attest', reasons: [...reasons], dispose: () => {} };
+    }
+    if (registration) return { ok: true, existing: true, dispose: registration.dispose };
+    const names = [COMMANDS.bind, COMMANDS.status, COMMANDS.unbind];
+    if (typeof commands.find === 'function') {
+      for (const name of names) {
+        let existing;
+        try { existing = commands.find(undefined, name); } catch { existing = undefined; }
+        if (existing !== undefined) return { ok: false, reason: 'command_name_taken', name, dispose: () => {} };
+      }
+    }
+    const disposers = [];
     const define = (name, description, handler) => {
       const dispose = commands.register({ name, description, recordInput: false, handler });
-      if (typeof dispose === 'function') disposers.push(dispose);
-      return dispose;
+      disposers.push(typeof dispose === 'function' ? dispose : () => {});
     };
-
-    define(COMMANDS.bind, 'Bind this chat as the LocalPost mail chat (no arguments).', async invocation => {
-      const session = chatSessionOf(invocation);
-      if (!session) return { kind: 'error', text: 'LocalPost: the host did not expose this chat\'s identity and workspace, so no binding was created.' };
-      const actionId = randomUUID();
-      const action = { actionId, hostId, threadId: session.id, cwd: session.cwd };
-      actions.set(actionId, { ...action, at: Number(now()) });
-      const result = await bindFromChatAction(store, identity, { host: bridge, action, authority: BIND_AUTHORITY });
-      if (!result?.ok) {
+    const release = () => { for (const dispose of disposers.splice(0).reverse()) { try { dispose(); } catch { /* release is best effort */ } } };
+    try {
+      define(COMMANDS.bind, 'Bind this chat as the LocalPost mail chat (no arguments).', async invocation => {
+        const session = chatSessionOf(invocation);
+        if (!session) return { kind: 'error', text: 'LocalPost: the host did not expose this chat' + String.fromCharCode(39) + 's identity and absolute workspace, so no binding was created.' };
+        const actionId = randomUUID();
+        const action = { actionId, hostId, threadId: session.id, cwd: session.cwd };
+        actions.set(actionId, { ...action, at: Number(now()) });
+        const result = await bindFromChatAction(store, identity, { host: bridge, action, authority: BIND_AUTHORITY });
+        if (result?.ok) {
+          return { kind: 'success', text: result.existing
+            ? 'LocalPost: this chat was already the mail chat; nothing changed.'
+            : 'LocalPost: this chat is now the mail chat. New mail that arrives is routed here until you unbind or it rotates.' };
+        }
         actions.delete(actionId);
-        return { kind: 'error', text: 'LocalPost: binding refused (' + String(result?.reason ?? 'unknown') + '). Nothing changed.' };
-      }
-      return { kind: 'success', text: 'LocalPost: this chat is now the mail chat. Later mail that arrives is routed here until you unbind or it rotates.' };
-    });
+        const reason = String(result?.reason ?? 'unknown');
+        if (reason === 'already_bound') {
+          // The store refuses any change once bound. Repeating the bind in the SAME chat is a no-op success:
+          // it must not touch generation, source or attestation. A different chat is not a rebind at all.
+          const current = await store.read(identity);
+          const bound = current?.binding?.session;
+          const same = bound?.host === action.hostId && bound?.id === action.threadId && bound?.cwd === action.cwd;
+          return same
+            ? { kind: 'success', text: 'LocalPost: this chat was already the mail chat; nothing changed.' }
+            : { kind: 'error', text: 'LocalPost: this identity is bound to another chat. T1 cannot move a binding between chats (that needs its own protocol).' };
+        }
+        return { kind: 'error', text: 'LocalPost: binding refused (' + reason + '). Nothing changed.' };
+      });
 
-    define(COMMANDS.status, 'Show the current LocalPost mail binding for this host (no arguments).', async () => {
-      const state = await store.read(identity);
-      if (!state) return { kind: 'error', text: 'LocalPost: this identity has no binding state yet.' };
-      const { binding } = state;
-      const attested = attestedNow(state);
-      return { kind: 'success', text: 'LocalPost: mode=' + binding.mode + ' generation=' + binding.generation +
-        ' chat=' + String(binding.session?.id ?? '?') + ' cwd=' + String(binding.session?.cwd ?? '?') +
-        ' attested=' + String(attested) };
-    });
+      define(COMMANDS.status, 'Show the current LocalPost mail binding for this host (no arguments).', async () => {
+        const state = await store.read(identity);
+        if (!state) return { kind: 'error', text: 'LocalPost: this identity has no binding state yet.' };
+        const { binding } = state;
+        return { kind: 'success', text: 'LocalPost: mode=' + binding.mode + ' generation=' + binding.generation +
+          ' chat=' + String(binding.session?.id ?? '?') + ' cwd=' + String(binding.session?.cwd ?? '?') +
+          ' attested=' + String(attestedNow(state)) };
+      });
 
-    define(COMMANDS.unbind, 'Stop automatic routing for this identity (no arguments). Manual reading keeps working.', async () => {
-      const state = await store.update(identity, current => { current.binding.mode = 'manual'; });
-      const mode = state?.binding?.mode ?? 'manual';
-      return mode === 'manual'
-        ? { kind: 'success', text: 'LocalPost: automatic routing is off for this identity. Mail stays for manual reading.' }
-        : { kind: 'error', text: 'LocalPost: could not confirm the unbind; automatic routing may still be on.' };
-    });
-
-    return () => { for (const dispose of disposers.splice(0)) dispose(); };
+      define(COMMANDS.unbind, 'Stop routing NEW mail automatically for this identity (no arguments).', async invocation => {
+        const session = chatSessionOf(invocation);
+        const state = await store.read(identity);
+        if (!state) return { kind: 'error', text: 'LocalPost: this identity has no binding to unbind.' };
+        if (!session || state.binding.session?.id !== session.id) {
+          return { kind: 'error', text: 'LocalPost: only the currently bound chat may unbind. Run this in that chat.' };
+        }
+        await store.update(identity, current => { current.binding.mode = 'manual'; });
+        // Confirm against what was actually persisted, not against the draft the mutator saw.
+        const after = await store.read(identity);
+        if (after?.binding?.mode !== 'manual') return { kind: 'error', text: 'LocalPost: could not confirm the unbind; automatic routing may still be on.' };
+        return { kind: 'success', text: 'LocalPost: automatic routing is off for NEW mail. Mail already accepted keeps its original owner and must be reconciled there; it is not moved to another chat.' };
+      });
+    } catch (error) {
+      release();
+      return { ok: false, reason: 'registration_failed', message: String(error?.message ?? error), dispose: () => {} };
+    }
+    const dispose = () => { release(); if (registration) registration = null; };
+    registration = { names, dispose };
+    return { ok: true, names, dispose };
   }
 
   return { ...bridge, registerCommands };
