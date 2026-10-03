@@ -28,9 +28,12 @@
 - `:850` `async prompt(request)` → `:882` `if (request.mode === "steer") agent.steer(message);` `:883` `else agent.followup(message);`
 - 轮次边界守卫在 `:966`：`if (request.action.kind === "steer" && (target !== "next-turn" || agent.status !== "running")) throw new RemoteError("session/steer-unavailable", …)`
   ⇒ **`agent.status` 可判断"当前是否正在跑一整轮"**
-- 队列语义：`dsh/node_modules/@deepseek-ai/dsh-agent-loop/lib/index.js` 中的 `"next-turn"` / `"next-step"` 两个队列，
-  `:92` 注释 **"Durably cancel all pending input, clearing next-step before next-turn"** ⇒ 队列是**持久**的 ✅
-- **结论**：`agent.followup(message)` 就是"本轮结束后投递"，且宿主自带持久队列。
+- 队列语义（**已按 codex 2026-10-03 审核修正**）：`dsh-agent-loop` 里的 `"next-turn"` / `"next-step"` 是 **session 事件投影**；
+  `:92` 注释原文 "Durably cancel all pending input…" 讲的是**取消**待发输入要持久，**推不出**队列本身跨崩溃持久。
+- **正确结论**：`agent.followup(message)` 的语义是「**作为下一轮输入**」，即本轮结束后投递；
+  **`followup()` 返回只代表宿主受理了这次调用，不代表投递已跨崩溃落盘** ⇒ 不得宣称持久投递
+  （与 §二.4「宿主不提供可跨崩溃证明的受理回执」一致，也与 §八.1 的撤回说明一致）。
+- 另：`followup` 是「下一轮输入」，**不等于**「自动后台执行闭环」——模型是否真的醒来并处理，本报告未证明。
 
 ### 3. 用户在聊天 A 内的**显式绑定动作**（关键）
 
@@ -43,7 +46,9 @@
   const invocation = Object.freeze({ commandId, agent, rawInput: parsed.rawInput, attachments, signal });
   const output = command.definition.handler(invocation);   // :388
   ```
-  ⇒ **handler 直接拿到 `invocation.agent`，也就是"用户在哪条聊天里敲下这条命令"的确切 agent/session** ✅
+  ⇒ **handler 直接拿到 `invocation.agent`**。
+  **证据强度（codex 审核修正）**：这只能证明 handler 收到 `execute(agent, …)` 传入的 **agent 对象**；
+  **不能**单凭它证明「真人在当前可见聊天输入」。**仍缺**：UI adapter 的调用链证据 + 真机 A/B 会话验证。
 - 另有 `list(agent)` / `find(agent, name)`，以及"Parse and execute a known command **without sending it to the model**"。
 
 ### 4. 持久受理状态
@@ -124,4 +129,46 @@
 - 隔离测试会话：A、B 两个专用会话；生产 `dispatch` 全程关闭。
 - 逐项步骤与通过标准见 `docs/live-acceptance-plan.md`（E1 绑定不投错、E2 整轮后投递、E3 关客户端不丢且只投原绑定、E4 幂等含重启与重放、E5 不确定不二次唤醒+真实 result 对账、E6 人工/自动单消费者）。
 - E 全部通过 **仍不等于** 可启用：还有 T2 用户批准与 T3 生产部署两道独立门槛。
+
+
+## 八、审核修正与追加要求（codex 2026-10-03）
+
+### 8.0 四类口径必须分开写（不得混为一谈）
+
+| 口径 | 本报告的状态 |
+|---|---|
+| **已实测的宿主 API 能力** | ✅ 有符号级证据（见 §二） |
+| **跨崩溃持久保证** | ❌ **未证明**（见 §八.1 撤回） |
+| **「当前用户可见聊天」判定** | ❌ **未证明**（§二.3 只证明 handler 拿到 agent 对象） |
+| **`followup` 的性质** | 「**下一轮输入**」，**不等于**自动后台执行闭环 |
+
+### 8.1 已撤回的两处过强表述
+
+1. **「队列是持久的 ✅ / 宿主自带持久队列」——撤回**（见 §二.2 修正后文本）。
+2. **「handler 拿到 invocation.agent ⇒ 就是用户在哪条聊天敲下命令」——强度过高**（见 §二.3 修正后文本）。
+
+### 8.2 实现前必须追加落实（codex 要求）
+
+1. **可信来源**：`hostId` / `authority` / `handoffDigest` 各自的可信来源必须写明。
+2. **投递竞态**：最终校验必须是 `ctx.agents.get(id) === capturedAgent`（**对象同一性**），
+   且**校验与同步 `followup()` 之间不得有 `await`**。
+3. **命令遮蔽**：scoped command 可遮蔽全局 `/localpost-bind`，必须做碰撞/遮蔽检测并告警。
+4. **隐私**：命令参数默认写入 session 日志 ⇒ 绑定类命令必须 `recordInput: false`；不得接受任意文件路径或任意 mailbox identity。
+5. **身份与降级**：强制 `MAILBOX_IDENTITY=dsh`、精确发件人白名单；**版本不匹配即 fail closed**。
+6. **绑定写入**：原子 CAS，覆盖**取消绑定 / 重复绑定 / 插件重载 / UI 中途取消**。
+7. **持久性口径**：`followup` 成功只能记为「**宿主调用成功，持久性未确认**」，**不得**宣称 exactly-once。
+
+### 8.3 后续闭环顺序（codex 指定）
+
+1. Claude 修 completion intent 并复审通过 → 2. DSH no-ff 集成 + main 全量复测 →
+3. **实现 DSH 原生 caller-attested 桥**：由可信宿主把 `execution/invocation.agent` 注入内部 caller，
+   **上下文不得成为模型可控参数** → 4. 真实端到端：受控投递 → followup → 同聊天 read/reply/archive → done，
+   并验证**异聊天/普通 MCP 被拒** → 5. schema 升级与 sessions/arrivals/queues 的快照、迁移、回滚 →
+6. GC 元数据策略与完整部署 manifest/hash → 7. 隔离根执行 E1–E6、强杀恢复、回滚演练 →
+8. codex 复审证据通过后，再向用户请求 **T2 最小人工试点**批准。
+
+### 8.4 一条不得误判的边界
+
+**普通 MCP 无法提供 caller proof 不等于功能完成**：它当前是**安全地拒绝**，但这也意味着自动任务会卡死。
+⇒ **真实宿主桥（caller-attested）是启用前的 P0 门禁**，不是可选项。
 
