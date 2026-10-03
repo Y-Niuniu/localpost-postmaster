@@ -81,12 +81,20 @@ function dead(pid) {
   catch (error) { return error.code === 'ESRCH'; }
 }
 const TRANSIENT_LEASE_ERRORS = new Set(['EPERM', 'EACCES', 'EBUSY']);
+// A lock file that stays empty means its creator died between the exclusive create and the
+// owner write. Past this grace period that is a real fault, not a busy lock.
+export const EMPTY_LOCK_GRACE_MS = 5000;
+const RELEASE_ATTEMPTS = 5;
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const isTransientLeaseError = error => Boolean(error) && TRANSIENT_LEASE_ERRORS.has(error.code);
 async function readOwner(file) {
   try {
     const raw = await fsp.readFile(file, 'utf8');
     // A lock file that exists but is still empty is being written right now - not corrupt.
-    if (raw.trim() === '') return { transient: true };
+    if (raw.trim() === '') {
+      const stats = await fsp.stat(file).catch(() => null);
+      return { transient: true, empty: true, emptySince: stats ? stats.mtimeMs : 0 };
+    }
     return JSON.parse(raw);
   }
   catch (error) {
@@ -99,8 +107,28 @@ async function readOwner(file) {
   }
 }
 async function unlinkOwned(file, token) {
-  const current = await readOwner(file);
-  if (current?.token === token) await fsp.unlink(file).catch(error => { if (error.code !== 'ENOENT') throw error; });
+  let lastError;
+  for (let attempt = 1; attempt <= RELEASE_ATTEMPTS; attempt += 1) {
+    try {
+      const current = await readOwner(file);
+      // A transient read (or an empty file still being written) says nothing about the owner, so
+      // retry briefly - but never report success: silently skipping the unlink leaks a lock that
+      // its still-live owner can never reclaim.
+      if (current?.transient) {
+        lastError = Object.assign(new Error('transient lock read during release'), { code: 'EBUSY' });
+        await sleep(attempt * 10);
+        continue;
+      }
+      if (current?.token === token) await fsp.unlink(file);
+      return { released: true };
+    } catch (error) {
+      if (error.code === 'ENOENT') return { released: true };
+      if (!isTransientLeaseError(error)) throw error;
+      lastError = error;
+      await sleep(attempt * 10);
+    }
+  }
+  throw Object.assign(new Error('Lease release could not be confirmed: ' + (lastError?.code || 'transient')), { code: 'LEASE_RELEASE_UNCERTAIN' });
 }
 async function createOwner(file, now) {
   const token = randomUUID();
@@ -131,9 +159,15 @@ export async function acquireLease(root, { name = '.postmaster.lock', staleMs = 
     const started = typeof x?.started_at === 'number' ? x.started_at : Date.parse(x?.started_at);
     return x && !x.invalid && Number.isFinite(started) && Number(now) - started > staleMs && dead(x.pid);
   };
-  if (!stale(previous)) return busy(previous?.invalid ? 'invalid_owner_needs_reconcile' : 'busy');
+  if (!stale(previous)) {
+    const emptyFor = previous?.empty ? Number(now) - Number(previous.emptySince || 0) : 0;
+    if (previous?.empty && emptyFor > EMPTY_LOCK_GRACE_MS) return busy('invalid_owner_needs_reconcile');
+    return busy(previous?.invalid ? 'invalid_owner_needs_reconcile' : 'busy');
+  }
   // Serialize stale recovery. A live owner is never stolen, even beyond its TTL.
-  const gateFile = safePath(root, `${name}.reclaim`);
+  let gateFile;
+  try { gateFile = safePath(root, `${name}.reclaim`); }
+  catch (error) { if (isTransientLeaseError(error)) return busy('busy'); throw error; }
   const gate = await createOwner(gateFile, now);
   if (!gate) return busy('recovery_busy_needs_reconcile');
   try {
