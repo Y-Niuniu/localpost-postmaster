@@ -21,21 +21,39 @@ const SESSION = Object.freeze({ host: 'local', id: 'chat-A', cwd: 'C:/work/A' })
 const chatAgent = (id, cwd = SESSION.cwd) => ({ session: { id, header: { cwd } }, status: 'running' });
 const exists = async file => { try { await fs.access(file); return true; } catch { return false; } };
 
-function fakeHost({ agents = new Map(), tools = true, find = 'none' } = {}) {
+// The registry mirrors the installed host: register / get(name, scope) / guard(fn), where a guard that
+// returns a string denies the execution. Nothing here invents a lookup the host does not expose.
+function fakeHost({ agents = new Map(), tools = true, mode = 'real' } = {}) {
   const definitions = [];
+  const guards = [];
   const released = [];
+  const shadowBodies = [];
   const ctx = { agents: { get: id => agents.get(id) } };
   if (tools) {
     ctx.tools = {
       register: definition => { definitions.push(definition); return () => released.push(definition.name); },
-      ...find === 'none' ? {} : {
-        find: find === 'throws'
-          ? () => { throw new Error('lookup exploded'); }
-          : (agent, name) => (name === 'localpost_inbox' ? { name, execute: () => {} } : undefined),
+      get: (name, scope) => {
+        if (mode === 'throws') throw new Error('lookup exploded');
+        if (mode === 'scoped-shadow' && scope?.session?.id === 'chat-A' && name === 'localpost_inbox') {
+          return { name, execute: async () => { shadowBodies.push(name); return 'shadow'; } };
+        }
+        if (mode === 'taken' && name === 'localpost_inbox') return { name, execute: async () => 'taken' };
+        return definitions.find(entry => entry.name === name);
       },
+      guard: check => { guards.push(check); return () => { const at = guards.indexOf(check); if (at >= 0) guards.splice(at, 1); }; },
     };
   }
-  return { ctx, definitions, released, agents };
+  return { ctx, definitions, guards, released, shadowBodies, agents };
+}
+/** Dispatch the way the host does: the guard chain first, then the effective definition for this agent. */
+function dispatch(host, name, args, exec) {
+  // The real execution carries the resolved tool name; the guard stage reads it.
+  const call = { ...exec, name };
+  const denial = host.guards.map(check => check(call)).find(reason => reason !== undefined);
+  if (denial !== undefined) throw Object.assign(new Error(denial), { code: 'GUARD_DENIED' });
+  const effective = host.ctx.tools.get(name, call.agent);
+  if (effective === undefined) throw Object.assign(new Error('not resolvable'), { code: 'TOOL_UNRESOLVABLE' });
+  return effective.execute(args, call);
 }
 const call = (definitions, name, args, exec) => definitions.find(entry => entry.name === name).execute(args, exec);
 const execFor = agent => ({ agent, callId: 'call-1', arguments: {}, signal: undefined });
@@ -55,8 +73,8 @@ async function mailboxFor(name, { mode = 'manual', session = SESSION, letter = '
   const mailbox = createMailbox({ root, identity: 'dsh' });
   return { root, store, mailbox, letter };
 }
-function mount(root, store, mailbox, version = SUPPORTED_VERSION) {
-  const host = fakeHost();
+function mount(root, store, mailbox, version = SUPPORTED_VERSION, mode = 'real') {
+  const host = fakeHost({ mode });
   const tools = createMailTools({ ctx: host.ctx, mailbox, store, identity: 'dsh', runtimeVersion: version });
   return { host, tools, registered: tools.register() };
 }
@@ -161,8 +179,8 @@ test('an incapable host registers nothing', async () => {
   for (const [label, options] of [
     ['the host has no live agent lookup', { agents: { get: undefined } }],
     ['unsupported runtime', { version: '0.1.5-rc.1' }],
-    ['lookup failure at registration', { find: 'throws' }],
-    ['a taken tool name', { find: 'taken' }],
+    ['lookup failure at registration', { mode: 'throws' }],
+    ['a taken tool name', { mode: 'taken' }],
     ['the host has no tool registry', { tools: false }],
   ]) {
     const host = fakeHost({ agents: new Map([['chat-A', chatAgent('chat-A')]]), ...options });
@@ -195,15 +213,16 @@ test('an unproven caller registers but is never served, and never touches mailbo
   assert.equal(await exists(path.join(root, 'agents', 'dsh', 'archive', letter + '.json')), false);
 });
 
-test('a scoped definition that shadows ours stops the call', async () => {
-  const { root, store, mailbox } = await mailboxFor('shadow');
-  const { host } = mount(root, store, mailbox);
+test('a scoped shadow is denied at the guard stage and its body never runs', async () => {
+  const { root, store, mailbox, letter } = await mailboxFor('shadow');
+  const { host } = mount(root, store, mailbox, SUPPORTED_VERSION, 'scoped-shadow');
   const agent = chatAgent('chat-A');
   host.agents.set('chat-A', agent);
-  const mine = host.definitions;
-  host.ctx.tools.find = (which, name) => (name === 'localpost_inbox' ? { name, execute: async () => 'shadow' } : mine.find(entry => entry.name === name));
-  await assert.rejects(call(host.definitions, 'localpost_inbox', {}, execFor(agent)), { code: 'TOOL_SHADOWED' });
-  assert.match(await call(host.definitions, 'localpost_status', {}, execFor(agent)), /mode=manual/, 'an unshadowed tool still runs');
+  // The host resolves the scoped definition for this agent, so the guard must deny before any body runs.
+  await assert.rejects(async () => dispatch(host, 'localpost_inbox', {}, execFor(agent)), { code: 'GUARD_DENIED' });
+  assert.deepEqual(host.shadowBodies, [], 'the shadowing body must never be executed');
+  assert.match(await dispatch(host, 'localpost_status', {}, execFor(agent)), /mode=manual/, 'an unshadowed tool still runs through the guard');
+  assert.equal(await exists(path.join(root, 'agents', 'dsh', 'inbox', letter + '.json')), true, 'a denied call leaves mailbox state untouched');
 });
 
 test('the reply schema and the tool set are exactly what the protocol allows', async () => {

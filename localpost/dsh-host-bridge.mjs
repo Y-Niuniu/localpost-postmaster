@@ -40,6 +40,18 @@ export function chatSessionOf(invocation) {
   return Object.freeze({ id, cwd });
 }
 
+/**
+ * The caller of a human command, proven by the host: an unattested caller must not even learn which
+ * chat is bound (its id and absolute workspace included), let alone change or clear the binding.
+ * @returns {{host: string, session: string, cwd: string}|null} null when nothing proves the caller
+ */
+export function attestedCommandCaller(invocation, agents, hostId) {
+  const session = chatSessionOf(invocation);
+  if (!session) return null;
+  if (typeof agents?.get !== 'function' || agents.get(session.id) !== invocation.agent) return null;
+  return Object.freeze({ host: hostId, session: session.id, cwd: session.cwd });
+}
+
 export function createDshHostBridge({ ctx, runtimeVersion, store, identity, hostId = 'local', now = Date.now, actionTtlMs = ACTION_TTL_MS } = {}) {
   assertId(identity);
   const commands = ctx?.commands;
@@ -56,6 +68,15 @@ export function createDshHostBridge({ ctx, runtimeVersion, store, identity, host
   const actions = new Map();
   let registration = null;
   const registered = new Map();
+
+  /** The active binding, only when it names exactly this caller; otherwise null. */
+  const boundTo = (state, caller) => {
+    const binding = state?.binding;
+    const bound = binding?.session;
+    const exact = caller && binding?.state === 'active' && bound?.host === caller.host &&
+      bound?.id === caller.session && (bound?.cwd ?? null) === caller.cwd;
+    return exact ? binding : null;
+  };
 
   const bridge = {
     capabilities,
@@ -132,10 +153,10 @@ export function createDshHostBridge({ ctx, runtimeVersion, store, identity, host
       define(COMMANDS.bind, 'Bind this chat as the LocalPost mail chat (no arguments).', async invocation => {
         const shadowed = guard(COMMANDS.bind, invocation);
         if (shadowed) return shadowed;
-        const session = chatSessionOf(invocation);
-        if (!session) return { kind: 'error', text: 'LocalPost: the host did not expose this chat' + String.fromCharCode(39) + 's identity and absolute workspace, so no binding was created.' };
+        const caller = attestedCommandCaller(invocation, agents, hostId);
+        if (!caller) return { kind: 'error', text: 'LocalPost: the host did not prove this chat' + String.fromCharCode(39) + 's identity and absolute workspace, so no binding was created.' };
         const actionId = randomUUID();
-        const action = { actionId, hostId, threadId: session.id, cwd: session.cwd };
+        const action = { actionId, hostId, threadId: caller.session, cwd: caller.cwd };
         actions.set(actionId, { ...action, at: Number(now()) });
         const result = await bindFromChatAction(store, identity, { host: bridge, action, authority: BIND_AUTHORITY });
         if (result?.ok) {
@@ -161,9 +182,12 @@ export function createDshHostBridge({ ctx, runtimeVersion, store, identity, host
       define(COMMANDS.status, 'Show the current LocalPost mail binding for this host (no arguments).', async invocation => {
         const shadowed = guard(COMMANDS.status, invocation);
         if (shadowed) return shadowed;
+        const caller = attestedCommandCaller(invocation, agents, hostId);
         const state = await store.read(identity);
+        if (!caller) return { kind: 'error', text: 'LocalPost: the host did not prove which chat is calling, so the binding is not disclosed.' };
         if (!state) return { kind: 'error', text: 'LocalPost: this identity has no binding state yet.' };
-        const { binding } = state;
+        const binding = boundTo(state, caller);
+        if (!binding) return { kind: 'error', text: 'LocalPost: only the bound mail chat may read the binding.' };
         return { kind: 'success', text: 'LocalPost: mode=' + binding.mode + ' generation=' + binding.generation +
           ' chat=' + String(binding.session?.id ?? '?') + ' cwd=' + String(binding.session?.cwd ?? '?') +
           ' attested=' + String(attestedNow(state)) };
@@ -172,10 +196,11 @@ export function createDshHostBridge({ ctx, runtimeVersion, store, identity, host
       define(COMMANDS.unbind, 'Stop routing NEW mail automatically for this identity (no arguments).', async invocation => {
         const shadowed = guard(COMMANDS.unbind, invocation);
         if (shadowed) return shadowed;
-        const session = chatSessionOf(invocation);
+        const caller = attestedCommandCaller(invocation, agents, hostId);
         const state = await store.read(identity);
+        if (!caller) return { kind: 'error', text: 'LocalPost: the host did not prove which chat is calling.' };
         if (!state) return { kind: 'error', text: 'LocalPost: this identity has no binding to unbind.' };
-        if (!session || state.binding.session?.id !== session.id) {
+        if (!boundTo(state, caller)) {
           return { kind: 'error', text: 'LocalPost: only the currently bound chat may unbind. Run this in that chat.' };
         }
         await store.update(identity, current => { current.binding.mode = 'manual'; });

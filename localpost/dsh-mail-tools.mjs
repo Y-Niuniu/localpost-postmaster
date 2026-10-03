@@ -52,18 +52,25 @@ export function attestedCaller(ctx, exec, hostId) {
  * The effective definition the host would run for this very agent must still be the one this bridge
  * registered: a scoped registration can shadow a global one, and a shadowed tool must not run at all.
  */
-export function assertNotShadowed(registry, agent, name, ours) {
-  if (typeof registry?.find !== 'function') return;
+/**
+ * The reason this execution must be denied, or undefined to let it through.
+ * The host picks the effective definition BEFORE dispatch (resolveExecution = get(name, scope)), so a
+ * scoped shadow means our own execute never runs: the check has to be a guard.
+ */
+export function shadowReason(tools, ours, exec) {
+  if (!TOOL_NAMES.includes(exec?.name)) return undefined;
+  const mine = ours.get(exec.name);
+  if (!mine || mine.size === 0) return undefined;          // not ours (released): leave the host's rules alone
   let effective;
-  try { effective = registry.find(agent, name); }
-  catch (error) { throw failure('SHADOW_CHECK_FAILED', 'the host could not resolve the effective ' + name + ': ' + String(error?.message ?? error)); }
-  if (!effective || effective.execute !== ours.execute) {
-    throw failure('TOOL_SHADOWED', 'the effective ' + name + ' is not the definition this bridge registered');
-  }
+  try { effective = tools.get(exec.name, exec.agent); }
+  catch (error) { return 'localpost: ' + exec.name + ' could not be resolved (' + String(error?.message ?? error) + ')'; }
+  if (effective === undefined) return 'localpost: ' + exec.name + ' is not resolvable in this scope';
+  if (!mine.has(effective)) return 'localpost: ' + exec.name + ' is shadowed by another definition';
+  return undefined;
 }
 
 /** True only when the identity's current binding is exactly this chat, workspace included. */
-function requireBoundChat(state, caller, id) {
+function requireBoundChat(state, caller) {
   const binding = state?.binding;
   if (!binding) throw failure('NOT_BOUND', 'this identity has no binding yet');
   if (binding.state !== 'active') throw failure('BINDING_FROZEN', 'the binding is not active');
@@ -86,23 +93,24 @@ const letterLine = letter => shown({
  */
 export function createMailTools({ ctx, mailbox, store, identity, hostId = 'local', runtimeVersion } = {}) {
   assertId(identity);
-  const canRegister = typeof ctx?.tools?.register === 'function';
+  const tools = ctx?.tools;
+  const canRegister = typeof tools?.register === 'function';
+  const canGet = typeof tools?.get === 'function';
+  const canGuard = typeof tools?.guard === 'function';
   const canLookup = typeof ctx?.agents?.get === 'function';
   const versionOk = runtimeVersion === SUPPORTED_VERSION;
   const reasons = [];
   if (!versionOk) reasons.push('runtime_version_mismatch');
   if (!canRegister) reasons.push('tool_registry_unavailable');
+  if (!canGet) reasons.push('tool_lookup_unavailable');
+  if (!canGuard) reasons.push('tool_guard_unavailable');
   if (!canLookup) reasons.push('live_agent_lookup_unavailable');
-  const capable = versionOk && canRegister && canLookup;
+  const capable = reasons.length === 0;
   let registration = null;
-  let registered = new Map();
+  // name -> Set of the definition objects this bridge registered, so the guard can prove identity.
+  const ours = new Map();
 
-  const withCaller = (name, exec, run) => {
-    const ours = registered.get(name);
-    const caller = attestedCaller(ctx, exec, hostId);
-    if (ours) assertNotShadowed(ctx.tools, exec.agent, name, ours);
-    return run(caller);
-  };
+  const withCaller = (name, exec, run) => run(attestedCaller(ctx, exec, hostId));
   const bound = async caller => requireBoundChat(await store.read(identity), caller);
 
   const definitions = () => [
@@ -191,29 +199,30 @@ export function createMailTools({ ctx, mailbox, store, identity, hostId = 'local
     if (!capable) return { ok: false, reason: 'host_capabilities_unmet', reasons: [...reasons], dispose: () => {} };
     if (registration) return { ok: true, existing: true, dispose: registration.dispose };
     const list = definitions();
-    if (typeof ctx.tools.find === 'function') {
-      for (const definition of list) {
-        let existing;
-        try { existing = ctx.tools.find(undefined, definition.name); }
-        // An unreadable lookup is not "no existing definition": it must stop registration.
-        catch (error) { return { ok: false, reason: 'lookup_failed', name: definition.name, message: String(error?.message ?? error), dispose: () => {} }; }
-        if (existing !== undefined) return { ok: false, reason: 'tool_name_taken', name: definition.name, dispose: () => {} };
-      }
+    for (const definition of list) {
+      let existing;
+      // An unreadable lookup is not "no existing definition": it must stop registration. Omitted scope = global view.
+      try { existing = tools.get(definition.name); }
+      catch (error) { return { ok: false, reason: 'lookup_failed', name: definition.name, message: String(error?.message ?? error), dispose: () => {} }; }
+      if (existing !== undefined) return { ok: false, reason: 'tool_name_taken', name: definition.name, dispose: () => {} };
     }
+    for (const definition of list) ours.set(definition.name, new Set());
     const disposers = [];
     const release = () => { for (const dispose of disposers.splice(0).reverse()) { try { dispose(); } catch { /* release is best effort */ } } };
     try {
+      // The guard goes first: there must be no window in which our tools are runnable without it.
+      disposers.push(tools.guard(exec => shadowReason(tools, ours, exec)) ?? (() => {}));
       for (const definition of list) {
-        const dispose = ctx.tools.register(definition);
+        const dispose = tools.register(definition);
         disposers.push(typeof dispose === 'function' ? dispose : () => {});
-        registered.set(definition.name, definition);
+        ours.set(definition.name, new Set([definition]));
       }
     } catch (error) {
       release();
-      registered = new Map();
+      ours.clear();
       return { ok: false, reason: 'registration_failed', message: String(error?.message ?? error), dispose: () => {} };
     }
-    const dispose = () => { release(); registered = new Map(); if (registration) registration = null; };
+    const dispose = () => { release(); ours.clear(); if (registration) registration = null; };
     registration = { names: [...TOOL_NAMES], dispose };
     return { ok: true, names: [...TOOL_NAMES], dispose };
   }
@@ -221,8 +230,8 @@ export function createMailTools({ ctx, mailbox, store, identity, hostId = 'local
   return {
     register,
     names: [...TOOL_NAMES],
-    shared: [...SHARED],
-    capabilities: () => ({ runtimeVersion: versionOk, toolRegistry: canRegister, liveAgentLookup: canLookup, reasons: [...reasons] }),
+    capabilities: () => ({ runtimeVersion: versionOk, toolRegistry: canRegister, toolLookup: canGet, toolGuard: canGuard, liveAgentLookup: canLookup, reasons: [...reasons] }),
     attestedCaller: exec => attestedCaller(ctx, exec, hostId),
+    shadowReason: exec => shadowReason(tools, ours, exec),
   };
 }

@@ -18,7 +18,9 @@ async function scratch(name) {
 }
 test.after(async () => { for (const dir of created) await removeTree(dir); await removeTree(TMP); });
 
-function fakeHost({ version = '0.2.0-rc.2', agents = new Map(), commands = true, failOn = 0, existing = null } = {}) {
+// Every chat agent a test builds is live in the registry, which is what command attestation checks.
+const live = new Map();
+function fakeHost({ version = '0.2.0-rc.2', agents = live, commands = true, failOn = 0, existing = null } = {}) {
   const definitions = [];
   const released = [];
   const ctx = {};
@@ -37,7 +39,11 @@ function fakeHost({ version = '0.2.0-rc.2', agents = new Map(), commands = true,
   if (agents !== null) ctx.agents = { get: id => agents.get(id) };
   return { ctx, definitions, released, agents };
 }
-const chatAgent = (id, cwd) => ({ session: { id, header: { cwd } }, status: 'running', followup: async () => {} });
+const chatAgent = (id, cwd = 'C:/work/A') => {
+  const agent = { session: { id, header: { cwd } }, status: 'running', followup: async () => {} };
+  live.set(id, agent);
+  return agent;
+};
 const find = (definitions, name) => definitions.find(entry => entry.name === name);
 
 async function bridgeFor(name, options = {}) {
@@ -198,9 +204,16 @@ test('status reports the binding without claiming more than the host can prove',
   bridge.registerCommands();
   assert.equal((await find(host.definitions, COMMANDS.status).handler({})).kind, 'error');
   await find(host.definitions, COMMANDS.bind).handler({ agent: chatAgent('chat-A', 'C:/work/A') });
-  const shown = await find(host.definitions, COMMANDS.status).handler({});
+  // A caller the host cannot prove learns nothing about the binding.
+  const substituted = await find(host.definitions, COMMANDS.status).handler({ agent: { session: { id: 'chat-A', header: { cwd: 'C:/work/A' } } } });
+  assert.equal(substituted.kind, 'error', 'an agent the live registry does not hand back must not read the binding');
+  // The live agent of the bound chat may.
+  const shown = await find(host.definitions, COMMANDS.status).handler({ agent: chatAgent('chat-A', 'C:/work/A') });
   assert.equal(shown.kind, 'success');
   assert.match(shown.text, /mode=auto/);
   assert.match(shown.text, /chat=chat-A/);
   assert.match(shown.text, /attested=true/);
+  // Same chat id, another workspace: not the bound chat.
+  const drifted = await find(host.definitions, COMMANDS.status).handler({ agent: chatAgent('chat-A', 'C:/work/ELSEWHERE') });
+  assert.equal(drifted.kind, 'error', 'workspace drift must not read the binding');
 });
