@@ -50,15 +50,15 @@ test('archived IDs cannot recreate pending tasks and concurrent delivery has one
   assert.equal(mail.roster().find(row => row.agent === 'codex').archive, 1);
 });
 
-test('only a trusted publication option can bind a route, and retries retain the original target', async t => {
+test('nobody routes a letter at delivery: neither the envelope nor a delivery option can set a route', async t => {
   const { root, mail } = fixture(t);
-  const route = { threadId: 'chat-A', cwd: root, hostId: 'local', focusRevision: 1, publishedAt: '2026-10-01T10:00:00.000Z', scope: 'analysis-reply' };
+  const route = { threadId: 'chat-A', cwd: root, hostId: 'local', generation: 1, bindingRevision: 1 };
   await assert.rejects(mail.deliver(letter({ route })), /route|路由/i);
-  await mail.deliver(letter(), { route });
-  const routePath = path.join(root, 'runtime/routes/task-one.json');
-  assert.equal(JSON.parse(fs.readFileSync(routePath, 'utf8')).threadId, 'chat-A');
-  await mail.deliver(letter(), { route: { ...route, threadId: 'chat-B', focusRevision: 2 } });
-  assert.equal(JSON.parse(fs.readFileSync(routePath, 'utf8')).threadId, 'chat-A');
+  await assert.rejects(mail.deliver(letter({ bindingRevision: 1 })), /route|路由/i);
+  // Routes are captured by the receiver from the explicit binding (receiver.test.mjs); delivery cannot set one.
+  await assert.rejects(mail.deliver(letter(), { route }), /route/);
+  await mail.deliver(letter());
+  assert.equal(fs.existsSync(path.join(root, 'runtime/routes')), false, 'no route file is ever written by delivery');
   assert.equal(mail.read('codex', 'task-one').envelope.route, undefined);
 });
 
@@ -270,12 +270,13 @@ test('MCP reports a published but unarchived reply as a structured partial failu
   assert.equal(partial.result.isError, true);
   const state = JSON.parse(partial.result.content[0].text);
   assert.deepEqual({ ...state, message: undefined }, { status: 'partial_failure', code: 'REPLIED_ARCHIVE_PENDING', reply_delivered: true,
-    reply_id: 'task-one.result', outcome: 'completed', archive_pending: 'task-one', retry_action: 'mailbox_archive', message: undefined });
+    reply_id: 'task-one.result', outcome: 'completed', archive_pending: 'task-one', retry_action: 'mailbox_reply', message: undefined });
+  assert.match(state.message, /identical mailbox_reply/);
   assert.equal(admin.read('dsh', 'task-one.result').envelope.outcome, 'completed');
   assert.equal(admin.inbox('codex').length, 1);
-  const archived = await call(2, 'mailbox_archive', { agent: 'codex', id: 'task-one' });
-  assert.equal(JSON.parse(archived.result.content[0].text).archived, 'task-one');
-  assert.equal(JSON.parse((await call(3, 'mailbox_reply', reply)).result.content[0].text).idempotent, true);
+  // The identical reply finishes it: the published result is reused and the original archived.
+  const repaired = JSON.parse((await call(2, 'mailbox_reply', reply)).result.content[0].text);
+  assert.deepEqual([repaired.idempotent, repaired.archived], [true, 'task-one']);
   assert.equal(admin.inbox('codex').length, 0);
   assert.equal(admin.inbox('dsh').length, 1);
   const plain = await call(4, 'mailbox_archive', { agent: 'codex', id: 'missing' });

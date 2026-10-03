@@ -16,7 +16,7 @@ import { acquireLease, atomicWrite, assertId, safePath } from './fs-safe.mjs';
  */
 export const STATE_SCHEMA = 'localpost-session-state-v1';
 export const MODES = Object.freeze(['manual', 'auto']);
-export const CLAIM_STATUSES = Object.freeze(['reserved', 'dispatching', 'accepted', 'done', 'released', 'needs_reconcile']);
+export const CLAIM_STATUSES = Object.freeze(['reserved', 'dispatching', 'accepted', 'completing', 'done', 'released', 'needs_reconcile']);
 export const ROTATION_STATES = Object.freeze(['active', 'frozen', 'drained', 'handoff_written', 'candidate_created', 'verified', 'switched', 'retired']);
 // The only scope a binding can carry. Implementation authority is never part of a binding or a handoff.
 export const ANALYSIS_REPLY = 'analysis-reply';
@@ -30,6 +30,9 @@ const validClaim = (id, claim) => record(claim) && claim.letter === id && typeof
   text(claim.owner.session) && Array.isArray(claim.history);
 const validJournal = (key, journal) => record(journal) && String(journal.generation) === key &&
   ROTATION_STATES.includes(journal.state) && validSession(journal.from) && Array.isArray(journal.history);
+// The host's confirmation of the user's explicit bind action in one chat (binding-provider.mjs).
+const validAttestation = a => a === undefined || (record(a) && a.kind === 'chat-action' &&
+  [a.actionId, a.hostId, a.threadId, a.cwd, a.at].every(text));
 
 // Windows refuses to open a lock file while its holder is deleting it: acquireLease then throws EPERM/EACCES/EBUSY
 // or reports an invalid owner (reproduced under contention, 2026-10-02). Those refusals are transient, so callers
@@ -47,7 +50,7 @@ export function validateState(state, identity) {
     record(binding) && Number.isSafeInteger(binding.version) && binding.version >= 1 &&
     Number.isSafeInteger(binding.generation) && binding.generation >= 1 && MODES.includes(binding.mode) &&
     ['active', 'frozen'].includes(binding.state) && Number.isSafeInteger(binding.capacity) && binding.capacity >= 1 &&
-    validSession(binding.session) && binding.authority?.scope === ANALYSIS_REPLY &&
+    validSession(binding.session) && binding.authority?.scope === ANALYSIS_REPLY && validAttestation(binding.attestation) &&
     record(state.claims) && Object.entries(state.claims).every(([id, claim]) => validClaim(id, claim)) &&
     record(state.rotations) && Object.entries(state.rotations).every(([key, journal]) => validJournal(key, journal));
   if (!valid) throw failure('STATE_NEEDS_RECONCILE', `Session state for ${identity} is invalid and needs reconciliation`);
@@ -124,19 +127,23 @@ export function createSessionStore({ root, now = () => Date.now(), staleMs = 600
 }
 
 /** The explicit, user-made binding of an identity to one session. Repeating it verbatim is a no-op; anything else is a conflict. */
-export async function bind(store, identity, { session, mode = 'manual', capacity = 50, authority, source } = {}) {
+export async function bind(store, identity, { session, mode = 'manual', capacity = 50, authority, source, attestation } = {}) {
   assertId(identity);
   if (!validSession(session)) throw new Error('A binding needs an explicit session { host, id }');
   if (!MODES.includes(mode)) throw new Error('Binding mode must be manual or auto');
   if (!Number.isSafeInteger(capacity) || capacity < 1) throw new Error('Binding capacity must be a positive integer');
   if (authority?.scope !== ANALYSIS_REPLY || !text(authority.source)) throw new Error('Binding authority must be the trusted analysis-reply policy');
   if (!text(source)) throw new Error('A binding must record who made it');
-  const created = await store.create(identity, () => ({
-    schema: STATE_SCHEMA, identity, revision: 0,
-    binding: { version: 1, generation: 1, session: { ...session }, mode, state: 'active', frozen: null, capacity,
-      authority: { scope: authority.scope, source: authority.source }, source, since: store.at() },
-    claims: {}, context: null, rotations: {},
-  }));
+  const created = await store.create(identity, () => {
+    const since = store.at();
+    return {
+      schema: STATE_SCHEMA, identity, revision: 0,
+      binding: { version: 1, generation: 1, session: { ...session }, mode, state: 'active', frozen: null, capacity,
+        authority: { scope: authority.scope, source: authority.source }, source, since,
+        ...(attestation ? { attestation: { kind: 'chat-action', ...attestation, at: since } } : {}) },
+      claims: {}, context: null, rotations: {},
+    };
+  });
   const { binding } = created.state;
   if (created.created) return { ok: true, binding };
   const same = binding.generation === 1 && binding.session.host === session.host && binding.session.id === session.id &&

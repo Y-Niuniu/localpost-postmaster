@@ -10,6 +10,7 @@
  *   candidate:requested  「要建候选会话」的写前记录刚落盘，还没调宿主
  *   handoff:file         交接文件已原子落盘，轮换日志还没记它的 digest
  *   host:created         宿主已建好候选会话，回包还没记进日志
+ *   host:revoked         宿主已给出旧会话的撤权 barrier，逐信 CAS 切换还没落盘
  *   host:retired         宿主已退役旧会话，日志还没记 retired
  *   claim:dispatching    某封信的 dispatching 写前记录刚落盘，还没调宿主
  *   host:submitted       宿主已受理某封信，结果还没记账
@@ -46,7 +47,7 @@ fsp.rename = async (from, to) => {
 };
 
 const host = createFakeHost({ root, behavior: JSON.parse(process.env.LP_HOST || '{}') });
-for (const [method, point] of [['createSession', 'host:created'], ['retireSession', 'host:retired'], ['submit', 'host:submitted']]) {
+for (const [method, point] of [['createSession', 'host:created'], ['revokeSession', 'host:revoked'], ['retireSession', 'host:retired'], ['submit', 'host:submitted']]) {
   const original = host[method];
   host[method] = async (...args) => { const result = await original(...args); if (crash === point) hang(); return result; };
 }

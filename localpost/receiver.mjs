@@ -6,6 +6,16 @@ import { validateEnvelope, isTerminalResult } from './postmaster.mjs';
 import { envelopeDigest } from './mailbox.mjs';
 
 const digest = envelopeDigest;
+// A dispatch that failed with one of these sent nothing: the letter waits for a later scan. Anything else is uncertain.
+const PENDING = { binding_unverified: 'binding_unverified', client_unavailable: 'client_closed', binding_frozen: 'binding_frozen', acceptance_busy: 'acceptance_busy' };
+const SOFT_REFUSALS = new Set(['mode_manual', 'frozen', 'capacity_full', 'held']);
+function afterFailure(error) {
+  if (Object.hasOwn(PENDING, error?.code)) return { state: 'queued', reason: PENDING[error.code] };
+  if (error?.code === 'acceptance_refused' && SOFT_REFUSALS.has(error.reason)) return { state: 'queued', reason: error.reason };
+  // The arrival route no longer leads to a bound chat (for example the user rebound to another one): never redirect it.
+  if (['binding_changed', 'delivery_binding_invalid'].includes(error?.code)) return { state: 'needs_reconcile', reason: 'route_unresolvable', detail: error.reason ?? error.code };
+  return { state: 'needs_reconcile', reason: 'dispatch_uncertain', error: error?.message };
+}
 const json = async file => {
   try { return JSON.parse(await fsp.readFile(file, 'utf8')); }
   catch (error) { if (error.code === 'ENOENT') return null; throw error; }
@@ -27,8 +37,20 @@ export function createReceiver({ root, agent, allowFrom = [], adapter, now = () 
   let watcher, interval, debounce, stopped = true;
   const active = new Set();
   const capabilities = adapter?.capabilities || {};
-  const verifiedAdapter = capabilities.trustedFocus === true && capabilities.wholeTurn === true &&
+  const verifiedAdapter = capabilities.trustedBinding === true && capabilities.wholeTurn === true &&
     capabilities.sourceIsRelay === true && capabilities.dispatchIdempotent === true;
+
+  // Where a letter goes was fixed when it was delivered: the controlled delivery records the recipient's binding in the
+  // same write-lock section that publishes the letter (mailbox.mjs). No envelope, sender, attachment, scan time or later
+  // binding decides it, and a letter without that record (written into the inbox by hand) is never dispatched.
+  async function arrival(env, hash) {
+    if (env.type === 'result') return { state: 'manual', reason: 'result' }; // results are read by people, never relayed
+    const record = await json(checked(`runtime/arrivals/${agent}/${env.id}.json`));
+    if (!record) return { state: 'manual', reason: 'no_arrival_record' };
+    if (record.id !== env.id || record.to !== agent || record.digest !== hash) return { state: 'needs_reconcile', reason: 'arrival_record_conflict' };
+    if (!record.route) return { state: 'manual', reason: record.reason ?? 'arrived_without_route' };
+    return { state: 'queued', route: { ...record.route, arrivedAt: record.arrivedAt } };
+  }
 
   async function scanOnce() {
     const lease = await acquireLease(root, { name: `.receiver-${agent}.lock`, now: now() });
@@ -78,20 +100,7 @@ export function createReceiver({ root, agent, allowFrom = [], adapter, now = () 
         item = state.entries[env.id] = { id: env.id, thread: env.thread_id, from: env.from, type: env.type, hash, receivedAt: new Date(now()).toISOString() };
         if (state.historicalIds?.includes(env.id)) { item.state = 'historical'; continue; }
         if (!allowFrom.includes(env.from)) { item.state = 'denied'; item.reason = 'sender_not_allowed'; continue; }
-        let route;
-        try { route = await json(checked(`runtime/routes/${env.id}.json`)); }
-        catch (error) {
-          item.state = 'needs_reconcile'; item.reason = 'route_unreadable';
-          state.errors.push({ file: `runtime/routes/${env.id}.json`, code: error.code || 'invalid_route', message: 'Publication record cannot be read' });
-          continue;
-        }
-        if (!route || route.messageId !== env.id || route.from !== env.from || route.to !== env.to || route.envelopeDigest !== hash ||
-            route.scope !== 'analysis-reply' || !route.threadId || !route.cwd || !route.hostId ||
-            route.focusRevision === undefined || !Number.isFinite(Date.parse(route.publishedAt))) {
-          item.state = 'unbound'; item.reason = 'no_trusted_publication_focus'; continue;
-        }
-        item.target = { threadId: route.threadId, cwd: route.cwd, hostId: route.hostId, focusRevision: route.focusRevision };
-        item.state = 'queued';
+        Object.assign(item, await arrival(env, hash));
       }
       for (const item of Object.values(state.entries)) {
         const uncertainDispatch = item.state === 'needs_reconcile' && ['dispatch_interrupted', 'dispatch_uncertain'].includes(item.reason);
@@ -123,21 +132,17 @@ export function createReceiver({ root, agent, allowFrom = [], adapter, now = () 
       if (verifiedAdapter) {
         for (const item of Object.values(state.entries).filter(x => x.state === 'queued')) {
           if (!allowFrom.includes(item.from)) { item.state = 'denied'; item.reason = 'sender_permission_revoked'; continue; }
-          let running
-          try { running = await adapter.isRunning(item.target) }
-          catch (error) { item.reason = 'controller_unavailable'; item.error = error.message; continue }
-          if (!running) { item.reason = 'client_closed'; continue }
-          item.state = 'dispatching'; delete item.reason;
+          item.state = 'dispatching'; delete item.reason; delete item.detail; delete item.error;
           await atomicWrite(stateFile(), JSON.stringify(state, null, 2) + '\n');
           try {
             const receipt = await adapter.submit({
-              target: item.target, idempotencyKey: `${agent}:${item.id}`,
+              route: item.route, digest: item.hash, idempotencyKey: `${agent}:${item.id}`,
               source: { kind: 'plugin', plugin: 'localpost', form: 'relay' }, scope: 'analysis-reply',
               messageReference: { agent, id: item.id }, after: 'whole-turn',
             });
             if (!receipt?.accepted) throw new Error('Runtime did not confirm durable acceptance');
             item.state = 'submitted'; item.receipt = receipt.receipt; item.submittedAt = new Date(now()).toISOString();
-          } catch (error) { item.state = 'needs_reconcile'; item.reason = 'dispatch_uncertain'; item.error = error.message; }
+          } catch (error) { Object.assign(item, afterFailure(error)); }
           await atomicWrite(stateFile(), JSON.stringify(state, null, 2) + '\n');
         }
       } else for (const item of Object.values(state.entries).filter(x => x.state === 'queued')) item.reason = 'runtime_capabilities_unverified';

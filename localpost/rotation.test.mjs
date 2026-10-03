@@ -319,7 +319,7 @@ function leaseReport(root, childPid) {
 
 test('a crash at every rotation step recovers to exactly one new generation without losing or duplicating mail', { timeout: 180000 }, async t => {
   const points = ['state:frozen', 'state:drained', 'handoff:file', 'state:handoff_written', 'candidate:requested', 'host:created',
-    'state:candidate_created', 'state:verified', 'state:switched', 'host:retired'];
+    'state:candidate_created', 'state:verified', 'host:revoked', 'state:switched', 'host:retired'];
   for (const point of points) await t.test(point, async t => {
     const { root } = await scenario(t);
     const childPid = await crashChild(t, { LP_ROOT: root, LP_ACTION: 'rotate', LP_CRASH: point });

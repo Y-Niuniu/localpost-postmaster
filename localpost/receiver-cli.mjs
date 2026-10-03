@@ -14,7 +14,7 @@ if (!root || !agent || !['status', 'receive'].includes(args[0])) {
     process.exitCode = 2;
   } else {
     await receiver.start();
-    console.log(JSON.stringify({ receiver: 'started', dispatch: 'disabled', reason: 'desktop_focus_and_acceptance_unverified' }));
+    console.log(JSON.stringify({ receiver: 'started', dispatch: 'disabled', reason: 'explicit_binding_and_acceptance_unverified' }));
     const shutdown = async () => { await receiver.stop(); process.exitCode = 0; };
     process.once('SIGINT', shutdown); process.once('SIGTERM', shutdown);
   }

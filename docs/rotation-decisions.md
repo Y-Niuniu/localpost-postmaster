@@ -43,8 +43,8 @@ T1 通过 ≠ 可启用；**纯逻辑实现与假宿主测试不等于生产启�
 |---|---|---|
 | 1 | **显式绑定提供者** | 实现 `capture / verifyBinding`；把 adapter、route schema、错误码与测试里的 `focusRevision` 改为明确的 **binding 语义**。**不能只把一个 provider 标成 `trusted:true`** |
 | 2 | **持久、幂等的受理提供者** | 以 `agent:id` 为 key，写前日志并持久化 `reserved → dispatching → accepted`，崩溃中断进入 `uncertain/needs_reconcile`；跨进程重启仍须去重。DSH rc.2 的 `followup()` **没有**可跨崩溃证明的原子 receipt ⇒ **不要宣称 exactly-once**；可实现并验收的是「正常路径恰好唤醒一次 + 不确定写入绝不盲目重试 = at-most-once wake」 |
-| 3 | **到达路由快照的可信生成** | 现在 receiver 只读 `runtime/routes/<mail-id>.json`，而普通信件不会自动获得 route。须由**受控 receiver/host** 在首次发现新信时从**当前显式绑定**原子生成；**发件信封不得自行声明 route** |
-| 4 | **人工与自动的单消费者 claim** | 每封信必须有 claim/owner/lease；或在自动 receiver 运行期间让人工入口识别 claim 并拒绝处理。**仅有 receiver 扫描锁不够** |
+| 3 | **到达路由快照的可信生成** | 现在 receiver 只读 `runtime/routes/<mail-id>.json`，而普通信件不会自动获得 route。~~须由受控 receiver/host 在首次发现新信时生成~~ **2026-10-03 更正（codex T1 审查 P0-1）**：「首次发现」≠「到达」——receiver 停机、扫描延迟或防抖期间改绑，旧信会被投给新聊天。现由**受控投递**在发布信件的**同一把写锁**内、信件可见之前，从收件身份的**当前显式绑定**写到达记录 `runtime/arrivals/<agent>/<id>.json`，receiver **只认**到达记录；没有到达记录（手写进 inbox、投递时未绑定）、手动模式下到达、以及 result 信，一律归人工、不自动派发；**发件信封不得自行声明 route** |
+| 4 | **人工与自动的单消费者 claim** | 每封信必须有 claim/owner/lease；或在自动 receiver 运行期间让人工入口识别 claim 并拒绝处理。**仅有 receiver 扫描锁不够**。**2026-10-03 更正（P0-2/P0-3）**：只有带自动到达路由的信进 claim 台账；台账里有 owner 的信，读/回执/归档都须由**宿主证明调用者**就是 owner（DSH 原生工具调用带 `execution.agent`；DSH 的 MCP 客户端只转发工具名和参数，证明不了 → 一律 `CALLER_UNVERIFIED`）；回执/归档先预写 `completing` 再发布、发布后才 `done`，崩溃后 owner 重试收口，轮换不转移 `completing`。**2026-10-03 第三轮**：预写的意图**不可变**，只有同一操作、同一结果 id、同一内容摘要（去掉时间戳）的重试能续做或重复，否则 `COMPLETION_INTENT_CONFLICT`、不发布任何东西；`done` 和被轮换钉住的中断完成同样校验，没有记录意图的 `done`（运维收口）一律算冲突 |
 
 ## 3. 显式绑定契约（替代「可信焦点」）
 
