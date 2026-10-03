@@ -270,12 +270,13 @@ test('MCP reports a published but unarchived reply as a structured partial failu
   assert.equal(partial.result.isError, true);
   const state = JSON.parse(partial.result.content[0].text);
   assert.deepEqual({ ...state, message: undefined }, { status: 'partial_failure', code: 'REPLIED_ARCHIVE_PENDING', reply_delivered: true,
-    reply_id: 'task-one.result', outcome: 'completed', archive_pending: 'task-one', retry_action: 'mailbox_archive', message: undefined });
+    reply_id: 'task-one.result', outcome: 'completed', archive_pending: 'task-one', retry_action: 'mailbox_reply', message: undefined });
+  assert.match(state.message, /identical mailbox_reply/);
   assert.equal(admin.read('dsh', 'task-one.result').envelope.outcome, 'completed');
   assert.equal(admin.inbox('codex').length, 1);
-  const archived = await call(2, 'mailbox_archive', { agent: 'codex', id: 'task-one' });
-  assert.equal(JSON.parse(archived.result.content[0].text).archived, 'task-one');
-  assert.equal(JSON.parse((await call(3, 'mailbox_reply', reply)).result.content[0].text).idempotent, true);
+  // The identical reply finishes it: the published result is reused and the original archived.
+  const repaired = JSON.parse((await call(2, 'mailbox_reply', reply)).result.content[0].text);
+  assert.deepEqual([repaired.idempotent, repaired.archived], [true, 'task-one']);
   assert.equal(admin.inbox('codex').length, 0);
   assert.equal(admin.inbox('dsh').length, 1);
   const plain = await call(4, 'mailbox_archive', { agent: 'codex', id: 'missing' });

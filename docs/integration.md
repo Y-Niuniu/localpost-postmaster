@@ -17,8 +17,10 @@ main integrator. Keep the authoritative mailbox operations in
   If a terminal reply is published but archiving the original fails, the tool
   reports `REPLIED_ARCHIVE_PENDING` (已回执但待归档) instead of a plain failure;
   over MCP this is `isError` with a JSON body (`status: partial_failure`,
-  `reply_delivered: true`, `archive_pending`, `retry_action: mailbox_archive`).
-  Retrying the same `mailbox_reply` (same id and content) or `mailbox_archive` finishes it.
+  `reply_delivered: true`, `archive_pending`, `retry_action: mailbox_reply`).
+  Retry only the identical `mailbox_reply` (same `reply_to`, `reply_id` and content). For a letter in the claim
+  ledger the reply's completion intent is immutable, so `mailbox_archive` or a different reply is refused with
+  `COMPLETION_INTENT_CONFLICT`; invalid reply input fails before any intent is recorded.
   `MAILBOX_TOOLS` (comma list) restricts the tools a deployment exposes, enforced on
   call as well as in `tools/list`; unknown or empty lists refuse to start. Manual use
   keeps all seven; an automated reader should not get `mailbox_send`.

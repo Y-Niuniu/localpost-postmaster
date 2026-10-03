@@ -149,12 +149,6 @@ export function createMailbox({ root, identity } = {}) {
       + 'or was, completed by another operation or with other content; only the identical retry may finish it'), { code: 'COMPLETION_INTENT_CONFLICT' });
     throw refused(id, begun.reason);
   }
-  // What a terminal reply says (its id is compared separately), without the timestamp: the same reply retried has the same digest.
-  const replyDigest = (options, outcome) => {
-    const content = { outcome, body: options.body };
-    for (const key of ['subject', 'commit', 'base_rev', 'test', 'attachments']) if (options[key] !== undefined) content[key] = options[key];
-    return envelopeDigest(content);
-  };
   /** read() for a consumer that takes the letter into its context: goes through the claim ledger first. */
   async function take(agent, id, { caller } = {}) {
     own(agent);
@@ -167,8 +161,8 @@ export function createMailbox({ root, identity } = {}) {
     if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)) throw new Error('invalid envelope');
     for (const key of ['route', 'route_snapshot', 'threadId', 'cwd', 'hostId', 'focusRevision', 'bindingRevision', 'publishedAt', 'scope'])
       if (Object.hasOwn(envelope, key)) throw new Error('envelope cannot declare trusted route: ' + key);
-    // Where a letter goes is captured by the receiver from the explicit binding when it first sees it; nobody else sets it.
-    if (route !== undefined) throw new Error('a route cannot be set at delivery: the receiver captures it from the explicit binding');
+    // Where a letter goes is recorded from the recipient's explicit binding when it is delivered (recordArrival); nobody sets it.
+    if (route !== undefined) throw new Error('a route cannot be set at delivery: it is recorded from the recipient\'s explicit binding');
     envelope = JSON.parse(JSON.stringify(envelope));
     if (envelope.id === undefined) envelope.id = randomUUID();
     assertId(envelope.id);
@@ -176,6 +170,20 @@ export function createMailbox({ root, identity } = {}) {
     if (envelope.budget === undefined) envelope.budget = 'standard';
     const found = findId(envelope.id);
     if (envelope.created_at === undefined) envelope.created_at = found[0]?.envelope.created_at || new Date().toISOString();
+    const warnings = checkEnvelope(envelope);
+    const target = fileFor(envelope.to, 'inbox', envelope.id);
+    if (found.length) {
+      if (found.some(existing => canonical(existing.envelope) !== canonical(envelope))) throw new Error('message ID content conflict: ' + envelope.id);
+      const delivered = found.find(existing => existing.bucket !== 'outbox');
+      if (delivered) return { id: envelope.id, delivered_to: delivered.file, idempotent: true, warnings };
+    }
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    await recordArrival(envelope);
+    await atomicWrite(target, JSON.stringify(envelope, null, 2) + '\n');
+    return { id: envelope.id, delivered_to: target, idempotent: false, warnings };
+  }
+  // Everything delivery refuses about a complete envelope (defaults filled in); returns the soft warnings.
+  function checkEnvelope(envelope) {
     if (identity && envelope.from !== identity) throw new Error('configured sender identity mismatch');
     agentName(envelope.from); agentName(envelope.to); assertId(envelope.thread_id);
     for (const key of ['subject', 'body', 'created_at']) if (typeof envelope[key] !== 'string' || !envelope[key].trim()) throw new Error('missing string field: ' + key);
@@ -192,16 +200,7 @@ export function createMailbox({ root, identity } = {}) {
       try { if (!fs.statSync(file).isFile()) throw new Error('attachment is not a file'); }
       catch (error) { if (error.code === 'ENOENT') warnings.push('missing attachment: ' + attachment); else throw error; }
     }
-    const target = fileFor(envelope.to, 'inbox', envelope.id);
-    if (found.length) {
-      if (found.some(existing => canonical(existing.envelope) !== canonical(envelope))) throw new Error('message ID content conflict: ' + envelope.id);
-      const delivered = found.find(existing => existing.bucket !== 'outbox');
-      if (delivered) return { id: envelope.id, delivered_to: delivered.file, idempotent: true, warnings };
-    }
-    fs.mkdirSync(path.dirname(target), { recursive: true });
-    await recordArrival(envelope);
-    await atomicWrite(target, JSON.stringify(envelope, null, 2) + '\n');
-    return { id: envelope.id, delivered_to: target, idempotent: false, warnings };
+    return warnings;
   }
   async function deliver(envelope, options) {
     const snapshot = JSON.parse(JSON.stringify(envelope));
@@ -243,51 +242,63 @@ export function createMailbox({ root, identity } = {}) {
     if (typeof options.body !== 'string' || !options.body.trim()) throw new Error('reply body is required');
     const outcome = options.outcome ?? 'completed';
     if (!['completed', 'needs_authorization', 'failed'].includes(outcome)) throw new Error('invalid reply outcome');
-    // Take the letter in the shared claim ledger, and write a terminal completion ahead, before any result is published.
     // After a crash the original may already be archived: the owner's retry still finds its claim and finishes it.
     const original = readJson(fileFor(agent, 'inbox', options.reply_to)) ?? readJson(fileFor(agent, 'archive', options.reply_to));
-    const owner = original ? await takeLetter(agent, original, caller) : null;
+    if (!original) throw new Error('original letter not found: ' + options.reply_to);
+    // The complete result is built and validated first; only then is the letter taken in the shared claim ledger and a
+    // terminal completion written ahead, whose digest is exactly what will be published (without the timestamp).
+    const draft = prepareReply(agent, original, options, outcome);
+    const owner = await takeLetter(agent, original, caller);
     const terminal = outcome !== 'needs_authorization';
-    if (owner && terminal) {
-      const result = options.reply_id ?? `${options.reply_to}.result`;
-      await beginCompletionFor(agent, options.reply_to, owner, { op: 'reply', result, digest: replyDigest(options, outcome) });
-    }
-    const replied = await publishReply(agent, options, outcome);
-    if (owner && terminal) replied.ledger = ledgerOutcome(await complete(sessions, agent, options.reply_to, owner));
+    if (owner && terminal) await beginCompletionFor(agent, original.id, owner, { op: 'reply', result: draft.id, digest: envelopeDigest(draft) });
+    const replied = await publishReply(agent, draft);
+    if (owner && terminal) replied.ledger = ledgerOutcome(await complete(sessions, agent, original.id, owner));
     return replied;
   }
-  function publishReply(agent, options, outcome) {
+  /**
+   * The result envelope a reply publishes, complete and checked like any delivery before anything about the reply is
+   * written down, so an invalid reply fails while the letter's claim is untouched. Only created_at is left out: it is
+   * set under the write lock, where an idempotent retry keeps the first one.
+   */
+  function prepareReply(agent, source, options, outcome) {
+    if (source.to !== agent || source.type === 'result') throw new Error('invalid original letter or reply loop');
+    const terminal = outcome !== 'needs_authorization';
+    const id = options.reply_id ?? (terminal ? `${source.id}.result` : `${source.id}.result.${randomUUID()}`);
+    assertId(id);
+    if (!terminal && id === `${source.id}.result`) throw new Error('nonterminal reply requires an independent reply ID');
+    const draft = { id, thread_id: source.thread_id, from: agent, to: source.from, type: 'result',
+      subject: options.subject ?? `回执: ${source.subject}`, body: options.body, budget: source.budget, reply_to: source.id, outcome };
+    for (const key of ['commit', 'base_rev', 'test', 'attachments']) if (options[key] !== undefined) draft[key] = options[key];
+    checkEnvelope({ ...draft, created_at: new Date().toISOString() });
+    return draft;
+  }
+  function publishReply(agent, draft) {
     return locked(async () => {
-      const pending = readJson(fileFor(agent, 'inbox', options.reply_to));
-      const source = pending || readJson(fileFor(agent, 'archive', options.reply_to));
-      if (!source) throw new Error('original letter not found: ' + options.reply_to);
-      if (source.to !== agent || source.type === 'result') throw new Error('invalid original letter or reply loop');
-      const terminal = outcome !== 'needs_authorization';
-      const id = options.reply_id ?? (terminal ? `${source.id}.result` : `${source.id}.result.${randomUUID()}`);
-      assertId(id);
-      if (!terminal && id === `${source.id}.result`) throw new Error('nonterminal reply requires an independent reply ID');
-      const previous = findId(id);
+      const pending = readJson(fileFor(agent, 'inbox', draft.reply_to));
+      const source = pending || readJson(fileFor(agent, 'archive', draft.reply_to));
+      if (!source) throw new Error('original letter not found: ' + draft.reply_to);
+      const terminal = draft.outcome !== 'needs_authorization';
+      const previous = findId(draft.id);
       if (!pending && !previous.length) throw new Error('archived task cannot create a new reply');
-      const envelope = { id, thread_id: source.thread_id, from: agent, to: source.from,
-        type: 'result', subject: options.subject ?? `回执: ${source.subject}`, body: options.body,
-        budget: source.budget, created_at: previous[0]?.envelope.created_at || new Date().toISOString(),
-        reply_to: source.id, outcome };
-      for (const key of ['commit', 'base_rev', 'test', 'attachments']) if (options[key] !== undefined) envelope[key] = options[key];
+      const { id, thread_id, from, to, type, subject, body, budget, ...rest } = draft;
+      const envelope = { id, thread_id, from, to, type, subject, body, budget,
+        created_at: previous[0]?.envelope.created_at || new Date().toISOString(), ...rest };
       const result = await deliverUnlocked(envelope);
       if (terminal) {
         // The result is already public here; an archive failure must not read as "reply failed".
         try { Object.assign(result, archiveUnlocked(agent, source.id), { idempotent: result.idempotent }); }
         catch (error) {
+          // The reply's completion intent is immutable, so only the identical reply finishes the letter.
           const fault = new Error(`replied but archive pending (已回执但待归档): result ${id} was delivered; `
-            + `original ${source.id} was not archived (${error.message}). After an authorized operator fixes access, `
-            + 'retry the same mailbox_reply or mailbox_archive to finish.', { cause: error });
+            + `original ${source.id} was not archived (${error.message}). After an authorized operator fixes access, retry the `
+            + 'identical mailbox_reply (same reply_to, reply_id and content) to finish; mailbox_archive cannot replace it.', { cause: error });
           fault.code = 'REPLIED_ARCHIVE_PENDING';
-          fault.reply = { ...result, id, outcome };
+          fault.reply = { ...result, id, outcome: draft.outcome };
           fault.pending = source.id;
           throw fault;
         }
       }
-      return { ...result, id, outcome };
+      return { ...result, id, outcome: draft.outcome };
     });
   }
   function roster() {

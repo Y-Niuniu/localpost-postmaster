@@ -102,7 +102,7 @@ export function createMcpServer({
         // A published result must stay machine-recognizable; only these fields cross the boundary.
         const text = error.code === 'REPLIED_ARCHIVE_PENDING'
           ? JSON.stringify({ status: 'partial_failure', code: error.code, reply_delivered: true, reply_id: error.reply.id,
-            outcome: error.reply.outcome, archive_pending: error.pending, retry_action: 'mailbox_archive', message: error.message }, null, 2)
+            outcome: error.reply.outcome, archive_pending: error.pending, retry_action: 'mailbox_reply', message: error.message }, null, 2)
           : 'Error: ' + error.message;
         return ok(id, { content: [{ type: 'text', text }], isError: true });
       }

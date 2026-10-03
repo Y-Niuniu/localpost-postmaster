@@ -210,13 +210,59 @@ test('R3: a letter an operator closed without any recorded intent refuses every 
   assert.deepEqual(published(w.root), []);
 });
 
-test('R3: the ledger compares the operation itself, not only the result and content that usually come with it', () => {
+test('R3: the ledger compares the operation and the result id themselves, not only the content digest that usually covers them', () => {
   const at = '2026-10-03T00:00:00.000Z', owner = { generation: 1, session: 'chat-a' };
   const state = { claims: { one: { letter: 'one', digest: 'd'.repeat(64), owner, status: 'accepted', version: 1, history: [] } } };
   const reply = { op: 'reply', result: 'one.result', digest: 'c'.repeat(64) };
   assert.equal(beginCompletionIn(state, 'one', owner, reply, at).ok, true);
   assert.equal(beginCompletionIn(state, 'one', owner, { ...reply, op: 'archive' }, at).reason, 'completion_intent_conflict');
+  assert.equal(beginCompletionIn(state, 'one', owner, { ...reply, result: 'one.result.b' }, at).reason, 'completion_intent_conflict');
   assert.equal(beginCompletionIn(state, 'one', owner, reply, at).reused, true);
+});
+
+// Fourth review round (codex 2026-10-03): the complete result envelope is built and validated before the immutable intent is
+// written, its publishable content is the intent digest, and only the identical reply finishes an archive-pending one.
+test('R4: an invalid reply fails before any intent is written; the corrected reply then completes the letter', async t => {
+  const { root, store, acceptForA, admin, mail } = await world(t);
+  await admin.deliver(letter('one'));
+  assert.equal((await acceptForA('one')).accepted, true);
+  const base = { reply_to: 'one', body: 'Done', outcome: 'completed' };
+  for (const invalid of [{ subject: 1 }, { subject: '  ' }, { commit: 1 }, { test: { passed: true } },
+    { attachments: '../bad' }, { attachments: ['../escape.md'] }, { attachments: [1] }]) {
+    await assert.rejects(mail.reply('dsh', { ...base, ...invalid }, { caller: CHAT_A }), Error, JSON.stringify(invalid));
+    const claim = (await store.read('dsh')).claims.one;
+    assert.deepEqual([claim.status, claim.completion], ['accepted', undefined], 'nothing was written for ' + JSON.stringify(invalid));
+  }
+  assert.deepEqual(published(root), [], 'nothing was published');
+  const done = await mail.reply('dsh', { ...base, subject: 'Reviewed', commit: 'abc1234' }, { caller: CHAT_A });
+  assert.equal(done.ledger, 'done');
+  assert.equal(fs.existsSync(path.join(root, 'agents/dsh/archive/one.json')), true);
+  assert.deepEqual(published(root), ['one.result.json']);
+});
+
+test('R4: once the reply is published but archiving failed, only the identical reply finishes it; archive cannot replace it', async t => {
+  const { root, store, acceptForA, admin, mail } = await world(t);
+  await admin.deliver(letter('one'));
+  assert.equal((await acceptForA('one')).accepted, true);
+  const rename = fs.renameSync;
+  let failNextArchive = true;
+  t.mock.method(fs, 'renameSync', (from, to) => {
+    if (failNextArchive && String(to).includes(`${path.sep}archive${path.sep}`)) {
+      failNextArchive = false;
+      throw Object.assign(new Error('EPERM: operation not permitted, rename'), { code: 'EPERM' });
+    }
+    return rename(from, to);
+  });
+  const reply = { reply_to: 'one', body: 'Done', outcome: 'completed' };
+  await assert.rejects(mail.reply('dsh', reply, { caller: CHAT_A }), error => error.code === 'REPLIED_ARCHIVE_PENDING'
+    && /identical mailbox_reply/.test(error.message) && /mailbox_archive cannot replace it/.test(error.message));
+  assert.equal((await store.read('dsh')).claims.one.status, 'completing');
+  await assert.rejects(mail.archive('dsh', 'one', { caller: CHAT_A }), CONFLICT);
+  assert.deepEqual(published(root), ['one.result.json'], 'the result was published once');
+  const repaired = await mail.reply('dsh', reply, { caller: CHAT_A });
+  assert.deepEqual([repaired.idempotent, repaired.ledger], [true, 'done']);
+  assert.deepEqual(published(root), ['one.result.json'], 'and never duplicated');
+  assert.equal(fs.existsSync(path.join(root, 'agents/dsh/inbox/one.json')), false, 'the original is archived');
 });
 
 /** codex bound to session-1 on host 'fake' (capacity 3): three letters delivered and accepted, one done; then a rotation. */
