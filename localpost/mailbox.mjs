@@ -140,11 +140,21 @@ export function createMailbox({ root, identity } = {}) {
     if (!taken.ok) throw refused(envelope.id, taken.reason);
     return taken.claim.owner;
   }
-  // A reply or archive by the owner is written ahead in the ledger (`completing`) before anything is published.
+  // A reply or archive by the owner is written ahead in the ledger (`completing`) before anything is published, and that
+  // intent is immutable (letter-claims.mjs): a retry must be the same operation with the same content.
   async function beginCompletionFor(agent, id, owner, intent) {
     const begun = await beginCompletion(sessions, agent, id, owner, intent);
-    if (!begun.ok) throw refused(id, begun.reason);
+    if (begun.ok) return;
+    if (begun.reason === 'completion_intent_conflict') throw Object.assign(new Error(`COMPLETION_INTENT_CONFLICT: letter ${id} is being, `
+      + 'or was, completed by another operation or with other content; only the identical retry may finish it'), { code: 'COMPLETION_INTENT_CONFLICT' });
+    throw refused(id, begun.reason);
   }
+  // What a terminal reply says (its id is compared separately), without the timestamp: the same reply retried has the same digest.
+  const replyDigest = (options, outcome) => {
+    const content = { outcome, body: options.body };
+    for (const key of ['subject', 'commit', 'base_rev', 'test', 'attachments']) if (options[key] !== undefined) content[key] = options[key];
+    return envelopeDigest(content);
+  };
   /** read() for a consumer that takes the letter into its context: goes through the claim ledger first. */
   async function take(agent, id, { caller } = {}) {
     own(agent);
@@ -238,7 +248,10 @@ export function createMailbox({ root, identity } = {}) {
     const original = readJson(fileFor(agent, 'inbox', options.reply_to)) ?? readJson(fileFor(agent, 'archive', options.reply_to));
     const owner = original ? await takeLetter(agent, original, caller) : null;
     const terminal = outcome !== 'needs_authorization';
-    if (owner && terminal) await beginCompletionFor(agent, options.reply_to, owner, { op: 'reply', result: options.reply_id ?? `${options.reply_to}.result` });
+    if (owner && terminal) {
+      const result = options.reply_id ?? `${options.reply_to}.result`;
+      await beginCompletionFor(agent, options.reply_to, owner, { op: 'reply', result, digest: replyDigest(options, outcome) });
+    }
     const replied = await publishReply(agent, options, outcome);
     if (owner && terminal) replied.ledger = ledgerOutcome(await complete(sessions, agent, options.reply_to, owner));
     return replied;

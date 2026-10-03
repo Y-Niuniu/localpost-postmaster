@@ -134,16 +134,26 @@ export function completeIn(state, id, { generation, session } = {}, at) {
 /**
  * Write-ahead step of the owner's reply or archive (mailbox.mjs), persisted before anything is published.
  * The claim stays `completing` until the publication is followed by completeIn, so a crash in between can neither
- * return the letter to `accepted` nor let a rotation move it; repeating the same operation finishes it.
+ * return the letter to `accepted` nor let a rotation move it. The intent is immutable: only the very same operation with
+ * the same content (result id + digest) may finish or repeat it - also once the letter is done, or was pinned by a
+ * rotation mid-completion. Anything else, and a letter closed without a recorded intent, is a conflict.
  */
-export function beginCompletionIn(state, id, { generation, session } = {}, { op, result } = {}, at) {
+export function beginCompletionIn(state, id, { generation, session } = {}, { op, result, digest } = {}, at) {
   if (!['reply', 'archive'].includes(op)) throw new Error('A completion is a reply or an archive');
   const claim = claimOf(state, id);
   if (!claim) return { ok: false, reason: 'not_claimed' };
   if (claim.owner.generation !== generation || claim.owner.session !== session) return { ok: false, reason: 'not_owner', claim };
-  if (['completing', 'done'].includes(claim.status)) return { ok: true, reused: true, claim };
+  const interrupted = claim.status === 'needs_reconcile' && claim.reason === 'completion_interrupted';
+  if (['completing', 'done'].includes(claim.status) || interrupted) {
+    const recorded = claim.completion;
+    const same = recorded !== undefined && recorded.op === op && (recorded.result ?? null) === (result ?? null) &&
+      (recorded.digest ?? null) === (digest ?? null);
+    if (!same) return { ok: false, reason: 'completion_intent_conflict', claim };
+    return interrupted ? { ok: true, claim: move(claim, 'completing', at) } : { ok: true, reused: true, claim };
+  }
   if (!['accepted', 'needs_reconcile'].includes(claim.status)) return { ok: false, reason: 'not_accepted', claim };
-  const completion = { op, ...(result ? { result } : {}), from: claim.status, ...(claim.reason ? { reason: claim.reason } : {}), at };
+  const completion = { op, ...(result ? { result } : {}), ...(digest ? { digest } : {}), from: claim.status,
+    ...(claim.reason ? { reason: claim.reason } : {}), at };
   return { ok: true, claim: move(claim, 'completing', at, { completion }) };
 }
 

@@ -10,7 +10,7 @@ import { createDshAdapter } from './dsh-adapter.mjs';
 import { createSessionStore, bind } from './session-binding.mjs';
 import { createBindingProvider, bindFromChatAction } from './binding-provider.mjs';
 import { createLedgerAcceptance } from './ledger-acceptance.mjs';
-import { dispatchLetter, complete, transferForSwitchIn } from './letter-claims.mjs';
+import { dispatchLetter, complete, transferForSwitchIn, resolveUncertain, beginCompletionIn } from './letter-claims.mjs';
 import { createRotation, candidateSessionId } from './rotation.mjs';
 import { switchMode } from './letter-claims.mjs';
 import { createMcpServer } from './mcp-server.mjs';
@@ -109,18 +109,23 @@ test('P0-2: a letter delivered to chat A can be handled only by a caller the hos
   assert.equal((await mail.reply('dsh', { reply_to: 'one', body: 'Done', outcome: 'completed' }, { caller: CHAT_A })).ledger, 'done');
 });
 
-/** Runs archive/reply in a child that dies right after the letter is archived, before its claim is completed. */
-async function crashInWindow(t, op) {
+/**
+ * Runs archive/reply in a child that dies at `point` (fixtures/claim-crash-window.mjs): right after the letter is archived,
+ * before its claim is completed (after-archive), or right after the completion intent is written, before anything is
+ * published (before-publish).
+ */
+async function crashInWindow(t, op, point = 'after-archive') {
   const w = await world(t);
   await w.admin.deliver(letter('one'));
   assert.equal((await w.acceptForA('one')).accepted, true);
-  const child = spawn(process.execPath, [crashFixture, w.root, op, 'one', 'chat-a'], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, [crashFixture, w.root, op, 'one', 'chat-a', point], { stdio: ['ignore', 'pipe', 'pipe'] });
   let output = '';
   child.stdout.on('data', chunk => { output += chunk; });
   child.stderr.on('data', chunk => { output += chunk; });
   await once(child, 'exit');
   assert.doesNotMatch(output, /finished/, 'the child died inside the window: ' + output);
-  assert.equal(fs.existsSync(path.join(w.root, 'agents/dsh/archive/one.json')), true, 'the letter was archived before the crash');
+  assert.equal(fs.existsSync(path.join(w.root, 'agents/dsh/archive/one.json')), point === 'after-archive',
+    point === 'after-archive' ? 'the letter was archived before the crash' : 'nothing was archived before the crash');
   return w;
 }
 for (const op of ['archive', 'reply']) {
@@ -138,6 +143,81 @@ for (const op of ['archive', 'reply']) {
     assert.equal((await store.read('dsh')).claims.one.status, 'done');
   });
 }
+
+// Third review round (codex 2026-10-03): a completion intent, once written, is immutable. Only the very same operation
+// with the very same content (result id + digest of what the reply publishes) may finish or repeat it.
+const CONFLICT = { code: 'COMPLETION_INTENT_CONFLICT' };
+const listed = dir => (fs.existsSync(dir) ? fs.readdirSync(dir) : []);
+const published = root => listed(path.join(root, 'agents/codex/inbox'));
+
+test('R3: after a reply crashed before publishing, only the identical reply may finish the letter, also once it is done', async t => {
+  const { root, store, mail } = await crashInWindow(t, 'reply', 'before-publish');
+  let claim = (await store.read('dsh')).claims.one;
+  assert.deepEqual([claim.status, claim.completion.op, claim.completion.result], ['completing', 'reply', 'one.result']);
+  assert.deepEqual(published(root), [], 'nothing was published before the crash');
+  const same = { reply_to: 'one', body: 'Done', outcome: 'completed' };
+  for (const attempt of [
+    () => mail.archive('dsh', 'one', { caller: CHAT_A }),                                                   // reply A → archive
+    () => mail.reply('dsh', { ...same, reply_id: 'one.result.b' }, { caller: CHAT_A }),                      // reply A → reply B
+    () => mail.reply('dsh', { ...same, body: 'Something else' }, { caller: CHAT_A }),                        // same id, other body
+    () => mail.reply('dsh', { ...same, outcome: 'failed' }, { caller: CHAT_A }),                             // same id, other outcome
+  ]) await assert.rejects(attempt(), CONFLICT);
+  assert.equal(fs.existsSync(path.join(root, 'agents/dsh/inbox/one.json')), true, 'every refused attempt left the letter in place');
+  assert.deepEqual(published(root), [], 'and published nothing');
+  assert.equal((await store.read('dsh')).claims.one.status, 'completing');
+  // The identical retry finishes the letter and stays idempotent afterwards.
+  assert.equal((await mail.reply('dsh', same, { caller: CHAT_A })).ledger, 'done');
+  assert.equal((await mail.reply('dsh', same, { caller: CHAT_A })).idempotent, true);
+  // A done letter is checked the same way.
+  await assert.rejects(mail.archive('dsh', 'one', { caller: CHAT_A }), CONFLICT);
+  await assert.rejects(mail.reply('dsh', { ...same, body: 'Done, but differently' }, { caller: CHAT_A }), CONFLICT);
+  await assert.rejects(mail.reply('dsh', { ...same, reply_id: 'one.result.b' }, { caller: CHAT_A }), CONFLICT);
+  assert.deepEqual(published(root), ['one.result.json']);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'agents/codex/inbox/one.result.json'), 'utf8')).body, 'Done');
+});
+
+test('R3: after an archive crashed before publishing, a reply cannot take over; the identical archive finishes it', async t => {
+  const { root, store, mail } = await crashInWindow(t, 'archive', 'before-publish');
+  const claim = (await store.read('dsh')).claims.one;
+  assert.deepEqual([claim.status, claim.completion.op], ['completing', 'archive']);
+  await assert.rejects(mail.reply('dsh', { reply_to: 'one', body: 'Done', outcome: 'completed' }, { caller: CHAT_A }), CONFLICT);
+  assert.deepEqual(published(root), []);
+  assert.equal((await mail.archive('dsh', 'one', { caller: CHAT_A })).ledger, 'done');
+  assert.equal((await mail.archive('dsh', 'one', { caller: CHAT_A })).idempotent, true);
+});
+
+test('R3: a completion interrupted and pinned by a rotation keeps its intent; only that operation finishes it', async t => {
+  const { root, store, mail } = await crashInWindow(t, 'reply', 'before-publish');
+  await store.update('dsh', state => { transferForSwitchIn(state, 1, { generation: 2, session: 'chat-next' }, { revoked: true }, store.at()); });
+  const claim = (await store.read('dsh')).claims.one;
+  assert.deepEqual([claim.status, claim.reason, claim.completion.op], ['needs_reconcile', 'completion_interrupted', 'reply']);
+  await assert.rejects(mail.archive('dsh', 'one', { caller: CHAT_A }), CONFLICT);
+  await assert.rejects(mail.reply('dsh', { reply_to: 'one', body: 'Other', outcome: 'completed' }, { caller: CHAT_A }), CONFLICT);
+  assert.equal((await mail.reply('dsh', { reply_to: 'one', body: 'Done', outcome: 'completed' }, { caller: CHAT_A })).ledger, 'done');
+  assert.deepEqual(published(root), ['one.result.json']);
+});
+
+test('R3: a letter an operator closed without any recorded intent refuses every later reply or archive', async t => {
+  const w = await world(t);
+  await w.admin.deliver(letter('one'));
+  // The wake-up may have happened but its confirmation was lost: uncertain, pinned for reconciliation.
+  const lost = { submit: async () => { throw new Error('connection lost after the wake-up was queued'); } };
+  assert.equal((await dispatchLetter(w.store, 'dsh', { id: 'one', digest: envelopeDigest(letter('one')) }, lost)).claim.status, 'needs_reconcile');
+  const claim = (await w.store.read('dsh')).claims.one;
+  assert.equal((await resolveUncertain(w.store, 'dsh', 'one', { outcome: 'done', expectedVersion: claim.version })).ok, true);
+  for (const attempt of [() => w.mail.archive('dsh', 'one', { caller: CHAT_A }),
+    () => w.mail.reply('dsh', { reply_to: 'one', body: 'Done', outcome: 'completed' }, { caller: CHAT_A })]) await assert.rejects(attempt(), CONFLICT);
+  assert.deepEqual(published(w.root), []);
+});
+
+test('R3: the ledger compares the operation itself, not only the result and content that usually come with it', () => {
+  const at = '2026-10-03T00:00:00.000Z', owner = { generation: 1, session: 'chat-a' };
+  const state = { claims: { one: { letter: 'one', digest: 'd'.repeat(64), owner, status: 'accepted', version: 1, history: [] } } };
+  const reply = { op: 'reply', result: 'one.result', digest: 'c'.repeat(64) };
+  assert.equal(beginCompletionIn(state, 'one', owner, reply, at).ok, true);
+  assert.equal(beginCompletionIn(state, 'one', owner, { ...reply, op: 'archive' }, at).reason, 'completion_intent_conflict');
+  assert.equal(beginCompletionIn(state, 'one', owner, reply, at).reused, true);
+});
 
 /** codex bound to session-1 on host 'fake' (capacity 3): three letters delivered and accepted, one done; then a rotation. */
 async function rotatedCodex(t, behavior, wrap = host => host) {
