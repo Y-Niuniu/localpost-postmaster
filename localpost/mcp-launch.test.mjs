@@ -32,7 +32,9 @@ function launcherCopy(t, { edits = [], realServer = false } = {}) {
     source = source.replace(from, to);
   }
   fs.writeFileSync(path.join(dir, 'mcp-launch.mjs'), source);
-  if (realServer) for (const name of ['mcp-server.mjs', 'mailbox.mjs', 'fs-safe.mjs']) fs.copyFileSync(path.join(import.meta.dirname, name), path.join(dir, name));
+  // The real server's whole import closure: mailbox.mjs also uses the claim ledger (session-binding, letter-claims).
+  if (realServer) for (const name of ['mcp-server.mjs', 'mailbox.mjs', 'fs-safe.mjs', 'session-binding.mjs', 'letter-claims.mjs'])
+    fs.copyFileSync(path.join(import.meta.dirname, name), path.join(dir, name));
   else fs.copyFileSync(path.join(import.meta.dirname, 'fixtures', 'env-probe-server.mjs'), path.join(dir, 'mcp-server.mjs'));
   return path.join(dir, 'mcp-launch.mjs');
 }

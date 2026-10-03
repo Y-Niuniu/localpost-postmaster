@@ -50,15 +50,15 @@ test('archived IDs cannot recreate pending tasks and concurrent delivery has one
   assert.equal(mail.roster().find(row => row.agent === 'codex').archive, 1);
 });
 
-test('only a trusted publication option can bind a route, and retries retain the original target', async t => {
+test('nobody routes a letter at delivery: neither the envelope nor a delivery option can set a route', async t => {
   const { root, mail } = fixture(t);
-  const route = { threadId: 'chat-A', cwd: root, hostId: 'local', focusRevision: 1, publishedAt: '2026-10-01T10:00:00.000Z', scope: 'analysis-reply' };
+  const route = { threadId: 'chat-A', cwd: root, hostId: 'local', generation: 1, bindingRevision: 1 };
   await assert.rejects(mail.deliver(letter({ route })), /route|路由/i);
-  await mail.deliver(letter(), { route });
-  const routePath = path.join(root, 'runtime/routes/task-one.json');
-  assert.equal(JSON.parse(fs.readFileSync(routePath, 'utf8')).threadId, 'chat-A');
-  await mail.deliver(letter(), { route: { ...route, threadId: 'chat-B', focusRevision: 2 } });
-  assert.equal(JSON.parse(fs.readFileSync(routePath, 'utf8')).threadId, 'chat-A');
+  await assert.rejects(mail.deliver(letter({ bindingRevision: 1 })), /route|路由/i);
+  // Routes are captured by the receiver from the explicit binding (receiver.test.mjs); delivery cannot set one.
+  await assert.rejects(mail.deliver(letter(), { route }), /route/);
+  await mail.deliver(letter());
+  assert.equal(fs.existsSync(path.join(root, 'runtime/routes')), false, 'no route file is ever written by delivery');
   assert.equal(mail.read('codex', 'task-one').envelope.route, undefined);
 });
 

@@ -70,7 +70,7 @@ export function createMcpServer({
       }
       case 'mailbox_roster': return { agents: mail.roster() };
       case 'mailbox_inbox': return { agent: args.agent, letters: mail.inbox(args.agent) };
-      case 'mailbox_read': return mail.read(args.agent, args.id);
+      case 'mailbox_read': return mail.take(args.agent, args.id);
       case 'mailbox_send': return mail.deliver(args);
       case 'mailbox_reply': return mail.reply(args.agent, args);
       case 'mailbox_archive': return mail.archive(args.agent, args.id);

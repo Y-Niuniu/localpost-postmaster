@@ -2,24 +2,26 @@ import { assertId } from './fs-safe.mjs';
 
 const SUPPORTED_VERSION = '0.2.0-rc.2';
 
-function failure(code, message) {
-  return Object.assign(new Error(message), { code });
+function failure(code, message, extra = {}) {
+  return Object.assign(new Error(message), { code, ...extra });
 }
+const text = value => typeof value === 'string' && value.trim() !== '';
 
 /**
  * Same-host adapter for the installed DSH rc.2 public Agent API.
  *
- * This module discovers no sessions, never resumes a cold agent, and does not
- * manufacture focus or idempotency. Native followup alone proves neither.
- * A host integration must provide and verify the focus and acceptance contracts
- * before the receiver can dispatch automatically. No such integration is
- * shipped here; injected fake providers are for contract tests only.
+ * This module discovers no sessions, never resumes a cold agent, and does not manufacture a binding or
+ * idempotency. Native followup alone proves neither. Automatic dispatch needs:
+ *   bindingProvider   explicit, host-attested chat binding (binding-provider.mjs): capture / resolve / verifyBinding.
+ *                     Its trust comes from a host capability the installed DSH rc.2 does not have; without it
+ *                     the adapter stays disabled. There is no "current focus" fallback of any kind.
+ *   acceptance        durable, idempotent acceptance (ledger-acceptance.mjs): acceptOnce.
  */
-export function createDshAdapter({ ctx, runtimeVersion, focusProvider, acceptance, hostId = 'local', mailboxAgent = 'dsh' } = {}) {
+export function createDshAdapter({ ctx, runtimeVersion, bindingProvider, acceptance, hostId = 'local', mailboxAgent = 'dsh' } = {}) {
   assertId(mailboxAgent);
   const capabilities = Object.freeze({
-    trustedFocus: focusProvider?.trusted === true && typeof focusProvider.capture === 'function' &&
-      typeof focusProvider.verifyBinding === 'function',
+    trustedBinding: bindingProvider?.trusted === true && typeof bindingProvider.capture === 'function' &&
+      typeof bindingProvider.resolve === 'function' && typeof bindingProvider.verifyBinding === 'function',
     wholeTurn: runtimeVersion === SUPPORTED_VERSION,
     sourceIsRelay: true,
     dispatchIdempotent: acceptance?.durable === true && acceptance?.idempotent === true &&
@@ -33,44 +35,39 @@ export function createDshAdapter({ ctx, runtimeVersion, focusProvider, acceptanc
       runtimeVersion, supportedVersion: SUPPORTED_VERSION, dispatchEnabled: enabled,
       reasons: Object.entries(capabilities).filter(([, value]) => !value).map(([name]) => name),
     }),
-    async captureFocus() {
-      if (!capabilities.trustedFocus) throw failure('focus_unverified', 'A trusted desktop focus provider is required');
-      return focusProvider.capture();
-    },
-    async isRunning(target) {
-      if (target?.hostId !== hostId || typeof target?.threadId !== 'string') return false;
-      const agent = ctx?.agents?.get?.(target.threadId);
-      return typeof agent?.followup === 'function';
+    /** The arrival route snapshot for a newly received letter: the explicit binding as it stands now. */
+    async captureBinding() {
+      if (!capabilities.trustedBinding) throw failure('binding_unverified', 'A host-attested explicit binding provider is required');
+      return bindingProvider.capture();
     },
     async submit(request) {
-      if (!enabled || focusProvider?.trusted !== true || acceptance?.durable !== true || acceptance?.idempotent !== true) {
-        throw failure('runtime_capabilities_unverified', 'DSH automatic delivery requires verified focus and durable idempotent acceptance');
+      if (!enabled) {
+        throw failure('runtime_capabilities_unverified', 'DSH automatic delivery requires a verified binding and durable idempotent acceptance');
       }
       if (request?.after !== 'whole-turn' || request?.scope !== 'analysis-reply' ||
           request?.source?.kind !== 'plugin' || request?.source?.plugin !== 'localpost' ||
           request?.source?.form !== 'relay') {
         throw failure('delivery_policy_invalid', 'Only LocalPost analysis-reply plugin relays after a whole turn are supported');
       }
-      const { target: inputTarget, messageReference: reference, idempotencyKey: key } = request;
-      if (inputTarget?.hostId !== hostId || typeof inputTarget?.threadId !== 'string' ||
-          !inputTarget.threadId.trim() || typeof inputTarget?.cwd !== 'string' || !inputTarget.cwd.trim() ||
-          inputTarget.focusRevision === undefined || typeof key !== 'string' || !key.trim() || key.length > 256) {
-        throw failure('delivery_binding_invalid', 'An exact host/chat/workspace/focus binding and acceptance key are required');
-      }
+      const { route, messageReference: reference, idempotencyKey: key, digest } = request;
       assertId(reference?.agent);
       assertId(reference?.id);
       if (reference.agent !== mailboxAgent || key !== `${reference.agent}:${reference.id}`) {
         throw failure('delivery_reference_invalid', 'The mail reference and acceptance key must identify this recipient mailbox');
       }
-      // Keep arrival-time routing immutable, even if the user now views chat B.
-      const target = Object.freeze({
-        threadId: inputTarget.threadId, hostId: inputTarget.hostId,
-        cwd: inputTarget.cwd, focusRevision: inputTarget.focusRevision,
-      });
-      const messageReference = Object.freeze({ agent: reference.agent, id: reference.id });
-      if (await focusProvider.verifyBinding(target) !== true) {
-        throw failure('focus_binding_unverified', 'The host could not verify the stored arrival-time focus binding');
+      if (route?.hostId !== hostId || !text(route?.threadId) || !text(route?.cwd)) {
+        throw failure('delivery_binding_invalid', 'An arrival route snapshot on this host is required');
       }
+      // The letter goes where its arrival route leads now: the same binding or its rotation successor, nowhere else.
+      const resolved = await bindingProvider.resolve(route);
+      if (!resolved?.ok) throw failure(resolved?.reason === 'binding_frozen' ? 'binding_frozen' : 'binding_changed',
+        'The arrival route no longer leads to a bound chat', { reason: resolved?.reason });
+      const target = Object.freeze({ ...resolved.target });
+      if (target.hostId !== hostId) throw failure('delivery_binding_invalid', 'The bound chat is on another host');
+      if (await bindingProvider.verifyBinding(target) !== true) {
+        throw failure('binding_unverified', 'The host could not verify the bound chat; the mail stays pending');
+      }
+      const messageReference = Object.freeze({ agent: reference.agent, id: reference.id });
       const message = Object.freeze({
         source: Object.freeze({ kind: 'plugin', plugin: 'localpost', form: 'relay' }),
         content: Object.freeze([Object.freeze({ type: 'text', text:
@@ -81,10 +78,9 @@ export function createDshAdapter({ ctx, runtimeVersion, focusProvider, acceptanc
         })]),
       });
       let enqueued = false;
-      // acceptOnce is a required host-supplied durable reconciliation boundary.
-      // It must handle uncertain writes and duplicate keys across host restarts.
-      // A process-local Map or native followup return value is not sufficient.
-      const receipt = await acceptance.acceptOnce({ key, target, messageReference }, async () => {
+      // acceptOnce is the durable reconciliation boundary: it writes ahead, deduplicates across restarts and never
+      // retries an uncertain enqueue. A process-local Map or the native followup return value is not sufficient.
+      const receipt = await acceptance.acceptOnce({ key, target, messageReference, digest }, async () => {
         if (enqueued) throw failure('acceptance_contract_invalid', 'Acceptance invoked the same enqueue callback more than once');
         const agent = ctx.agents.get(target.threadId);
         if (typeof agent?.followup !== 'function') {
@@ -95,8 +91,7 @@ export function createDshAdapter({ ctx, runtimeVersion, focusProvider, acceptanc
         // No steer/inject/create/resume/session-controller path is used here.
         await agent.followup(message);
       });
-      if (receipt?.accepted !== true || receipt?.durable !== true ||
-          typeof receipt?.receipt !== 'string' || !receipt.receipt.trim()) {
+      if (receipt?.accepted !== true || receipt?.durable !== true || !text(receipt?.receipt)) {
         throw failure('acceptance_unconfirmed', 'Host did not confirm durable acceptance; delivery requires reconciliation');
       }
       return receipt;

@@ -2,6 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { acquireLease, atomicWrite, assertId, safePath } from './fs-safe.mjs';
+import { createSessionStore } from './session-binding.mjs';
+import { claimManual, complete } from './letter-claims.mjs';
 
 function canonical(value) {
   if (Array.isArray(value)) return '[' + value.map(canonical).join(',') + ']';
@@ -73,10 +75,37 @@ export function createMailbox({ root, identity } = {}) {
     });
     return { envelope, attachments_resolved };
   }
+  // Once an identity is bound (runtime/sessions/<agent>.json) its letters have one owner at a time, recorded in the
+  // claim ledger the automatic receiver uses too (letter-claims.mjs). An unbound mailbox keeps its manual consumer.
+  const sessions = createSessionStore({ root });
+  async function takeLetter(agent, envelope) {
+    const state = await sessions.read(agent);
+    if (!state) return null;
+    const { binding } = state, digest = envelopeDigest(envelope), claim = state.claims[envelope.id];
+    const current = claim && claim.digest === digest && claim.owner.generation === binding.generation && claim.owner.session === binding.session.id;
+    if (current && ['accepted', 'done'].includes(claim.status)) return claim.owner;
+    if (binding.mode === 'auto') {
+      // Automatic mode: only the session the receiver delivered this letter to works on it; everyone else is told so.
+      throw Object.assign(new Error(`letter ${envelope.id} belongs to the automatic consumer and was not delivered to this session`), { code: 'CLAIMED_BY_AUTO' });
+    }
+    const taken = await claimManual(sessions, agent, { id: envelope.id, digest, session: binding.session.id });
+    if (!taken.ok) throw Object.assign(new Error(`letter ${envelope.id} cannot be taken: ${taken.reason}`), { code: 'LETTER_CLAIMED', reason: taken.reason });
+    return taken.claim.owner;
+  }
+  /** read() for a consumer that takes the letter into its context: goes through the claim ledger first. */
+  async function take(agent, id) {
+    own(agent);
+    const envelope = readJson(fileFor(agent, 'inbox', id));
+    if (!envelope) throw new Error('letter not found: ' + id);
+    await takeLetter(agent, envelope);
+    return read(agent, id);
+  }
   async function deliverUnlocked(envelope, { route } = {}) {
     if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)) throw new Error('invalid envelope');
-    for (const key of ['route', 'route_snapshot', 'threadId', 'cwd', 'hostId', 'focusRevision', 'publishedAt', 'scope'])
+    for (const key of ['route', 'route_snapshot', 'threadId', 'cwd', 'hostId', 'focusRevision', 'bindingRevision', 'publishedAt', 'scope'])
       if (Object.hasOwn(envelope, key)) throw new Error('envelope cannot declare trusted route: ' + key);
+    // Where a letter goes is captured by the receiver from the explicit binding when it first sees it; nobody else sets it.
+    if (route !== undefined) throw new Error('a route cannot be set at delivery: the receiver captures it from the explicit binding');
     envelope = JSON.parse(JSON.stringify(envelope));
     if (envelope.id === undefined) envelope.id = randomUUID();
     assertId(envelope.id);
@@ -107,24 +136,6 @@ export function createMailbox({ root, identity } = {}) {
       if (delivered) return { id: envelope.id, delivered_to: delivered.file, idempotent: true, warnings };
     }
     fs.mkdirSync(path.dirname(target), { recursive: true });
-    if (route) {
-      if (typeof route.threadId !== 'string' || !route.threadId || typeof route.hostId !== 'string' || !route.hostId ||
-          typeof route.cwd !== 'string' || !path.isAbsolute(route.cwd) ||
-          !['string', 'number'].includes(typeof route.focusRevision) ||
-          (typeof route.focusRevision === 'number' && !Number.isFinite(route.focusRevision)) ||
-          !Number.isFinite(Date.parse(route.publishedAt)) || (route.scope !== undefined && route.scope !== 'analysis-reply'))
-        throw new Error('invalid trusted route snapshot');
-      const routeFile = safePath(root, path.join('runtime', 'routes', envelope.id + '.json'));
-      const digest = envelopeDigest(envelope);
-      const existingRoute = readJson(routeFile);
-      if (existingRoute) {
-        if (existingRoute.envelopeDigest !== digest) throw new Error('orphan route content conflict; needs reconcile');
-      } else {
-        await atomicWrite(routeFile, JSON.stringify({ threadId: route.threadId, cwd: route.cwd, hostId: route.hostId,
-          focusRevision: route.focusRevision, publishedAt: route.publishedAt, scope: 'analysis-reply',
-          messageId: envelope.id, from: envelope.from, to: envelope.to, envelopeDigest: digest }, null, 2) + '\n');
-      }
-    }
     await atomicWrite(target, JSON.stringify(envelope, null, 2) + '\n');
     return { id: envelope.id, delivered_to: target, idempotent: false, warnings };
   }
@@ -149,7 +160,15 @@ export function createMailbox({ root, identity } = {}) {
     fs.renameSync(source, destination);
     return { archived: id, idempotent: false };
   }
-  async function archive(agent, id) { return locked(() => archiveUnlocked(agent, id)); }
+  async function archive(agent, id) {
+    own(agent);
+    const pending = readJson(fileFor(agent, 'inbox', id));
+    const owner = pending ? await takeLetter(agent, pending) : null;
+    const archived = await locked(() => archiveUnlocked(agent, id));
+    if (owner) archived.ledger = ledgerOutcome(await complete(sessions, agent, id, owner));
+    return archived;
+  }
+  const ledgerOutcome = completed => (completed.ok ? 'done' : completed.reason);
   async function reply(agent, input) {
     own(agent);
     const options = JSON.parse(JSON.stringify(input));
@@ -157,6 +176,14 @@ export function createMailbox({ root, identity } = {}) {
     if (typeof options.body !== 'string' || !options.body.trim()) throw new Error('reply body is required');
     const outcome = options.outcome ?? 'completed';
     if (!['completed', 'needs_authorization', 'failed'].includes(outcome)) throw new Error('invalid reply outcome');
+    // Take the letter in the shared claim ledger before any result about it is published.
+    const pending = readJson(fileFor(agent, 'inbox', options.reply_to));
+    const owner = pending ? await takeLetter(agent, pending) : null;
+    const replied = await publishReply(agent, options, outcome);
+    if (owner && outcome !== 'needs_authorization') replied.ledger = ledgerOutcome(await complete(sessions, agent, options.reply_to, owner));
+    return replied;
+  }
+  function publishReply(agent, options, outcome) {
     return locked(async () => {
       const pending = readJson(fileFor(agent, 'inbox', options.reply_to));
       const source = pending || readJson(fileFor(agent, 'archive', options.reply_to));
@@ -196,5 +223,5 @@ export function createMailbox({ root, identity } = {}) {
       archive: listFiles(safePath(root, path.join('agents', agent, 'archive'))).filter(f => f.endsWith('.json')).length,
     }));
   }
-  return { deliver, inbox, read, reply, archive, roster };
+  return { deliver, inbox, read, take, reply, archive, roster };
 }
