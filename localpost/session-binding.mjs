@@ -21,6 +21,23 @@ export const ROTATION_STATES = Object.freeze(['active', 'frozen', 'drained', 'ha
 // The only scope a binding can carry. Implementation authority is never part of a binding or a handoff.
 export const ANALYSIS_REPLY = 'analysis-reply';
 
+/**
+ * What makes a binding THIS binding, for compare-and-swap. A version alone is not enough: when the record is removed and a
+ * chat binds afresh, the new binding starts at the same version (ABA). So the identity also names the generation, the
+ * session (host, id, workspace), when it was bound and the attested bind action.
+ */
+export const bindingIdentity = binding => ({
+  version: binding.version, generation: binding.generation,
+  session: { host: binding.session.host, id: binding.session.id, cwd: binding.session.cwd ?? null },
+  since: binding.since ?? null, attestation: binding.attestation?.actionId ?? null,
+});
+export function isBinding(binding, expected) {
+  const now = bindingIdentity(binding);
+  return now.version === expected?.version && now.generation === expected.generation && now.session.host === expected.session?.host &&
+    now.session.id === expected.session?.id && now.session.cwd === (expected.session?.cwd ?? null) &&
+    now.since === (expected.since ?? null) && now.attestation === (expected.attestation ?? null);
+}
+
 const failure = (code, message) => Object.assign(new Error(message), { code });
 const text = value => typeof value === 'string' && value.trim() !== '';
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);

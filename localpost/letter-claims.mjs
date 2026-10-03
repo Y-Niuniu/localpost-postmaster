@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { assertId } from './fs-safe.mjs';
-import { MODES } from './session-binding.mjs';
+import { MODES, isBinding } from './session-binding.mjs';
 
 /**
  * The per-letter owner ledger, shared by the manual and the automatic consumer of an identity.
@@ -231,9 +231,12 @@ export function pinTransfersIn(state, letters, at) {
   return pinned;
 }
 
-export function requestModeIn(state, mode, { expectedVersion } = {}, at) {
+export function requestModeIn(state, mode, { expectedVersion, expectedBinding } = {}, at) {
   if (!MODES.includes(mode)) throw new Error('Mode must be manual or auto');
   const { binding } = state;
+  // A caller that proved one particular binding switches that binding or nothing: checked first, before any write - also a
+  // fresh binding at the same version (ABA) or a pending switch of another binding is left untouched.
+  if (expectedBinding !== undefined && !isBinding(binding, expectedBinding)) return { ok: false, reason: 'binding_conflict' };
   if (binding.state === 'frozen') {
     if (binding.frozen?.for === 'mode') return binding.frozen.mode === mode ? { ok: true, existing: true } : { ok: false, reason: 'mode_switch_pending' };
     return { ok: false, reason: 'rotation_in_progress' };
