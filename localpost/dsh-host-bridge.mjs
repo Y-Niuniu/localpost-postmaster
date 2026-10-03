@@ -206,21 +206,32 @@ export function createDshHostBridge({ ctx, runtimeVersion, store, identity, host
         }
         // The mode switch protocol (letter-claims.mjs switchMode): freeze → drain → CAS under the identity's actor lease, so no
         // dispatch is in flight, an interrupted one is isolated for reconciliation, and the binding version moves with the mode.
-        const switched = await switchMode(store, identity, 'manual');
+        // The CAS names the version this caller was checked against: if the binding moved since (a rotation to B), nothing changes.
+        const switched = await switchMode(store, identity, 'manual', { expectedVersion: state.binding.version });
         if (switched?.skipped) return { kind: 'error', text: 'LocalPost: mail is being delivered right now, so nothing changed. Run the unbind again in a moment.' };
+        if (switched?.reason === 'version_conflict') return { kind: 'error', text: 'LocalPost: the binding changed since this chat was checked (for example a rotation), so nothing changed.' };
         if (!switched?.ok) return { kind: 'error', text: 'LocalPost: the unbind was refused (' + String(switched?.reason ?? 'unknown') + '); nothing changed.' };
-        // Confirm against what was actually persisted, not against what the switch reported.
+        // Confirm against what was actually persisted: the very binding this caller proved, now in manual mode.
         const after = await store.read(identity);
-        if (after?.binding?.mode !== 'manual') return { kind: 'error', text: 'LocalPost: could not confirm the unbind; automatic routing may still be on.' };
+        if (!boundTo(after, caller) || after.binding.generation !== state.binding.generation || after.binding.mode !== 'manual') {
+          return { kind: 'error', text: 'LocalPost: could not confirm the unbind of this chat\'s binding; automatic routing may still be on.' };
+        }
         return { kind: 'success', text: 'LocalPost: automatic routing is off for NEW mail. Mail already accepted keeps its original owner and must be reconciled there; it is not moved to another chat.' };
       });
     } catch (error) {
       release();
       return { ok: false, reason: 'registration_failed', message: String(error?.message ?? error), dispose: () => {} };
     }
-    const dispose = () => { release(); if (registration) registration = null; };
-    registration = { names, dispose };
-    return { ok: true, names, dispose };
+    // Only the current registration can be released, once: a repeated call, or a late one after a successor registered,
+    // is a no-op and never touches the successor.
+    const own = { names };
+    own.dispose = () => {
+      if (registration !== own) return;
+      registration = null;
+      release();
+    };
+    registration = own;
+    return { ok: true, names, dispose: own.dispose };
   }
 
   return { ...bridge, registerCommands };
