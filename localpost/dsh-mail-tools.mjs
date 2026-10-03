@@ -105,9 +105,9 @@ export function createMailTools({ ctx, mailbox, store, identity, hostId = 'local
   if (!canGuard) reasons.push('tool_guard_unavailable');
   if (!canLookup) reasons.push('live_agent_lookup_unavailable');
   const capable = reasons.length === 0;
+  // The current registration: its own token, disposer and identity map (name -> Set of the definition objects it
+  // registered, so its guard can prove identity). A stale disposer can therefore never touch a successor's.
   let registration = null;
-  // name -> Set of the definition objects this bridge registered, so the guard can prove identity.
-  const ours = new Map();
 
   const withCaller = (name, exec, run) => run(attestedCaller(ctx, exec, hostId));
   const bound = async caller => requireBoundChat(await store.read(identity), caller);
@@ -205,7 +205,7 @@ export function createMailTools({ ctx, mailbox, store, identity, hostId = 'local
       catch (error) { return { ok: false, reason: 'lookup_failed', name: definition.name, message: String(error?.message ?? error), dispose: () => {} }; }
       if (existing !== undefined) return { ok: false, reason: 'tool_name_taken', name: definition.name, dispose: () => {} };
     }
-    for (const definition of list) ours.set(definition.name, new Set());
+    const ours = new Map(list.map(definition => [definition.name, new Set()]));
     const disposers = [];
     const release = () => { for (const dispose of disposers.splice(0).reverse()) { try { dispose(); } catch { /* release is best effort */ } } };
     try {
@@ -221,9 +221,17 @@ export function createMailTools({ ctx, mailbox, store, identity, hostId = 'local
       ours.clear();
       return { ok: false, reason: 'registration_failed', message: String(error?.message ?? error), dispose: () => {} };
     }
-    const dispose = () => { release(); ours.clear(); if (registration) registration = null; };
-    registration = { names: [...TOOL_NAMES], dispose };
-    return { ok: true, names: [...TOOL_NAMES], dispose };
+    // Only the current registration can be released, once: a repeated call, or a late one after a successor registered,
+    // is a no-op and never touches the successor.
+    const own = { names: [...TOOL_NAMES], ours };
+    own.dispose = () => {
+      if (registration !== own) return;
+      registration = null;
+      release();
+      ours.clear();
+    };
+    registration = own;
+    return { ok: true, names: [...TOOL_NAMES], dispose: own.dispose };
   }
 
   return {
@@ -231,6 +239,6 @@ export function createMailTools({ ctx, mailbox, store, identity, hostId = 'local
     names: [...TOOL_NAMES],
     capabilities: () => ({ runtimeVersion: versionOk, toolRegistry: canRegister, toolLookup: canGet, toolGuard: canGuard, liveAgentLookup: canLookup, reasons: [...reasons] }),
     attestedCaller: exec => attestedCaller(ctx, exec, hostId),
-    shadowReason: exec => shadowReason(tools, ours, exec),
+    shadowReason: exec => shadowReason(tools, registration?.ours ?? new Map(), exec),
   };
 }

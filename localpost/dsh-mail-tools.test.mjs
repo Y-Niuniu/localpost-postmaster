@@ -23,7 +23,7 @@ const exists = async file => { try { await fs.access(file); return true; } catch
 
 // The registry mirrors the installed host: register / get(name, scope) / guard(fn), where a guard that
 // returns a string denies the execution. Nothing here invents a lookup the host does not expose.
-function fakeHost({ agents = new Map(), tools = true, mode = 'real' } = {}) {
+function fakeHost({ agents = new Map(), tools = true, mode = 'real', unregister = false } = {}) {
   const definitions = [];
   const guards = [];
   const released = [];
@@ -31,7 +31,11 @@ function fakeHost({ agents = new Map(), tools = true, mode = 'real' } = {}) {
   const ctx = { agents: { get: id => agents.get(id) } };
   if (tools) {
     ctx.tools = {
-      register: definition => { definitions.push(definition); return () => released.push(definition.name); },
+      // unregister: like the real host, the disposer removes exactly this definition (older tests only record it).
+      register: definition => {
+        definitions.push(definition);
+        return () => { released.push(definition.name); if (unregister) { const at = definitions.indexOf(definition); if (at >= 0) definitions.splice(at, 1); } };
+      },
       get: (name, scope) => {
         if (mode === 'throws') throw new Error('lookup exploded');
         if (mode === 'scoped-shadow' && scope?.session?.id === 'chat-A' && name === 'localpost_inbox') {
@@ -223,6 +227,24 @@ test('a scoped shadow is denied at the guard stage and its body never runs', asy
   assert.deepEqual(host.shadowBodies, [], 'the shadowing body must never be executed');
   assert.match(await dispatch(host, 'localpost_status', {}, execFor(agent)), /mode=manual/, 'an unshadowed tool still runs through the guard');
   assert.equal(await exists(path.join(root, 'agents', 'dsh', 'inbox', letter + '.json')), true, 'a denied call leaves mailbox state untouched');
+});
+
+test('a stale tool disposer releases only its own registration: the successor keeps its tools and its shadow guard', async () => {
+  const { store, mailbox } = await mailboxFor('stale-tool-dispose');
+  const host = fakeHost({ mode: 'scoped-shadow', unregister: true });
+  const tools = createMailTools({ ctx: host.ctx, mailbox, store, identity: 'dsh', runtimeVersion: SUPPORTED_VERSION });
+  const first = tools.register();
+  first.dispose();
+  const second = tools.register();
+  assert.equal(second.ok, true);
+  first.dispose();                                    // late or repeated release of R1
+  const agent = chatAgent('chat-A');
+  host.agents.set('chat-A', agent);
+  assert.match(await dispatch(host, 'localpost_status', {}, execFor(agent)), /mode=manual/, 'R2 still serves');
+  await assert.rejects(async () => dispatch(host, 'localpost_inbox', {}, execFor(agent)), { code: 'GUARD_DENIED' }, 'R2 guard still denies a shadow');
+  assert.deepEqual(host.shadowBodies, [], 'the shadowing body never ran');
+  const again = tools.register();
+  assert.deepEqual([again.ok, again.existing], [true, true], 'R2 is still the current registration, not a name conflict');
 });
 
 test('the reply schema and the tool set are exactly what the protocol allows', async () => {
