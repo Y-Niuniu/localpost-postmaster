@@ -73,14 +73,17 @@ export function createFakeHost({ root, behavior = {} } = {}) {
       };
     },
     // 撤权 barrier：宿主证明旧会话已结束当前整轮、并失去这些信的处理权。重复请求返回同一个 barrier。
-    async revokeSession(id, { generation, letters } = {}) {
+    async revokeSession(id, { generation, letters, lettersDigest } = {}) {
       const r = mode('revoke');
       if (r === 'throw') throw new Error('host revocation unavailable');
       if (r === 'refuse') return { revoked: false, reason: 'the session is still in a turn' };
+      // 'stale'：宿主答了一个缓存的、为另一组信开的 barrier（会话和代次都对，信件集合不对）。
+      if (r === 'stale') return { revoked: true, sessionId: id, generation, barrier: `barrier:${id}:cached`,
+        letters: (letters ?? []).slice(0, 1), lettersDigest: 'f'.repeat(64) };
       const data = load();
       if (Object.hasOwn(data.sessions, id)) data.sessions[id].revoked = { generation, letters: [...(letters ?? [])] };
       save(data);
-      return { revoked: true, sessionId: r === 'wrong-session' ? 'another-session' : id, generation, barrier: `barrier:${id}:g${generation}` };
+      return { revoked: true, sessionId: r === 'wrong-session' ? 'another-session' : id, generation, lettersDigest, barrier: `barrier:${id}:g${generation}` };
     },
     async retireSession(id) {
       if (mode('retire') === 'throw') throw new Error('host retire unavailable');

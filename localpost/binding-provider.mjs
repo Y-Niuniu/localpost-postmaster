@@ -53,6 +53,21 @@ export function attestedNow(state) {
   return a?.kind === 'chat-action' && sameSession({ host: a.hostId, id: a.threadId, cwd: a.cwd }, session);
 }
 
+/**
+ * The arrival route a letter keeps for good: the binding as it stands when the letter is delivered. The controlled
+ * delivery records it in the same write-lock section that publishes the letter (mailbox.mjs), so a later rebinding
+ * reaches only later mail. Only an attested automatic binding routes mail (a rotation in progress included: the
+ * route follows its lineage); anything else leaves the letter with the manual consumer. The host is asked at dispatch.
+ */
+export function arrivalRoute(state) {
+  const { binding } = state;
+  if (binding.mode !== 'auto') return { route: null, reason: 'binding_manual' };
+  if (!attestedNow(state)) return { route: null, reason: 'binding_unattested' };
+  if (!text(binding.session.cwd)) return { route: null, reason: 'binding_incomplete' };
+  return { route: Object.freeze({ identity: state.identity, hostId: binding.session.host, threadId: binding.session.id, cwd: binding.session.cwd,
+    generation: binding.generation, bindingRevision: binding.version, boundAt: binding.since, attestation: binding.attestation.actionId }) };
+}
+
 export function createBindingProvider({ store, identity, host } = {}) {
   assertId(identity);
   const trusted = host?.capabilities?.chatBinding === true && typeof host.describeThread === 'function';
@@ -63,17 +78,6 @@ export function createBindingProvider({ store, identity, host } = {}) {
   };
   return {
     trusted,
-    /** The binding as it stands now: the immutable arrival snapshot a newly received letter keeps for good. */
-    async capture() {
-      if (!trusted) throw failure('binding_unverified', 'The host cannot attest chat bindings');
-      const state = await current();
-      if (!attestedNow(state)) throw failure('binding_unattested', 'The binding does not come from an attested chat action');
-      const { binding } = state;
-      if (binding.state !== 'active' || binding.mode !== 'auto') throw failure('binding_inactive', 'The binding is frozen or in manual mode');
-      if (!text(binding.session.cwd)) throw failure('binding_incomplete', 'The binding has no workspace');
-      return Object.freeze({ identity, hostId: binding.session.host, threadId: binding.session.id, cwd: binding.session.cwd,
-        generation: binding.generation, bindingRevision: binding.version, boundAt: binding.since, attestation: binding.attestation.actionId });
-    },
     /**
      * Where a letter that arrived under `route` goes now: the same binding, or its successor by completed rotations.
      * A user rebinding (any other change of the session) never captures mail that arrived before it.

@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { createSessionStore, bind } from './session-binding.mjs';
 import { dispatchLetter, claimManual, complete, switchMode, resolveUncertain } from './letter-claims.mjs';
 import { createRotation, candidateSessionId, deriveAlerts, auditState } from './rotation.mjs';
@@ -70,7 +71,9 @@ test('a proven barrier moves each letter by CAS but holds it from the new sessio
   assert.equal((await rotation.beginIfDue('codex')).ok, true);
   await runUntil(rotation, 'switched');
   let state = await store.read('codex');
-  assert.deepEqual(state.rotations[1].revocation, { proven: true, barrier: `barrier:session-1:g1`, letters: ['open-1', 'open-2'] });
+  // The barrier is bound to the exact set it was asked for: sha256 of the sorted [{ id, digest }] list.
+  const lettersDigest = createHash('sha256').update(JSON.stringify(['open-1', 'open-2'].map(id => ({ id, digest: mail(id).digest })))).digest('hex');
+  assert.deepEqual(state.rotations[1].revocation, { proven: true, barrier: `barrier:session-1:g1`, letters: ['open-1', 'open-2'], lettersDigest });
   assert.deepEqual(host.state().sessions['session-1'].revoked, { generation: 1, letters: ['open-1', 'open-2'] });
   for (const id of ['open-1', 'open-2']) {
     assert.deepEqual([...view(state.claims[id]), state.claims[id].hold], ['reserved', 'transferred', 2, NEXT, 'retire']);

@@ -13,8 +13,8 @@
 |---|---|---|
 | `wholeTurn`（整轮后投递） | `runtimeVersion === '0.2.0-rc.2'` | ✅ 运行中的 harness 正是 rc.2 |
 | `sourceIsRelay` | 代码内固定 | ✅ |
-| **绑定提供者**（原 `trustedFocus`） | 需 `capture() + verifyBinding()` | ❌ **未实现** |
-| **受理提供者**（`dispatchIdempotent`） | 需 `durable + idempotent + acceptOnce()` | ❌ **未实现** |
+| **绑定提供者**（原 `trustedFocus`） | 需 `resolve() + verifyBinding()`；到达路由由受控投递写到达记录（`arrivalRoute`，2026-10-03 起） | LocalPost 侧已实现（T1）；DSH rc.2 无 `chatBinding`/`describeThread` → ❌ **仍关闭** |
+| **受理提供者**（`dispatchIdempotent`） | 需 `durable + idempotent + acceptOnce()` | LocalPost 侧已实现（`ledger-acceptance.mjs`，T1）；只能 at-most-once |
 
 **结论**：先补齐 `docs/rotation-decisions.md` §2 的四项实现，才能开始 E。
 

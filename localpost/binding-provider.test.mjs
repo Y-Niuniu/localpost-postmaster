@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createSessionStore } from './session-binding.mjs';
-import { createBindingProvider, bindFromChatAction } from './binding-provider.mjs';
+import { createBindingProvider, bindFromChatAction, arrivalRoute } from './binding-provider.mjs';
 import { createFakeDshHost } from './fixtures/fake-dsh-host.mjs';
 import { removeTreeSync } from './temp-tree.mjs';
 
@@ -44,23 +44,27 @@ test('without the host capability nothing is trusted and no binding can be made'
   const ctx = setup(t, { capabilities: {} });
   assert.equal(ctx.provider.trusted, false);
   assert.deepEqual(await bindA(ctx), { ok: false, reason: 'host_cannot_attest' });
-  await assert.rejects(ctx.provider.capture(), { code: 'binding_unverified' });
+  assert.equal(await ctx.store.read('dsh'), null, 'no binding, so no arrival route for any letter');
 });
 
-test('the captured snapshot records host, chat, workspace, generation, revision and time', async t => {
+test('the arrival route records host, chat, workspace, generation, revision and time; manual mode routes nothing', async t => {
   const ctx = setup(t);
   await bindA(ctx);
-  const snapshot = await ctx.provider.capture();
+  const snapshot = arrivalRoute(await ctx.store.read('dsh')).route;
   const { binding } = await ctx.store.read('dsh');
   assert.deepEqual(snapshot, { identity: 'dsh', hostId: 'local', threadId: 'chat-a', cwd: CWD_A, generation: 1,
     bindingRevision: binding.version, boundAt: binding.since, attestation: binding.attestation.actionId });
   assert.ok(Object.isFrozen(snapshot));
+  const state = await ctx.store.read('dsh');
+  assert.deepEqual(arrivalRoute({ ...state, binding: { ...state.binding, mode: 'manual' } }), { route: null, reason: 'binding_manual' });
+  assert.equal(arrivalRoute({ ...state, binding: { ...state.binding, state: 'frozen' } }).route.threadId, 'chat-a',
+    'a rotation in progress still routes new mail to its generation; the lineage carries it on');
 });
 
 test('verification fails closed when the chat is offline, moved, on another host, or the binding changed', async t => {
   const ctx = setup(t);
   await bindA(ctx);
-  const snapshot = await ctx.provider.capture();
+  const snapshot = arrivalRoute(await ctx.store.read('dsh')).route;
   const target = { hostId: snapshot.hostId, threadId: snapshot.threadId, cwd: snapshot.cwd, generation: snapshot.generation };
   assert.equal(await ctx.provider.verifyBinding(target), true);
   ctx.host.setOnline('chat-a', false);
@@ -77,7 +81,7 @@ test('verification fails closed when the chat is offline, moved, on another host
 test('after a completed, verified rotation, earlier mail follows the lineage and the successor counts as attested', async t => {
   const ctx = setup(t);
   await bindA(ctx);
-  const route = await ctx.provider.capture();
+  const route = arrivalRoute(await ctx.store.read('dsh')).route;
   const file = path.join(ctx.root, 'runtime/sessions/dsh.json');
   const state = JSON.parse(fs.readFileSync(file, 'utf8'));
   const successor = { host: 'local', id: 'chat-a2', cwd: CWD_A };
@@ -88,19 +92,19 @@ test('after a completed, verified rotation, earlier mail follows the lineage and
   fs.writeFileSync(file, JSON.stringify(state));
   ctx.host.openThread('chat-a2', CWD_A);
   assert.deepEqual(await ctx.provider.resolve(route), { ok: true, target: { identity: 'dsh', hostId: 'local', threadId: 'chat-a2', cwd: CWD_A, generation: 2 } });
-  assert.equal((await ctx.provider.capture()).threadId, 'chat-a2');
+  assert.equal((arrivalRoute(await ctx.store.read('dsh')).route).threadId, 'chat-a2');
   assert.equal(await ctx.provider.verifyBinding({ hostId: 'local', threadId: 'chat-a2', cwd: CWD_A, generation: 2 }), true);
   // A rotation that never verified its candidate gives no lineage.
   state.rotations['1'].candidate.status = 'rejected';
   fs.writeFileSync(file, JSON.stringify(state));
   assert.deepEqual(await ctx.provider.resolve(route), { ok: false, reason: 'route_lineage_broken' });
-  await assert.rejects(ctx.provider.capture(), { code: 'binding_unattested' });
+  assert.deepEqual(arrivalRoute(await ctx.store.read('dsh')), { route: null, reason: 'binding_unattested' });
 });
 
 test('a route resolves only to its own binding or a successor reached by a completed rotation', async t => {
   const ctx = setup(t);
   await bindA(ctx);
-  const route = await ctx.provider.capture();
+  const route = arrivalRoute(await ctx.store.read('dsh')).route;
   assert.deepEqual(await ctx.provider.resolve(route), { ok: true, target: { identity: 'dsh', hostId: 'local', threadId: 'chat-a', cwd: CWD_A, generation: 1 } });
   for (const [field, value, reason] of [['threadId', 'chat-b', 'binding_changed'], ['generation', 2, 'route_from_future'],
     ['cwd', 'C:/work/project-b', 'binding_changed'], ['hostId', 'other-host', 'binding_changed'], ['identity', 'codex', 'route_invalid']]) {
@@ -113,5 +117,5 @@ test('a route resolves only to its own binding or a successor reached by a compl
   state.binding = { ...state.binding, generation: 2, session: { host: 'local', id: 'chat-b', cwd: 'C:/work/project-b' } };
   fs.writeFileSync(file, JSON.stringify(state));
   assert.deepEqual(await ctx.provider.resolve(route), { ok: false, reason: 'route_lineage_broken' });
-  await assert.rejects(ctx.provider.capture(), { code: 'binding_unattested' }, 'a binding nobody attested is not used for new mail either');
+  assert.deepEqual(arrivalRoute(await ctx.store.read('dsh')), { route: null, reason: 'binding_unattested' }, 'a binding nobody attested is not used for new mail either');
 });

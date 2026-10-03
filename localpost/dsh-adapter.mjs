@@ -12,7 +12,8 @@ const text = value => typeof value === 'string' && value.trim() !== '';
  *
  * This module discovers no sessions, never resumes a cold agent, and does not manufacture a binding or
  * idempotency. Native followup alone proves neither. Automatic dispatch needs:
- *   bindingProvider   explicit, host-attested chat binding (binding-provider.mjs): capture / resolve / verifyBinding.
+ *   bindingProvider   explicit, host-attested chat binding (binding-provider.mjs): resolve / verifyBinding. The arrival
+ *                     route itself is recorded when a letter is delivered (mailbox.mjs), never at dispatch.
  *                     Its trust comes from a host capability the installed DSH rc.2 does not have; without it
  *                     the adapter stays disabled. There is no "current focus" fallback of any kind.
  *   acceptance        durable, idempotent acceptance (ledger-acceptance.mjs): acceptOnce.
@@ -20,7 +21,7 @@ const text = value => typeof value === 'string' && value.trim() !== '';
 export function createDshAdapter({ ctx, runtimeVersion, bindingProvider, acceptance, hostId = 'local', mailboxAgent = 'dsh' } = {}) {
   assertId(mailboxAgent);
   const capabilities = Object.freeze({
-    trustedBinding: bindingProvider?.trusted === true && typeof bindingProvider.capture === 'function' &&
+    trustedBinding: bindingProvider?.trusted === true &&
       typeof bindingProvider.resolve === 'function' && typeof bindingProvider.verifyBinding === 'function',
     wholeTurn: runtimeVersion === SUPPORTED_VERSION,
     sourceIsRelay: true,
@@ -35,11 +36,6 @@ export function createDshAdapter({ ctx, runtimeVersion, bindingProvider, accepta
       runtimeVersion, supportedVersion: SUPPORTED_VERSION, dispatchEnabled: enabled,
       reasons: Object.entries(capabilities).filter(([, value]) => !value).map(([name]) => name),
     }),
-    /** The arrival route snapshot for a newly received letter: the explicit binding as it stands now. */
-    async captureBinding() {
-      if (!capabilities.trustedBinding) throw failure('binding_unverified', 'A host-attested explicit binding provider is required');
-      return bindingProvider.capture();
-    },
     async submit(request) {
       if (!enabled) {
         throw failure('runtime_capabilities_unverified', 'DSH automatic delivery requires a verified binding and durable idempotent acceptance');

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createMailbox, envelopeDigest } from './mailbox.mjs';
-import { createSessionStore, bind } from './session-binding.mjs';
+import { createSessionStore } from './session-binding.mjs';
 import { switchMode } from './letter-claims.mjs';
 import { auditState } from './rotation.mjs';
 import { bindFromChatAction } from './binding-provider.mjs';
@@ -18,6 +18,9 @@ const tempRoot = path.resolve(import.meta.dirname, '../.localpost-tmp/single-con
 const AUTHORITY = { scope: 'analysis-reply', source: 'policy:test' };
 const CWD = 'C:/work/project-a';
 const TARGET = { identity: 'dsh', hostId: 'local', threadId: 'chat-a', cwd: CWD, generation: 1 };
+// The host's word for which chat is calling (DSH: execution.agent of a native tool call); never a tool argument.
+const CHAT_A = { host: 'local', session: 'chat-a' };
+const CHAT_B = { host: 'local', session: 'chat-b' };
 const letter = id => ({ id, thread_id: id, from: 'codex', to: 'dsh', type: 'task', subject: 'Analyze', body: 'Please analyze',
   budget: 'standard', created_at: '2026-10-03T00:00:00.000Z' });
 const accept = (acceptance, id, wake = async () => {}) =>
@@ -28,41 +31,52 @@ async function setup(t, mode) {
   const root = fs.mkdtempSync(path.join(tempRoot, 'case-'));
   t.after(() => removeTreeSync(root));
   const store = createSessionStore({ root });
-  if (mode === 'auto') {
-    const host = createFakeDshHost({ root });
-    host.openThread('chat-a', CWD);
-    assert.equal((await bindFromChatAction(store, 'dsh', { host, action: host.userBindAction('chat-a'), authority: AUTHORITY })).ok, true);
-  } else {
-    assert.equal((await bind(store, 'dsh', { session: { host: 'local', id: 'chat-a', cwd: CWD }, mode: 'manual', authority: AUTHORITY, source: 'user:explicit-bind' })).ok, true);
-  }
+  const host = createFakeDshHost({ root });
+  host.openThread('chat-a', CWD);
+  assert.equal((await bindFromChatAction(store, 'dsh', { host, action: host.userBindAction('chat-a'), authority: AUTHORITY })).ok, true);
+  // The letters arrive under the automatic binding, so each carries an arrival route and enters the shared ledger when
+  // it is taken; manual mode is the explicit switch afterwards (freeze → drain → CAS).
   const admin = createMailbox({ root });
   for (const id of ['one', 'two', 'three']) await admin.deliver(letter(id));
+  if (mode === 'manual') assert.equal((await switchMode(store, 'dsh', 'manual')).ok, true);
   return { root, store, mail: createMailbox({ root, identity: 'dsh' }), acceptance: createLedgerAcceptance({ store, identity: 'dsh' }) };
 }
 
-test('in manual mode the manual entry takes letters in the shared ledger and the automatic consumer is refused', async t => {
+test('in manual mode the bound session, proven by the host, takes letters in the shared ledger and the automatic consumer is refused', async t => {
   const { store, mail, acceptance } = await setup(t, 'manual');
-  assert.equal((await mail.take('dsh', 'one')).envelope.id, 'one');
+  await assert.rejects(mail.take('dsh', 'one'), { code: 'CALLER_UNVERIFIED' }, 'nothing proves the caller is the bound session');
+  await assert.rejects(mail.take('dsh', 'one', { caller: CHAT_B }), { code: 'NOT_LETTER_OWNER' }, 'another chat of this identity');
+  assert.equal((await mail.take('dsh', 'one', { caller: CHAT_A })).envelope.id, 'one');
   let claim = (await store.read('dsh')).claims.one;
   assert.deepEqual([claim.status, claim.owner.session], ['accepted', 'chat-a']);
   await assert.rejects(accept(acceptance, 'one'), { code: 'acceptance_refused', reason: 'mode_manual' });
   await assert.rejects(accept(acceptance, 'two'), { code: 'acceptance_refused', reason: 'mode_manual' });
-  const replied = await mail.reply('dsh', { reply_to: 'one', body: 'Done', outcome: 'completed' });
+  const replied = await mail.reply('dsh', { reply_to: 'one', body: 'Done', outcome: 'completed' }, { caller: CHAT_A });
   assert.equal(replied.ledger, 'done');
   claim = (await store.read('dsh')).claims.one;
   assert.equal(claim.status, 'done');
   // Taking a letter again or replying again is idempotent for its owner.
-  assert.equal((await mail.reply('dsh', { reply_to: 'one', body: 'Done', outcome: 'completed' })).idempotent, true);
+  assert.equal((await mail.reply('dsh', { reply_to: 'one', body: 'Done', outcome: 'completed' }, { caller: CHAT_A })).idempotent, true);
   // Archiving without a reply also closes the letter in the ledger.
-  assert.equal((await mail.archive('dsh', 'two')).ledger, 'done');
+  assert.equal((await mail.archive('dsh', 'two', { caller: CHAT_A })).ledger, 'done');
   assert.deepEqual(auditState(await store.read('dsh')), []);
 });
 
-test('in automatic mode only a letter delivered to the bound session can be handled; anything else is refused explicitly', async t => {
+test('mail that arrives in manual mode belongs to the manual consumer for good: no ledger, no caller proof, never automatic', async t => {
+  const { store, mail } = await setup(t, 'manual');
+  await createMailbox({ root: store.root }).deliver(letter('handwork'));
+  assert.equal((await mail.take('dsh', 'handwork')).envelope.id, 'handwork', 'nothing to prove: the letter is outside the ledger');
+  assert.equal(Object.hasOwn((await store.read('dsh')).claims, 'handwork'), false);
+  assert.equal((await switchMode(store, 'dsh', 'auto')).ok, true);
+  assert.equal((await mail.archive('dsh', 'handwork')).archived, 'handwork', 'switching to automatic mode does not make it automatic mail');
+});
+
+test('in automatic mode only the session a letter was delivered to, proven by the host, handles it; anything else is refused explicitly', async t => {
   const { store, mail, acceptance } = await setup(t, 'auto');
   assert.equal((await accept(acceptance, 'one')).accepted, true);
-  assert.equal((await mail.take('dsh', 'one')).envelope.id, 'one', 'the delivered letter is readable by its session');
-  for (const action of [() => mail.take('dsh', 'two'), () => mail.reply('dsh', { reply_to: 'two', body: 'x' }), () => mail.archive('dsh', 'two')])
+  assert.equal((await mail.take('dsh', 'one', { caller: CHAT_A })).envelope.id, 'one', 'the delivered letter is readable by its session');
+  for (const action of [() => mail.take('dsh', 'two'), () => mail.reply('dsh', { reply_to: 'two', body: 'x' }), () => mail.archive('dsh', 'two'),
+    () => mail.take('dsh', 'two', { caller: CHAT_A })])
     await assert.rejects(action(), { code: 'CLAIMED_BY_AUTO' });
   assert.equal((await store.read('dsh')).claims.two, undefined, 'a refused manual attempt claims nothing');
   // The MCP tool goes through the same ledger.
@@ -70,7 +84,7 @@ test('in automatic mode only a letter delivered to the bound session can be hand
   const read = await server.handle({ id: 1, method: 'tools/call', params: { name: 'mailbox_read', arguments: { agent: 'dsh', id: 'two' } } });
   assert.equal(read.result.isError, true);
   assert.match(read.result.content[0].text, /automatic consumer/);
-  assert.equal((await mail.reply('dsh', { reply_to: 'one', body: 'Done', outcome: 'completed' })).ledger, 'done');
+  assert.equal((await mail.reply('dsh', { reply_to: 'one', body: 'Done', outcome: 'completed' }, { caller: CHAT_A })).ledger, 'done');
   assert.equal((await accept(acceptance, 'two')).accepted, true, 'the automatic consumer still gets the letters that were refused manually');
 });
 
@@ -79,7 +93,7 @@ test('a manual and an automatic consumer racing for the same letters leave exact
     const { store, mail, acceptance } = await setup(t, mode);
     const wakes = [];
     const outcomes = await Promise.allSettled(['one', 'two', 'three'].flatMap(id =>
-      [mail.take('dsh', id), accept(acceptance, id, async () => { wakes.push(id); })]));
+      [mail.take('dsh', id, { caller: CHAT_A }), accept(acceptance, id, async () => { wakes.push(id); })]));
     const state = await store.read('dsh');
     for (const id of ['one', 'two', 'three']) {
       // A letter nobody won stays unclaimed and is picked up by the next scan; none is ever taken twice.
@@ -101,10 +115,10 @@ test('a manual and an automatic consumer racing for the same letters leave exact
 
 test('switching modes goes through freeze, drain and CAS: afterwards the old mode is refused', async t => {
   const { store, mail, acceptance } = await setup(t, 'manual');
-  await mail.take('dsh', 'one');
+  await mail.take('dsh', 'one', { caller: CHAT_A });
   assert.equal((await switchMode(store, 'dsh', 'auto')).ok, true);
-  await assert.rejects(mail.take('dsh', 'two'), { code: 'CLAIMED_BY_AUTO' });
-  assert.equal((await mail.take('dsh', 'one')).envelope.id, 'one', 'a letter the manual session already holds stays its own');
+  await assert.rejects(mail.take('dsh', 'two', { caller: CHAT_A }), { code: 'CLAIMED_BY_AUTO' });
+  assert.equal((await mail.take('dsh', 'one', { caller: CHAT_A })).envelope.id, 'one', 'a letter the manual session already holds stays its own');
   assert.equal((await accept(acceptance, 'two')).accepted, true);
   // 'one' is already in this very session's hands (taken manually): the automatic path recognises it and does not wake it.
   let woke = false;

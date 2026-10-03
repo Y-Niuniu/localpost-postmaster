@@ -3,7 +3,8 @@ import path from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { acquireLease, atomicWrite, assertId, safePath } from './fs-safe.mjs';
 import { createSessionStore } from './session-binding.mjs';
-import { claimManual, complete } from './letter-claims.mjs';
+import { claimOf, claimManual, complete, beginCompletion } from './letter-claims.mjs';
+import { arrivalRoute } from './binding-provider.mjs';
 
 function canonical(value) {
   if (Array.isArray(value)) return '[' + value.map(canonical).join(',') + ']';
@@ -75,29 +76,81 @@ export function createMailbox({ root, identity } = {}) {
     });
     return { envelope, attachments_resolved };
   }
-  // Once an identity is bound (runtime/sessions/<agent>.json) its letters have one owner at a time, recorded in the
-  // claim ledger the automatic receiver uses too (letter-claims.mjs). An unbound mailbox keeps its manual consumer.
+  // Once an identity is bound (runtime/sessions/<agent>.json), a letter that arrived with an automatic route (its
+  // arrival record, written by deliverUnlocked) has one owner at a time, recorded in the claim ledger the automatic
+  // receiver uses too (letter-claims.mjs). Every other letter - results, mail to an unbound identity, mail that arrived
+  // in manual mode or was written into an inbox by hand - belongs to the manual consumer and never enters the ledger.
   const sessions = createSessionStore({ root });
-  async function takeLetter(agent, envelope) {
+  const arrivalFile = (agent, id) => { agentName(agent); assertId(id); return safePath(root, path.join('runtime', 'arrivals', agent, id + '.json')); };
+  const refused = (id, reason) => Object.assign(new Error(`letter ${id} cannot be taken: ${reason}`), { code: 'LETTER_CLAIMED', reason });
+  const OWNED = new Set(['accepted', 'completing', 'done', 'needs_reconcile']);
+  /**
+   * Fixes a new letter's arrival route before the letter becomes visible, in the write-lock section that publishes it:
+   * whatever a rebinding or the receiver does later, the letter keeps the route its recipient had at delivery.
+   * Only task and ping mail to a bound identity gets a record. A crash before the letter itself is written leaves a
+   * record without a letter, which the next delivery of that id replaces.
+   */
+  async function recordArrival(envelope) {
+    if (envelope.type === 'result') return;
+    let arrival;
+    try { const state = await sessions.read(envelope.to); arrival = state && arrivalRoute(state); }
+    catch (error) { if (error.code !== 'STATE_NEEDS_RECONCILE') throw error; arrival = { route: null, reason: 'binding_unreadable' }; }
+    if (!arrival) return;
+    const file = arrivalFile(envelope.to, envelope.id);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    await atomicWrite(file, JSON.stringify({ schema: 'localpost-arrival-v1', id: envelope.id, to: envelope.to, digest: envelopeDigest(envelope),
+      arrivedAt: new Date().toISOString(), route: arrival.route, ...(arrival.reason ? { reason: arrival.reason } : {}) }, null, 2) + '\n');
+  }
+  /** The arrival route recorded at delivery; null leaves the letter to the manual consumer. */
+  function arrivalOf(agent, envelope, digest) {
+    const record = readJson(arrivalFile(agent, envelope.id));
+    if (!record) return null;
+    if (record.id !== envelope.id || record.to !== agent || record.digest !== digest)
+      throw Object.assign(new Error(`letter ${envelope.id} does not match its arrival record and needs reconciliation`), { code: 'ARRIVAL_CONFLICT' });
+    return record.route ?? null;
+  }
+  /**
+   * Only the host can say which chat is calling: DSH hands native tools the calling agent (execution.agent), while its
+   * MCP client forwards nothing but the tool name and arguments. The caller therefore comes from trusted in-process
+   * code, never from tool arguments, and a letter that has an owner is worked on by that owner alone.
+   */
+  function proveOwner(state, owner, caller, id) {
+    if (typeof caller?.host !== 'string' || !caller.host || typeof caller.session !== 'string' || !caller.session)
+      throw Object.assign(new Error(`CALLER_UNVERIFIED: letter ${id} has an owner in the claim ledger and nothing proves which chat is calling`), { code: 'CALLER_UNVERIFIED' });
+    const host = owner.generation === state.binding.generation ? state.binding.session.host : state.rotations[owner.generation]?.from.host;
+    if (caller.session !== owner.session || caller.host !== host)
+      throw Object.assign(new Error(`NOT_LETTER_OWNER: letter ${id} belongs to another chat of this identity`), { code: 'NOT_LETTER_OWNER' });
+  }
+  /** The ledger owner the caller works on this letter as, or null for a letter outside the ledger; anything else throws. */
+  async function takeLetter(agent, envelope, caller) {
     const state = await sessions.read(agent);
     if (!state) return null;
-    const { binding } = state, digest = envelopeDigest(envelope), claim = state.claims[envelope.id];
-    const current = claim && claim.digest === digest && claim.owner.generation === binding.generation && claim.owner.session === binding.session.id;
-    if (current && ['accepted', 'done'].includes(claim.status)) return claim.owner;
+    const { binding } = state, digest = envelopeDigest(envelope), claim = claimOf(state, envelope.id);
+    if (claim && claim.digest !== digest) throw refused(envelope.id, 'digest_conflict');
+    const held = claim !== undefined && claim.status !== 'released';
+    if (held && OWNED.has(claim.status)) { proveOwner(state, claim.owner, caller, envelope.id); return claim.owner; }
+    if (!held && !arrivalOf(agent, envelope, digest)) return null;
     if (binding.mode === 'auto') {
-      // Automatic mode: only the session the receiver delivered this letter to works on it; everyone else is told so.
+      // Automatic mode: the letter waits for, or is in, delivery to its session; nobody takes it by hand.
       throw Object.assign(new Error(`letter ${envelope.id} belongs to the automatic consumer and was not delivered to this session`), { code: 'CLAIMED_BY_AUTO' });
     }
-    const taken = await claimManual(sessions, agent, { id: envelope.id, digest, session: binding.session.id });
-    if (!taken.ok) throw Object.assign(new Error(`letter ${envelope.id} cannot be taken: ${taken.reason}`), { code: 'LETTER_CLAIMED', reason: taken.reason });
+    // Manual mode: the bound session, proven by the host, takes it into the shared ledger.
+    proveOwner(state, { generation: binding.generation, session: binding.session.id }, caller, envelope.id);
+    const taken = await claimManual(sessions, agent, { id: envelope.id, digest, session: caller.session });
+    if (!taken.ok) throw refused(envelope.id, taken.reason);
     return taken.claim.owner;
   }
+  // A reply or archive by the owner is written ahead in the ledger (`completing`) before anything is published.
+  async function beginCompletionFor(agent, id, owner, intent) {
+    const begun = await beginCompletion(sessions, agent, id, owner, intent);
+    if (!begun.ok) throw refused(id, begun.reason);
+  }
   /** read() for a consumer that takes the letter into its context: goes through the claim ledger first. */
-  async function take(agent, id) {
+  async function take(agent, id, { caller } = {}) {
     own(agent);
     const envelope = readJson(fileFor(agent, 'inbox', id));
     if (!envelope) throw new Error('letter not found: ' + id);
-    await takeLetter(agent, envelope);
+    await takeLetter(agent, envelope, caller);
     return read(agent, id);
   }
   async function deliverUnlocked(envelope, { route } = {}) {
@@ -136,6 +189,7 @@ export function createMailbox({ root, identity } = {}) {
       if (delivered) return { id: envelope.id, delivered_to: delivered.file, idempotent: true, warnings };
     }
     fs.mkdirSync(path.dirname(target), { recursive: true });
+    await recordArrival(envelope);
     await atomicWrite(target, JSON.stringify(envelope, null, 2) + '\n');
     return { id: envelope.id, delivered_to: target, idempotent: false, warnings };
   }
@@ -160,27 +214,33 @@ export function createMailbox({ root, identity } = {}) {
     fs.renameSync(source, destination);
     return { archived: id, idempotent: false };
   }
-  async function archive(agent, id) {
+  async function archive(agent, id, { caller } = {}) {
     own(agent);
-    const pending = readJson(fileFor(agent, 'inbox', id));
-    const owner = pending ? await takeLetter(agent, pending) : null;
+    // After a crash the letter may already be archived: its claim is still found, and the owner's retry finishes it.
+    const envelope = readJson(fileFor(agent, 'inbox', id)) ?? readJson(fileFor(agent, 'archive', id));
+    const owner = envelope ? await takeLetter(agent, envelope, caller) : null;
+    if (owner) await beginCompletionFor(agent, id, owner, { op: 'archive' });
     const archived = await locked(() => archiveUnlocked(agent, id));
     if (owner) archived.ledger = ledgerOutcome(await complete(sessions, agent, id, owner));
     return archived;
   }
   const ledgerOutcome = completed => (completed.ok ? 'done' : completed.reason);
-  async function reply(agent, input) {
+  async function reply(agent, input, { caller } = {}) {
     own(agent);
     const options = JSON.parse(JSON.stringify(input));
     assertId(options.reply_to);
+    if (options.reply_id !== undefined) assertId(options.reply_id);
     if (typeof options.body !== 'string' || !options.body.trim()) throw new Error('reply body is required');
     const outcome = options.outcome ?? 'completed';
     if (!['completed', 'needs_authorization', 'failed'].includes(outcome)) throw new Error('invalid reply outcome');
-    // Take the letter in the shared claim ledger before any result about it is published.
-    const pending = readJson(fileFor(agent, 'inbox', options.reply_to));
-    const owner = pending ? await takeLetter(agent, pending) : null;
+    // Take the letter in the shared claim ledger, and write a terminal completion ahead, before any result is published.
+    // After a crash the original may already be archived: the owner's retry still finds its claim and finishes it.
+    const original = readJson(fileFor(agent, 'inbox', options.reply_to)) ?? readJson(fileFor(agent, 'archive', options.reply_to));
+    const owner = original ? await takeLetter(agent, original, caller) : null;
+    const terminal = outcome !== 'needs_authorization';
+    if (owner && terminal) await beginCompletionFor(agent, options.reply_to, owner, { op: 'reply', result: options.reply_id ?? `${options.reply_to}.result` });
     const replied = await publishReply(agent, options, outcome);
-    if (owner && outcome !== 'needs_authorization') replied.ledger = ledgerOutcome(await complete(sessions, agent, options.reply_to, owner));
+    if (owner && terminal) replied.ledger = ledgerOutcome(await complete(sessions, agent, options.reply_to, owner));
     return replied;
   }
   function publishReply(agent, options, outcome) {

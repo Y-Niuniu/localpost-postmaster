@@ -40,6 +40,18 @@ export function createReceiver({ root, agent, allowFrom = [], adapter, now = () 
   const verifiedAdapter = capabilities.trustedBinding === true && capabilities.wholeTurn === true &&
     capabilities.sourceIsRelay === true && capabilities.dispatchIdempotent === true;
 
+  // Where a letter goes was fixed when it was delivered: the controlled delivery records the recipient's binding in the
+  // same write-lock section that publishes the letter (mailbox.mjs). No envelope, sender, attachment, scan time or later
+  // binding decides it, and a letter without that record (written into the inbox by hand) is never dispatched.
+  async function arrival(env, hash) {
+    if (env.type === 'result') return { state: 'manual', reason: 'result' }; // results are read by people, never relayed
+    const record = await json(checked(`runtime/arrivals/${agent}/${env.id}.json`));
+    if (!record) return { state: 'manual', reason: 'no_arrival_record' };
+    if (record.id !== env.id || record.to !== agent || record.digest !== hash) return { state: 'needs_reconcile', reason: 'arrival_record_conflict' };
+    if (!record.route) return { state: 'manual', reason: record.reason ?? 'arrived_without_route' };
+    return { state: 'queued', route: { ...record.route, arrivedAt: record.arrivedAt } };
+  }
+
   async function scanOnce() {
     const lease = await acquireLease(root, { name: `.receiver-${agent}.lock`, now: now() });
     if (!lease.acquired) return { skipped: true, reason: lease.reason };
@@ -88,17 +100,7 @@ export function createReceiver({ root, agent, allowFrom = [], adapter, now = () 
         item = state.entries[env.id] = { id: env.id, thread: env.thread_id, from: env.from, type: env.type, hash, receivedAt: new Date(now()).toISOString() };
         if (state.historicalIds?.includes(env.id)) { item.state = 'historical'; continue; }
         if (!allowFrom.includes(env.from)) { item.state = 'denied'; item.reason = 'sender_not_allowed'; continue; }
-        // No envelope, sender, attachment or route file decides where a letter goes: see the routing pass below.
-        item.state = 'unbound'; item.reason = 'runtime_capabilities_unverified';
-      }
-      // The arrival route is captured once, from the current explicit binding, and never changed afterwards.
-      // Without a usable binding the letter stays pending and is tried again on a later scan.
-      if (verifiedAdapter) for (const item of Object.values(state.entries).filter(x => x.state === 'unbound')) {
-        try {
-          const snapshot = await adapter.captureBinding();
-          item.route = { ...snapshot, routedAt: new Date(now()).toISOString() };
-          item.state = 'queued'; delete item.reason;
-        } catch (error) { item.reason = error.code || 'binding_unavailable'; }
+        Object.assign(item, await arrival(env, hash));
       }
       for (const item of Object.values(state.entries)) {
         const uncertainDispatch = item.state === 'needs_reconcile' && ['dispatch_interrupted', 'dispatch_uncertain'].includes(item.reason);

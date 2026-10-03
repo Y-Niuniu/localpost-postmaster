@@ -17,6 +17,8 @@ import { removeTree, removeTreeSync } from './temp-tree.mjs';
 const tempRoot = path.resolve(import.meta.dirname, '../.localpost-tmp/receiver');
 const AUTHORITY = { scope: 'analysis-reply', source: 'policy:test' };
 const CWD_A = 'C:/work/project-a';
+// The host's word for which chat is calling (DSH: execution.agent of a native tool call).
+const CHAT_A = { host: 'local', session: 'chat-a' };
 const letter = (id, extra = {}) => ({ id, thread_id: id, from: 'codex', to: 'dsh', type: 'task', subject: 'test', body: 'Analyze only',
   budget: 'standard', created_at: new Date().toISOString(), ...extra });
 
@@ -41,17 +43,23 @@ const rebindByHand = (root, session) => {
   fs.writeFileSync(file, JSON.stringify(state));
 };
 
-test('legacy backlog stays untouched; without a verified binding new mail stays pending', async t => {
-  const { mail, receiver, entries } = await world(t, { bound: false });
+test('legacy backlog stays untouched; mail that arrives unbound has no arrival route and never becomes automatic later', async t => {
+  const { root, host, mail, receiver, entries } = await world(t, { bound: false });
   await mail.deliver(letter('old'));
   const plain = receiver({ adapter: undefined });
   await plain.scan();
   await mail.deliver(letter('new'));
   await plain.scan();
-  const state = await entries();
+  let state = await entries();
   assert.equal(state.old.state, 'historical');
-  assert.deepEqual([state.new.state, state.new.reason], ['unbound', 'runtime_capabilities_unverified']);
-  assert.equal(state.new.route, undefined);
+  assert.deepEqual([state.new.state, state.new.reason, state.new.route], ['manual', 'no_arrival_record', undefined]);
+  // A binding made afterwards serves later mail only; without a verified adapter nothing is dispatched in any case.
+  assert.equal((await bindFromChatAction(createSessionStore({ root }), 'dsh', { host, action: host.userBindAction('chat-a'), authority: AUTHORITY })).ok, true);
+  await mail.deliver(letter('later'));
+  await plain.scan();
+  state = await entries();
+  assert.deepEqual([state.new.state, state.new.reason], ['manual', 'no_arrival_record']);
+  assert.deepEqual([state.later.state, state.later.reason, state.later.route.threadId], ['queued', 'runtime_capabilities_unverified', 'chat-a']);
 });
 
 test('routes come only from the receiver: envelopes and delivery cannot set one, a forged route file is ignored', async t => {
@@ -83,7 +91,7 @@ test('the arrival snapshot is immutable: a later rebinding to chat B never moves
   await receiver().scan();
   const state = await entries();
   assert.deepEqual([state.early.state, state.early.reason, state.early.route.threadId], ['needs_reconcile', 'route_unresolvable', 'chat-a']);
-  assert.deepEqual([state.late.state, state.late.reason], ['unbound', 'binding_unattested'], 'an unattested binding routes nothing new either');
+  assert.deepEqual([state.late.state, state.late.reason], ['manual', 'binding_unattested'], 'an unattested binding routes nothing new either');
   assert.equal(host.followups().length, 0, 'nothing reached chat B, nothing reached the old chat A');
 });
 
@@ -120,10 +128,10 @@ test('an offline bound chat keeps mail pending; online it is woken once; restart
   assert.equal(host.followups().length, 1);
   // Runtime acceptance is not business completion; the bound session's own replies are.
   const reply = createMailbox({ root, identity: 'dsh' });
-  await reply.reply('dsh', { reply_to: 'queued', body: 'User authority required', outcome: 'needs_authorization' });
+  await reply.reply('dsh', { reply_to: 'queued', body: 'User authority required', outcome: 'needs_authorization' }, { caller: CHAT_A });
   await receiver().scan();
   assert.equal((await entries()).queued.state, 'awaiting_authorization');
-  await reply.reply('dsh', { reply_to: 'queued', body: 'Analyzed', outcome: 'completed' });
+  await reply.reply('dsh', { reply_to: 'queued', body: 'Analyzed', outcome: 'completed' }, { caller: CHAT_A });
   await receiver().scan();
   assert.equal((await entries()).queued.state, 'completed');
   assert.equal(host.followups().length, 1);
@@ -191,7 +199,7 @@ test('periodic scan discovers mail even if watch hints are missed and a result c
       found = (await receiver.snapshot()).entries['result-incoming'];
       if (found) break;
     }
-    assert.equal(found?.state, 'unbound');
+    assert.deepEqual([found?.state, found?.reason], ['manual', 'result'], 'a result is never relayed to a chat');
     assert.equal((await fsp.readdir(path.join(root, 'agents'))).includes('dsh'), false);
   } finally { await receiver.stop(); await removeTree(root); }
 });
@@ -222,6 +230,6 @@ test('prototype property identifiers survive persisted queue roundtrips', async 
     for (const id of ['constructor', 'toString']) await createMailbox({ root }).deliver({ ...letter(id, { created_at: '2020-01-01T00:00:00Z' }), from: 'dsh', to: 'codex' });
     await receiver.scan(); await createReceiver(options).scan();
     const state = await receiver.snapshot();
-    for (const id of ['constructor', 'toString']) { assert.equal(Object.hasOwn(state.entries, id), true); assert.equal(state.entries[id].state, 'unbound'); }
+    for (const id of ['constructor', 'toString']) { assert.equal(Object.hasOwn(state.entries, id), true); assert.equal(state.entries[id].state, 'manual'); }
   } finally { await removeTree(root); }
 });

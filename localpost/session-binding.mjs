@@ -16,7 +16,7 @@ import { acquireLease, atomicWrite, assertId, safePath } from './fs-safe.mjs';
  */
 export const STATE_SCHEMA = 'localpost-session-state-v1';
 export const MODES = Object.freeze(['manual', 'auto']);
-export const CLAIM_STATUSES = Object.freeze(['reserved', 'dispatching', 'accepted', 'done', 'released', 'needs_reconcile']);
+export const CLAIM_STATUSES = Object.freeze(['reserved', 'dispatching', 'accepted', 'completing', 'done', 'released', 'needs_reconcile']);
 export const ROTATION_STATES = Object.freeze(['active', 'frozen', 'drained', 'handoff_written', 'candidate_created', 'verified', 'switched', 'retired']);
 // The only scope a binding can carry. Implementation authority is never part of a binding or a handoff.
 export const ANALYSIS_REPLY = 'analysis-reply';

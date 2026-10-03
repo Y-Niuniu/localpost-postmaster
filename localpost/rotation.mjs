@@ -21,13 +21,19 @@ export { ROTATION_STATES };
  *   findSession(id) → { exists }      capabilities.lookupAuthoritative: is "absent" proof that it was never created?
  *   verifySession(id, expected) → the values the host actually sees, compared one by one with `expected`:
  *     { hostId, cwd, identity, generation, sessionId, authority, handoffDigest, tools: [names], crossIdentityRejected }
- *   revokeSession(id, { sessionId, generation, letters }) → { revoked: true, sessionId, generation, barrier }
- *     capabilities.revocationBarrier: proof that the old session finished its turn and lost these letters.
+ *   revokeSession(id, { sessionId, generation, letters, lettersDigest }) → { revoked: true, sessionId, generation, lettersDigest, barrier }
+ *     capabilities.revocationBarrier: proof that the old session finished its turn and lost these letters. The barrier
+ *     is bound to lettersDigest (sha256 of the sorted [{ id, digest }] set); an answer for any other set proves nothing.
  *     Without that proof, letters the old session accepted stay pinned to it and never move.
  *   retireSession(id)                  letters moved away from the old session are held until it succeeds; a failure
  *     sends them back to their original owner, pinned, and stops the rotation for an operator (fail closed).
  */
 const REASONS = ['capacity', 'context', 'operator'];
+// The letters a generation's session holds, as the sorted [{ id, digest }] set a revocation barrier must be bound to.
+const acceptedSet = (state, generation) => Object.values(state.claims)
+  .filter(claim => claim.owner.generation === generation && claim.status === 'accepted')
+  .map(claim => ({ id: claim.letter, digest: claim.digest })).sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+const setDigest = set => createHash('sha256').update(JSON.stringify(set)).digest('hex');
 // The mailbox tools a verified session must actually have (hosts may prefix them, e.g. mcp__localpost__).
 const MAILBOX_TOOLS = ['mailbox_inbox', 'mailbox_read', 'mailbox_reply', 'mailbox_archive'];
 const sha256 = text => createHash('sha256').update(text).digest('hex');
@@ -200,21 +206,22 @@ export function createRotation({ store, host, handoffWriter, maxTransfers = 1 } 
   }
 
   // Asks the host to prove the old session lost the letters it accepted. Repeating it after a crash asks again.
-  async function revoke(journal, letters) {
-    if (host.capabilities?.revocationBarrier !== true || typeof host.revokeSession !== 'function') return { proven: false, reason: 'not_supported', letters };
-    const expected = { sessionId: journal.from.id, generation: journal.generation, letters };
+  // The answer must name the digest of exactly this set: a stale or cached barrier for other letters is not a proof.
+  async function revoke(journal, set) {
+    const letters = set.map(entry => entry.id), lettersDigest = setDigest(set);
+    if (host.capabilities?.revocationBarrier !== true || typeof host.revokeSession !== 'function') return { proven: false, reason: 'not_supported', letters, lettersDigest };
+    const expected = { sessionId: journal.from.id, generation: journal.generation, letters, lettersDigest };
     let answer;
     try { answer = await host.revokeSession(journal.from.id, expected); }
-    catch (error) { return { proven: false, reason: 'revoke_failed', message: String(error.message ?? error), letters }; }
+    catch (error) { return { proven: false, reason: 'revoke_failed', message: String(error.message ?? error), letters, lettersDigest }; }
     const proven = answer?.revoked === true && answer.sessionId === expected.sessionId && answer.generation === expected.generation &&
-      typeof answer.barrier === 'string' && answer.barrier.trim() !== '';
-    return proven ? { proven: true, barrier: answer.barrier, letters } : { proven: false, reason: 'revoke_unproven', letters };
+      answer.lettersDigest === lettersDigest && typeof answer.barrier === 'string' && answer.barrier.trim() !== '';
+    return proven ? { proven: true, barrier: answer.barrier, letters, lettersDigest } : { proven: false, reason: 'revoke_unproven', letters, lettersDigest };
   }
 
   async function switchOver(identity, journal) {
     const state = await store.read(identity);
-    const accepted = Object.values(state.claims).filter(claim => claim.owner.generation === journal.generation && claim.status === 'accepted')
-      .map(claim => claim.letter).sort();
+    const accepted = acceptedSet(state, journal.generation);
     const revocation = accepted.length ? await revoke(journal, accepted) : { proven: false, reason: 'nothing_to_revoke', letters: [] };
     return step(identity, journal.generation, 'verified', (draft, j, at) => {
       const { binding } = draft;
@@ -222,15 +229,14 @@ export function createRotation({ store, host, handoffWriter, maxTransfers = 1 } 
           binding.version !== j.binding_version || binding.session.id !== j.from.id)
         return { failure: { code: 'switch_conflict', needs: 'operator', message: 'the binding changed while the rotation was in progress' } };
       const session = j.candidate.session;
-      // The proof covers exactly the letters it was asked for; anything accepted since then is not covered.
-      const current = Object.values(draft.claims).filter(claim => claim.owner.generation === j.generation && claim.status === 'accepted')
-        .map(claim => claim.letter).sort();
-      const covered = revocation.proven === true && JSON.stringify(current) === JSON.stringify(revocation.letters);
+      // The proof covers exactly the letters it was asked for; anything accepted (or changed) since then is not covered.
+      const covered = revocation.proven === true && setDigest(acceptedSet(draft, j.generation)) === revocation.lettersDigest;
       const transfer = transferForSwitchIn(draft, j.generation, { generation: j.next, session: session.id }, { maxTransfers, revoked: covered }, at);
       Object.assign(binding, { version: binding.version + 1, generation: j.next, session: { ...session }, state: 'active', frozen: null,
         source: `rotation:${draft.identity}:g${j.generation}`, since: at });
       draft.context = null;
-      j.revocation = covered || !revocation.proven ? revocation : { proven: false, reason: 'revocation_stale', letters: revocation.letters };
+      j.revocation = covered || !revocation.proven ? revocation
+        : { proven: false, reason: 'revocation_stale', letters: revocation.letters, lettersDigest: revocation.lettersDigest };
       j.transfer = transfer;
       return { to: 'switched', detail: transfer };
     });
@@ -351,7 +357,7 @@ export function auditState(state) {
     const { generation, session } = claim.owner;
     if (generation > binding.generation) problems.push(`future_owner:${claim.letter}`);
     else if (sessionOf.get(generation) !== session) problems.push(`owner_session_mismatch:${claim.letter}`);
-    if (['reserved', 'dispatching', 'accepted'].includes(claim.status) && generation !== binding.generation) problems.push(`stale_owner:${claim.letter}`);
+    if (['reserved', 'dispatching', 'accepted', 'completing'].includes(claim.status) && generation !== binding.generation) problems.push(`stale_owner:${claim.letter}`);
     // A hold exists only between the switch and the retire of the rotation that moved the letter.
     if (claim.hold && !(claim.status === 'reserved' && journals.some(journal => journal.state === 'switched' && journal.transfer?.transferred?.includes(claim.letter))))
       problems.push(`stray_hold:${claim.letter}`);

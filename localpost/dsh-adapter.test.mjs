@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createDshAdapter } from './dsh-adapter.mjs';
 import { createSessionStore } from './session-binding.mjs';
-import { createBindingProvider, bindFromChatAction } from './binding-provider.mjs';
+import { createBindingProvider, bindFromChatAction, arrivalRoute } from './binding-provider.mjs';
 import { createLedgerAcceptance } from './ledger-acceptance.mjs';
 import { envelopeDigest } from './mailbox.mjs';
 import { createFakeDshHost } from './fixtures/fake-dsh-host.mjs';
@@ -30,7 +30,7 @@ async function setup(t, { capabilities, version = '0.2.0-rc.2', bound = true } =
   const make = () => createDshAdapter({ ctx: host.ctx, runtimeVersion: version,
     bindingProvider: createBindingProvider({ store: createSessionStore({ root }), identity: 'dsh', host }),
     acceptance: createLedgerAcceptance({ store: createSessionStore({ root }), identity: 'dsh' }) });
-  return { root, host, store, make, adapter: make() };
+  return { root, host, store, make, adapter: make(), route: bound ? arrivalRoute(await store.read('dsh')).route : null };
 }
 const request = (route, extra = {}) => ({
   route, digest, idempotencyKey: 'dsh:letter-a', source: { kind: 'plugin', plugin: 'localpost', form: 'relay' },
@@ -43,15 +43,13 @@ test('without the host binding capability a live agent enables nothing', async t
   assert.equal(adapter.capabilities.trustedBinding, false);
   assert.ok(adapter.diagnostics().reasons.includes('trustedBinding'));
   assert.equal(adapter.diagnostics().dispatchEnabled, false);
-  await assert.rejects(adapter.captureBinding(), { code: 'binding_unverified' });
   await assert.rejects(adapter.submit({}), { code: 'runtime_capabilities_unverified' });
   assert.equal(host.followups().length, 0);
 });
 
 test('the arrival route A is kept and the mail goes as a plugin relay after a whole turn', async t => {
-  const { adapter, host } = await setup(t);
+  const { adapter, host, route } = await setup(t);
   assert.equal(adapter.diagnostics().dispatchEnabled, true);
-  const route = await adapter.captureBinding();
   assert.deepEqual([route.threadId, route.cwd, route.generation], ['chat-a', CWD_A, 1]);
   const receipt = await adapter.submit(request(route));
   assert.deepEqual(receipt, { accepted: true, durable: true, receipt: 'ledger:dsh:letter-a:g1' });
@@ -63,8 +61,7 @@ test('the arrival route A is kept and the mail goes as a plugin relay after a wh
 });
 
 test('the same mail key wakes the chat once, also through a restarted adapter', async t => {
-  const { adapter, make, host } = await setup(t);
-  const route = await adapter.captureBinding();
+  const { adapter, make, host, route } = await setup(t);
   await adapter.submit(request(route));
   const again = await make().submit(request(route));
   assert.equal(again.deduplicated, true);
@@ -72,8 +69,7 @@ test('the same mail key wakes the chat once, also through a restarted adapter', 
 });
 
 test('an offline bound chat stays unavailable and is never resumed, created or replaced', async t => {
-  const { adapter, host } = await setup(t);
-  const route = await adapter.captureBinding();
+  const { adapter, host, route } = await setup(t);
   host.setOnline('chat-a', false);
   await assert.rejects(adapter.submit(request(route)), { code: 'binding_unverified' });
   assert.equal(host.followups().length, 0);
@@ -84,8 +80,7 @@ test('an offline bound chat stays unavailable and is never resumed, created or r
 });
 
 test('a route whose binding was replaced is refused before acceptance and never reaches chat B', async t => {
-  const { adapter, host, root } = await setup(t);
-  const route = await adapter.captureBinding();
+  const { adapter, host, root, route } = await setup(t);
   const file = path.join(root, 'runtime/sessions/dsh.json');
   const state = JSON.parse(fs.readFileSync(file, 'utf8'));
   state.binding = { ...state.binding, session: { host: 'local', id: 'chat-b', cwd: 'C:/work/project-b' } };
@@ -97,16 +92,14 @@ test('a route whose binding was replaced is refused before acceptance and never 
 });
 
 test('changed policy cannot turn agent mail into user input or next-step steering', async t => {
-  const { adapter, host } = await setup(t);
-  const route = await adapter.captureBinding();
+  const { adapter, host, route } = await setup(t);
   for (const extra of [{ after: 'next-step' }, { scope: 'implementation' }, { source: { kind: 'user' } }, { source: { kind: 'plugin', plugin: 'localpost', form: 'steer' } }])
     await assert.rejects(adapter.submit(request(route, extra)), { code: 'delivery_policy_invalid' });
   assert.equal(host.followups().length, 0);
 });
 
 test('mail references and keys must stay in the configured recipient mailbox', async t => {
-  const { adapter, host } = await setup(t);
-  const route = await adapter.captureBinding();
+  const { adapter, host, route } = await setup(t);
   await assert.rejects(adapter.submit(request(route, { messageReference: { agent: 'codex', id: 'letter-a' } })), { code: 'delivery_reference_invalid' });
   await assert.rejects(adapter.submit(request(route, { idempotencyKey: 'dsh:other' })), { code: 'delivery_reference_invalid' });
   assert.equal(host.followups().length, 0);
@@ -122,7 +115,7 @@ test('an unsupported DSH version cannot enable automatic dispatch', async t => {
 test('an acceptance provider may not enqueue twice, and an undurable answer is not a receipt', async t => {
   const { host, root } = await setup(t);
   const bindingProvider = createBindingProvider({ store: createSessionStore({ root }), identity: 'dsh', host });
-  const route = await bindingProvider.capture();
+  const route = arrivalRoute(await createSessionStore({ root }).read('dsh')).route;
   const twice = createDshAdapter({ ctx: host.ctx, runtimeVersion: '0.2.0-rc.2', bindingProvider,
     acceptance: { durable: true, idempotent: true, acceptOnce: async (_, enqueue) => { await enqueue(); await enqueue(); } } });
   await assert.rejects(twice.submit(request(route)), { code: 'acceptance_contract_invalid' });

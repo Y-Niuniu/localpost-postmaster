@@ -5,7 +5,10 @@ import { MODES } from './session-binding.mjs';
 /**
  * The per-letter owner ledger, shared by the manual and the automatic consumer of an identity.
  * A claim names the single owner of a letter (generation + session) and where its delivery stands:
- *   reserved → dispatching → accepted → done
+ *   reserved → dispatching → accepted → completing → done
+ *   completing       write-ahead record of the owner's reply/archive, written before anything is published: a crash
+ *                    after publishing leaves it here (never accepted again), the owner's retry finishes it, and a
+ *                    rotation never moves it
  *   released         the host said "not received" (or an operator requeued it): may be reserved again
  *   needs_reconcile  uncertain: pinned to its generation, never redelivered on a guess, closed only by
  *                    that generation's own result or by an operator
@@ -19,10 +22,10 @@ const DIGEST = /^[a-f0-9]{64}$/;
 export const claimOf = (state, id) => Object.hasOwn(state.claims, id) ? state.claims[id] : undefined;
 
 export function occupancy(state, generation = state.binding.generation) {
-  const count = { reserved: 0, dispatching: 0, accepted: 0, done: 0, needs_reconcile: 0 };
+  const count = { reserved: 0, dispatching: 0, accepted: 0, completing: 0, done: 0, needs_reconcile: 0 };
   for (const claim of Object.values(state.claims))
     if (claim.owner.generation === generation && Object.hasOwn(count, claim.status)) count[claim.status]++;
-  const settled = count.accepted + count.done + count.needs_reconcile;
+  const settled = count.accepted + count.completing + count.done + count.needs_reconcile;
   return { generation, capacity: state.binding.capacity, ...count, settled, total: settled + count.reserved + count.dispatching };
 }
 // Capacity is the only automatic rotation trigger besides context telemetry. Elapsed time never is.
@@ -124,8 +127,24 @@ export function completeIn(state, id, { generation, session } = {}, at) {
     return { ok: false, reason: 'not_owner', claim };
   }
   if (claim.status === 'done') return { ok: true, reused: true, claim };
-  if (!['accepted', 'needs_reconcile'].includes(claim.status)) return { ok: false, reason: 'not_accepted', claim };
+  if (!['accepted', 'completing', 'needs_reconcile'].includes(claim.status)) return { ok: false, reason: 'not_accepted', claim };
   return { ok: true, claim: move(claim, 'done', at) };
+}
+
+/**
+ * Write-ahead step of the owner's reply or archive (mailbox.mjs), persisted before anything is published.
+ * The claim stays `completing` until the publication is followed by completeIn, so a crash in between can neither
+ * return the letter to `accepted` nor let a rotation move it; repeating the same operation finishes it.
+ */
+export function beginCompletionIn(state, id, { generation, session } = {}, { op, result } = {}, at) {
+  if (!['reply', 'archive'].includes(op)) throw new Error('A completion is a reply or an archive');
+  const claim = claimOf(state, id);
+  if (!claim) return { ok: false, reason: 'not_claimed' };
+  if (claim.owner.generation !== generation || claim.owner.session !== session) return { ok: false, reason: 'not_owner', claim };
+  if (['completing', 'done'].includes(claim.status)) return { ok: true, reused: true, claim };
+  if (!['accepted', 'needs_reconcile'].includes(claim.status)) return { ok: false, reason: 'not_accepted', claim };
+  const completion = { op, ...(result ? { result } : {}), from: claim.status, ...(claim.reason ? { reason: claim.reason } : {}), at };
+  return { ok: true, claim: move(claim, 'completing', at, { completion }) };
 }
 
 /** Operator reconciliation of an uncertain letter; the operator must name the version they looked at. */
@@ -164,8 +183,10 @@ export function transferForSwitchIn(state, from, to, { maxTransfers = 1, revoked
     } else if (claim.status === 'accepted' && revoked && claim.transfers < maxTransfers) {
       Object.assign(claim, { transferred_from: { ...claim.owner }, owner: { ...to }, transfers: claim.transfers + 1, hold: 'retire' });
       moved.transferred.push(move(claim, 'reserved', at, { reason: 'transferred' }).letter);
-    } else if (['accepted', 'dispatching'].includes(claim.status)) {
-      const reason = claim.status === 'dispatching' ? 'dispatch_interrupted' : revoked ? 'transfer_limit' : 'revocation_unproven';
+    } else if (['accepted', 'dispatching', 'completing'].includes(claim.status)) {
+      // A completion in progress (or cut short by a crash) has already published, or is publishing, the owner's answer.
+      const reason = claim.status === 'dispatching' ? 'dispatch_interrupted' : claim.status === 'completing' ? 'completion_interrupted'
+        : revoked ? 'transfer_limit' : 'revocation_unproven';
       moved.pinned.push(move(claim, 'needs_reconcile', at, { reason }).letter);
     }
   }
@@ -228,6 +249,8 @@ export const beginDispatch = (store, identity, id, { expectedVersion } = {}) =>
 export const settle = (store, identity, id, outcome) => store.update(identity, state => settleIn(state, id, outcome, store.at()));
 export const claimManual = (store, identity, request) => store.update(identity, state => claimManualIn(state, request, store.at()));
 export const complete = (store, identity, id, owner) => store.update(identity, state => completeIn(state, id, owner, store.at()));
+export const beginCompletion = (store, identity, id, owner, intent) =>
+  store.update(identity, state => beginCompletionIn(state, id, owner, intent, store.at()));
 export const resolveUncertain = (store, identity, id, decision) => store.update(identity, state => resolveUncertainIn(state, id, decision, store.at()));
 export const requestMode = (store, identity, mode, options) => store.update(identity, state => requestModeIn(state, mode, options, store.at()));
 
