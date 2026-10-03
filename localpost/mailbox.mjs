@@ -112,14 +112,16 @@ export function createMailbox({ root, identity } = {}) {
   /**
    * Only the host can say which chat is calling: DSH hands native tools the calling agent (execution.agent), while its
    * MCP client forwards nothing but the tool name and arguments. The caller therefore comes from trusted in-process
-   * code, never from tool arguments, and a letter that has an owner is worked on by that owner alone.
+   * code, never from tool arguments, and a letter that has an owner is worked on by that owner alone. An owner is a chat
+   * in a workspace - the current binding's session, or the one a rotation moved away from (rotations[g].from) - so the
+   * proof names host, session and workspace, and all three must match.
    */
   function proveOwner(state, owner, caller, id) {
-    if (typeof caller?.host !== 'string' || !caller.host || typeof caller.session !== 'string' || !caller.session)
-      throw Object.assign(new Error(`CALLER_UNVERIFIED: letter ${id} has an owner in the claim ledger and nothing proves which chat is calling`), { code: 'CALLER_UNVERIFIED' });
-    const host = owner.generation === state.binding.generation ? state.binding.session.host : state.rotations[owner.generation]?.from.host;
-    if (caller.session !== owner.session || caller.host !== host)
-      throw Object.assign(new Error(`NOT_LETTER_OWNER: letter ${id} belongs to another chat of this identity`), { code: 'NOT_LETTER_OWNER' });
+    if (![caller?.host, caller?.session, caller?.cwd].every(value => typeof value === 'string' && value !== ''))
+      throw Object.assign(new Error(`CALLER_UNVERIFIED: letter ${id} has an owner in the claim ledger and nothing proves which chat, in which workspace, is calling`), { code: 'CALLER_UNVERIFIED' });
+    const where = owner.generation === state.binding.generation ? state.binding.session : state.rotations[owner.generation]?.from;
+    if (caller.session !== owner.session || caller.host !== where?.host || caller.cwd !== where?.cwd)
+      throw Object.assign(new Error(`NOT_LETTER_OWNER: letter ${id} belongs to another chat or workspace of this identity`), { code: 'NOT_LETTER_OWNER' });
   }
   /** The ledger owner the caller works on this letter as, or null for a letter outside the ledger; anything else throws. */
   async function takeLetter(agent, envelope, caller) {

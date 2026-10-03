@@ -18,7 +18,7 @@ const tempRoot = path.resolve(import.meta.dirname, '../.localpost-tmp/receiver')
 const AUTHORITY = { scope: 'analysis-reply', source: 'policy:test' };
 const CWD_A = 'C:/work/project-a';
 // The host's word for which chat is calling (DSH: execution.agent of a native tool call).
-const CHAT_A = { host: 'local', session: 'chat-a' };
+const CHAT_A = { host: 'local', session: 'chat-a', cwd: CWD_A };
 const letter = (id, extra = {}) => ({ id, thread_id: id, from: 'codex', to: 'dsh', type: 'task', subject: 'test', body: 'Analyze only',
   budget: 'standard', created_at: new Date().toISOString(), ...extra });
 

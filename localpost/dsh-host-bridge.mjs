@@ -3,6 +3,7 @@ import { isAbsolute } from 'node:path';
 import { assertId } from './fs-safe.mjs';
 import { ANALYSIS_REPLY } from './session-binding.mjs';
 import { bindFromChatAction, attestedNow } from './binding-provider.mjs';
+import { switchMode } from './letter-claims.mjs';
 
 /**
  * The caller-attested native host bridge for the installed DSH.
@@ -203,8 +204,12 @@ export function createDshHostBridge({ ctx, runtimeVersion, store, identity, host
         if (!boundTo(state, caller)) {
           return { kind: 'error', text: 'LocalPost: only the currently bound chat may unbind. Run this in that chat.' };
         }
-        await store.update(identity, current => { current.binding.mode = 'manual'; });
-        // Confirm against what was actually persisted, not against the draft the mutator saw.
+        // The mode switch protocol (letter-claims.mjs switchMode): freeze → drain → CAS under the identity's actor lease, so no
+        // dispatch is in flight, an interrupted one is isolated for reconciliation, and the binding version moves with the mode.
+        const switched = await switchMode(store, identity, 'manual');
+        if (switched?.skipped) return { kind: 'error', text: 'LocalPost: mail is being delivered right now, so nothing changed. Run the unbind again in a moment.' };
+        if (!switched?.ok) return { kind: 'error', text: 'LocalPost: the unbind was refused (' + String(switched?.reason ?? 'unknown') + '); nothing changed.' };
+        // Confirm against what was actually persisted, not against what the switch reported.
         const after = await store.read(identity);
         if (after?.binding?.mode !== 'manual') return { kind: 'error', text: 'LocalPost: could not confirm the unbind; automatic routing may still be on.' };
         return { kind: 'success', text: 'LocalPost: automatic routing is off for NEW mail. Mail already accepted keeps its original owner and must be reconciled there; it is not moved to another chat.' };

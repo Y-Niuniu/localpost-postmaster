@@ -23,8 +23,8 @@ import { removeTreeSync } from './temp-tree.mjs';
 const tempRoot = path.resolve(import.meta.dirname, '../.localpost-tmp/t1-review');
 const AUTHORITY = { scope: 'analysis-reply', source: 'policy:test' };
 const CWD_A = 'C:/work/project-a';
-const CHAT_A = { host: 'local', session: 'chat-a' };
-const CHAT_B = { host: 'local', session: 'chat-b' };
+const CHAT_A = { host: 'local', session: 'chat-a', cwd: CWD_A };
+const CHAT_B = { host: 'local', session: 'chat-b', cwd: 'C:/work/project-b' };
 const letter = (id, extra = {}) => ({ id, thread_id: id, from: 'codex', to: 'dsh', type: 'task', subject: 'Analyze', body: 'Analyze only',
   budget: 'standard', created_at: '2026-10-03T00:00:00.000Z', ...extra });
 const crashFixture = path.join(import.meta.dirname, 'fixtures/claim-crash-window.mjs');
@@ -98,7 +98,7 @@ test('P0-2: a letter delivered to chat A can be handled only by a caller the hos
   // Another chat of the same identity, proven by the host: refused as not the owner.
   for (const action of [() => mail.take('dsh', 'one', { caller: CHAT_B }), () => mail.reply('dsh', { reply_to: 'one', body: 'x' }, { caller: CHAT_B }),
     () => mail.archive('dsh', 'one', { caller: CHAT_B })]) await assert.rejects(action(), { code: 'NOT_LETTER_OWNER' });
-  await assert.rejects(mail.take('dsh', 'one', { caller: { host: 'other-host', session: 'chat-a' } }), { code: 'NOT_LETTER_OWNER' }, 'same chat id on another host');
+  await assert.rejects(mail.take('dsh', 'one', { caller: { ...CHAT_A, host: 'other-host' } }), { code: 'NOT_LETTER_OWNER' }, 'same chat id on another host');
   // DSH's MCP client forwards only the tool name and arguments, so the MCP server cannot tell chats apart either.
   const server = createMcpServer({ root, identity: 'dsh' });
   const answer = await server.handle({ id: 1, method: 'tools/call', params: { name: 'mailbox_reply', arguments: { agent: 'dsh', reply_to: 'one', body: 'x' } } });
@@ -118,7 +118,7 @@ async function crashInWindow(t, op, point = 'after-archive') {
   const w = await world(t);
   await w.admin.deliver(letter('one'));
   assert.equal((await w.acceptForA('one')).accepted, true);
-  const child = spawn(process.execPath, [crashFixture, w.root, op, 'one', 'chat-a', point], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, [crashFixture, w.root, op, 'one', 'chat-a', point, CWD_A], { stdio: ['ignore', 'pipe', 'pipe'] });
   let output = '';
   child.stdout.on('data', chunk => { output += chunk; });
   child.stderr.on('data', chunk => { output += chunk; });
@@ -311,10 +311,32 @@ test('P0-2: after a rotation, a letter pinned to the old generation is closed on
   saved.rotations['1'].from.host = 'old-host';
   fs.writeFileSync(file, JSON.stringify(saved));
   const mail = createMailbox({ root, identity: 'codex' });
-  for (const caller of [{ host: 'fake', session: candidateSessionId('codex', 2, 1) }, { host: 'fake', session: 'session-1' }])
+  for (const caller of [{ host: 'fake', session: candidateSessionId('codex', 2, 1), cwd: 'C:/work/project-a' }, { host: 'fake', session: 'session-1', cwd: 'C:/work/project-a' }])
     await assert.rejects(mail.reply('codex', { reply_to: 'open-1', body: 'x' }, { caller }), { code: 'NOT_LETTER_OWNER' });
-  const done = await mail.reply('codex', { reply_to: 'open-1', body: 'Done', outcome: 'completed' }, { caller: { host: 'old-host', session: 'session-1' } });
+  const done = await mail.reply('codex', { reply_to: 'open-1', body: 'Done', outcome: 'completed' }, { caller: { host: 'old-host', session: 'session-1', cwd: 'C:/work/project-a' } });
   assert.equal(done.ledger, 'done');
+  assert.equal((await store.read('codex')).claims['open-1'].status, 'done');
+});
+
+// Fifth round (codex R4 P1 on the host bridge): an owner is a chat IN A WORKSPACE. The same session id in another workspace
+// is not the owner - for the current generation and for an earlier one - while the attested old owner still finishes its mail.
+test('R5: the same session id in another workspace is not the owner of the current generation\'s letter', async t => {
+  const { acceptForA, admin, mail } = await world(t);
+  await admin.deliver(letter('one'));
+  assert.equal((await acceptForA('one')).accepted, true);
+  for (const action of [() => mail.take('dsh', 'one', { caller: { ...CHAT_A, cwd: 'C:/work/elsewhere' } }),
+    () => mail.reply('dsh', { reply_to: 'one', body: 'x' }, { caller: { ...CHAT_A, cwd: 'C:/work/elsewhere' } }),
+    () => mail.archive('dsh', 'one', { caller: { ...CHAT_A, cwd: 'C:/work/elsewhere' } })]) await assert.rejects(action(), { code: 'NOT_LETTER_OWNER' });
+  await assert.rejects(mail.take('dsh', 'one', { caller: { host: 'local', session: 'chat-a' } }), { code: 'CALLER_UNVERIFIED' }, 'a proof without a workspace is incomplete');
+  assert.equal((await mail.take('dsh', 'one', { caller: CHAT_A })).envelope.id, 'one');
+});
+
+test('R5: after a rotation the old owner finishes its letter only from its own workspace', async t => {
+  const { root, store } = await rotatedCodex(t, { revoke: 'refuse' });
+  const mail = createMailbox({ root, identity: 'codex' });
+  const oldA = { host: 'fake', session: 'session-1', cwd: 'C:/work/project-a' };
+  await assert.rejects(mail.reply('codex', { reply_to: 'open-1', body: 'x' }, { caller: { ...oldA, cwd: 'C:/work/elsewhere' } }), { code: 'NOT_LETTER_OWNER' });
+  assert.equal((await mail.reply('codex', { reply_to: 'open-1', body: 'Done', outcome: 'completed' }, { caller: oldA })).ledger, 'done');
   assert.equal((await store.read('codex')).claims['open-1'].status, 'done');
 });
 

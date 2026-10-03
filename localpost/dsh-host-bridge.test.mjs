@@ -6,6 +6,7 @@ import { COMMANDS, chatSessionOf, createDshHostBridge } from './dsh-host-bridge.
 import { createSessionStore } from './session-binding.mjs';
 import { arrivalRoute, createBindingProvider } from './binding-provider.mjs';
 import { removeTree } from './temp-tree.mjs';
+import { acquireLease } from './fs-safe.mjs';
 
 // Codex R2: tests must not depend on the system temp dir (its EPERM/realpath behaviour made runs flaky).
 const TMP = path.resolve(import.meta.dirname, '..', '.localpost-tmp', 'dsh-host-bridge');
@@ -197,6 +198,25 @@ test('unbind works only from the bound chat and only stops routing for new mail'
   const state = await store.read('dsh');
   assert.equal(state.binding.mode, 'manual');
   assert.deepEqual(arrivalRoute(state), { route: null, reason: 'binding_manual' });
+});
+
+test('unbind goes through the mode switch protocol: never under an in-flight dispatch, and the binding version moves', async () => {
+  const { root, bridge, host, store } = await bridgeFor('unbind-protocol');
+  bridge.registerCommands();
+  const a = chatAgent('chat-A', 'C:/work/A');
+  await find(host.definitions, COMMANDS.bind).handler({ agent: a });
+  const before = (await store.read('dsh')).binding.version;
+  // The receiver dispatching mail holds the identity's actor lease; switching modes under it is what the protocol forbids.
+  const lease = await acquireLease(root, { name: '.session-actor-dsh.lock' });
+  const busy = await find(host.definitions, COMMANDS.unbind).handler({ agent: a });
+  assert.equal(busy.kind, 'error');
+  assert.equal((await store.read('dsh')).binding.mode, 'auto', 'nothing changed while a dispatch may be in flight');
+  await lease.release();
+  const ok = await find(host.definitions, COMMANDS.unbind).handler({ agent: a });
+  assert.equal(ok.kind, 'success');
+  const { binding } = await store.read('dsh');
+  assert.deepEqual([binding.mode, binding.state], ['manual', 'active']);
+  assert.ok(binding.version > before, 'the CAS version moved with the mode');
 });
 
 test('status reports the binding without claiming more than the host can prove', async () => {
