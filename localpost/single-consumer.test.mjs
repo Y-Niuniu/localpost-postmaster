@@ -19,8 +19,8 @@ const AUTHORITY = { scope: 'analysis-reply', source: 'policy:test' };
 const CWD = 'C:/work/project-a';
 const TARGET = { identity: 'dsh', hostId: 'local', threadId: 'chat-a', cwd: CWD, generation: 1 };
 // The host's word for which chat is calling (DSH: execution.agent of a native tool call); never a tool argument.
-const CHAT_A = { host: 'local', session: 'chat-a' };
-const CHAT_B = { host: 'local', session: 'chat-b' };
+const CHAT_A = { host: 'local', session: 'chat-a', cwd: CWD };
+const CHAT_B = { host: 'local', session: 'chat-b', cwd: 'C:/work/project-b' };
 const letter = id => ({ id, thread_id: id, from: 'codex', to: 'dsh', type: 'task', subject: 'Analyze', body: 'Please analyze',
   budget: 'standard', created_at: '2026-10-03T00:00:00.000Z' });
 const accept = (acceptance, id, wake = async () => {}) =>

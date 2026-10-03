@@ -5,7 +5,7 @@
  *   after-archive（默认）：原信一被移进 archive，就在申请会话状态锁（把 claim 标成 done）之前自杀；
  *   before-publish：completing 意图已落盘，就在申请写锁（发布回执 / 归档）之前自杀，什么都还没发布。
  *
- * 用法：node claim-crash-window.mjs <根目录> <archive|reply> <信 id> <调用聊天 id> [after-archive|before-publish]
+ * 用法：node claim-crash-window.mjs <根目录> <archive|reply> <信 id> <调用聊天 id> [after-archive|before-publish] [调用聊天工作目录]
  * 没崩就在 stdout 打一行 'finished'；断言全部在父测试里做。
  * 为什么是落盘文件而不是 node -e：见 reply-then-hang.mjs 的说明（本机规则禁止内联脚本）。
  */
@@ -13,7 +13,7 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import { createMailbox } from '../mailbox.mjs';
 
-const [root, op, id, session, point = 'after-archive'] = process.argv.slice(2);
+const [root, op, id, session, point = 'after-archive', cwd] = process.argv.slice(2);
 if (!['after-archive', 'before-publish'].includes(point)) { process.stderr.write('unknown point ' + point + '\n'); process.exit(2); }
 let archived = false;
 const renameSync = fs.renameSync;
@@ -31,7 +31,7 @@ fsp.open = async (file, ...rest) => {
 };
 
 const mail = createMailbox({ root, identity: 'dsh' });
-const caller = { host: 'local', session };
+const caller = { host: 'local', session, ...(cwd ? { cwd } : {}) };
 if (op === 'archive') await mail.archive('dsh', id, { caller });
 else if (op === 'reply') await mail.reply('dsh', { reply_to: id, body: 'Done', outcome: 'completed' }, { caller });
 else { process.stderr.write('unknown op ' + op + '\n'); process.exit(2); }

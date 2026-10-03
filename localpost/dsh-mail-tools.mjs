@@ -10,10 +10,10 @@ import { assertId } from './fs-safe.mjs';
  * present a caller at all. Reading, replying and archiving an owned letter must be provable, and a
  * plain MCP call is refused.
  *
- * Every tool requires the calling chat to BE the identity's current bound chat (host, session and
- * workspace, exactly). That is stricter than the mailbox's own owner check on purpose: the mailbox
- * keeps an already-claimed letter with its original owner across a rebind, while listing and status
- * describe the binding, which only the bound chat may ask about.
+ * Listing and status describe the binding, so they require the calling chat to BE the identity's current
+ * bound chat (host, session and workspace, exactly). Reading, replying and archiving go through the
+ * mailbox's owner check instead (host, session and workspace of the letter's owner), which keeps an
+ * already-claimed letter with its original owner across a rotation.
  *
  * There is deliberately no send tool: this bridge finishes mail, it does not create it.
  */
@@ -49,13 +49,12 @@ export function attestedCaller(ctx, exec, hostId) {
 }
 
 /**
- * The effective definition the host would run for this very agent must still be the one this bridge
- * registered: a scoped registration can shadow a global one, and a shadowed tool must not run at all.
- */
-/**
- * The reason this execution must be denied, or undefined to let it through.
- * The host picks the effective definition BEFORE dispatch (resolveExecution = get(name, scope)), so a
- * scoped shadow means our own execute never runs: the check has to be a guard.
+ * The reason this execution must be denied, or undefined to let it through. A scoped registration can
+ * shadow a global one, and the host resolves the effective definition itself (resolveExecution =
+ * get(name, scope)), so when a shadow wins our own execute never runs: the check has to be a guard.
+ * What it proves: at guard time the definition this agent sees is the one this bridge registered.
+ * The host resolves again at dispatch, after the async around-dispatch stage, so a registration change
+ * inside that window is not covered; only in-process plugin code can register tools, and it is trusted.
  */
 export function shadowReason(tools, ours, exec) {
   if (!TOOL_NAMES.includes(exec?.name)) return undefined;
