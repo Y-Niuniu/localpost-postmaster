@@ -17,6 +17,18 @@ const AUTHORITY = { scope: 'analysis-reply', source: 'policy:test' };
 const CWD_A = 'C:/work/project-a';
 const digest = envelopeDigest({ id: 'letter-a', thread_id: 't', from: 'codex', to: 'dsh', type: 'task', subject: 's', body: 'b',
   budget: 'standard', created_at: '2026-10-03T00:00:00.000Z' });
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+// The host's pending-input rule, reproduced from dsh-agent-loop/lib/index.js:41-45 (the inbox projection) and
+// :190-194 (the splice mutation): two pending messages that share an id collide, and identity-less messages
+// collide as "undefined".
+function hostPendingIds(messages) {
+  const ids = new Set();
+  for (const message of messages) {
+    if (ids.has(message.id)) throw new Error(`message "${message.id}" is already pending`);
+    ids.add(message.id);
+  }
+}
 
 async function setup(t, { capabilities, version = '0.2.0-rc.2', bound = true } = {}) {
   fs.mkdirSync(tempRoot, { recursive: true });
@@ -78,6 +90,24 @@ test('the delivered source satisfies the host v4 producer-owned kind contract', 
   // form stays 'relay': the client renders form from a closed union and throws on unknown values (contract §6).
   assert.equal(delivered.source.form, 'relay');
   assert.equal(Object.hasOwn(delivered.source, 'plugin'), false, 'the V3 wrapper must not reach the host');
+  // Identity: the host reads a user/message back only when it carries a nonempty string id and role 'user'
+  // (dsh-session/lib/index.js:1191-1216, reached through adoptSessionEvent on the persistence read path).
+  assert.match(delivered.id, UUID_PATTERN);
+  assert.equal(delivered.role, 'user');
+});
+
+test('two pending deliveries carry distinct identities instead of colliding as undefined', async t => {
+  const { adapter, host, route } = await setup(t);
+  await adapter.submit(request(route));
+  await adapter.submit(request(route, { messageReference: { agent: 'dsh', id: 'letter-b' }, idempotencyKey: 'dsh:letter-b' }));
+  const delivered = host.followups();
+  assert.equal(delivered.length, 2, 'two distinct letters each wake the chat once');
+  assert.deepEqual(delivered.map(message => message.role), ['user', 'user']);
+  for (const message of delivered) assert.match(message.id, UUID_PATTERN);
+  assert.notEqual(delivered[0].id, delivered[1].id);
+  assert.doesNotThrow(() => hostPendingIds(delivered), 'distinct identities never collide while both are pending');
+  // Negative control: the pre-fix shape had no id, so the host rule collapses both messages onto "undefined".
+  assert.throws(() => hostPendingIds([{ source: {} }, { source: {} }]), { message: 'message "undefined" is already pending' });
 });
 
 test('the same mail key wakes the chat once, also through a restarted adapter', async t => {

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { assertId } from './fs-safe.mjs';
 
 const SUPPORTED_VERSION = '0.2.0-rc.2';
@@ -90,7 +91,19 @@ export function createDshAdapter({ ctx, runtimeVersion, bindingProvider, accepta
         throw failure('binding_unverified', 'The host could not verify the bound chat; the mail stays pending');
       }
       const messageReference = Object.freeze({ agent: reference.agent, id: reference.id });
+      // A delivered message must be a host UserMessage, not a bare {source, content} pair. The read-back path
+      // (dsh-session/lib/index.js:1191-1216 assertMessageEventShape, reached through adoptSessionEvent) rejects
+      // a message whose `id` is not a nonempty string ("lacks an identified message") and requires role 'user'
+      // for user/message; the inbox dedup also keys on message.id (dsh-agent-loop/lib/index.js:41-45, :190-194),
+      // where two identity-less messages collide as `undefined` ("message \"undefined\" is already pending").
+      //
+      // One delivery = one identity. acceptOnce (ledger-acceptance.mjs) writes ahead, deduplicates across
+      // restarts and never retries an uncertain enqueue, so this id is minted exactly once per wake-up and is
+      // never reused for a second delivery of the same letter. A future retry-after-uncertain-enqueue would
+      // have to persist the id with the acceptance record instead of minting it here.
       const message = Object.freeze({
+        id: randomUUID(),
+        role: 'user',
         source: HOST_RELAY_SOURCE,
         content: Object.freeze([Object.freeze({ type: 'text', text:
           `LocalPost agent mail relay. Authorized scope: analysis-reply. ` +

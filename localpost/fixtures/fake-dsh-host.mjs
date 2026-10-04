@@ -48,7 +48,7 @@ export function createFakeDshHost({ root, hostId = 'local', capabilities = { cha
           if (!thread?.online) return undefined;
           return {
             async followup(message) {
-              change(data => { data.followups.push({ threadId, source: message.source, text: message.content[0].text }); });
+              change(data => { data.followups.push({ threadId, id: message.id, role: message.role, source: message.source, text: message.content[0].text }); });
               if (load().followupFault === 'lost') throw new Error('connection lost after the followup was queued');
             },
           };
