@@ -194,9 +194,17 @@ T '4a exe hash 漂移 => 拒绝' { Refused { EGate-AssertHash 'C:\Windows\notepa
 T '4b 文件不存在 => 拒绝' { Refused { EGate-AssertHash (Join-Path $script:Tmp 'nope.exe') 'x' 'exe' } '^文件不存在：' | Out-Null }
 T '4c 非 git 目录（即使位于别的仓库之内）=> 基线拒绝' { $d = Join-Path $script:Tmp '4c'; New-Item -ItemType Directory -Path $d -ErrorAction Stop | Out-Null; Refused { EGate-AssertBaseline $d $script:RepoHead } '^不是 git 仓库：' | Out-Null }
 T '4d 正确 hash => 放行' { $h = (Get-FileHash 'C:\Windows\notepad.exe' -Algorithm SHA256).Hash.ToLowerInvariant(); Assert ((EGate-AssertHash 'C:\Windows\notepad.exe' $h 'exe') -ceq $h) '应返回同一 hash' }
-T '4e 目录里只有空 .git（git 会向上用外层仓库的 HEAD）=> 基线拒绝' {
-  $d = Join-Path $script:Tmp '4e'; New-Item -ItemType Directory -Path (Join-Path $d '.git') -Force -ErrorAction Stop | Out-Null
-  Refused { EGate-AssertBaseline $d $script:RepoHead } '^仓库根不符' | Out-Null
+T '4e 外层真仓库 + 内含空 .git 的子目录 => 基线拒绝（仓库根不符）' {
+  # 不依赖 TempBase 恰好位于某个仓库里：这里自己造一个真正的外层仓库，
+  # 再在其中放一个只有空 .git 的子目录，先断言 git 确实把它归到外层仓库，再断言门禁因根不符而拒绝。
+  $outer = Join-Path $script:Tmp '4e-outer'; New-Item -ItemType Directory -Path $outer -Force -ErrorAction Stop | Out-Null
+  & git -C $outer init --quiet 2>$null | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw ('夹具：无法初始化外层仓库：' + $outer) }
+  $inner = Join-Path $outer 'inner'; New-Item -ItemType Directory -Path (Join-Path $inner '.git') -Force -ErrorAction Stop | Out-Null
+  $top = (& git -C $inner rev-parse --show-toplevel 2>$null)
+  if ([string]::IsNullOrWhiteSpace($top)) { throw '夹具：git 未把子目录归到外层仓库' }
+  Assert (([IO.Path]::GetFullPath($top).TrimEnd('\')) -eq ([IO.Path]::GetFullPath($outer).TrimEnd('\'))) '夹具应解析到外层仓库'
+  Refused { EGate-AssertBaseline $inner $script:RepoHead } '^仓库根不符' | Out-Null
 }
 T '4f 夹具仓库干净且 HEAD 一致 => 放行（返回 HEAD）' { Assert ((EGate-AssertBaseline $script:Repo $script:RepoHead) -ceq $script:RepoHead) '应返回 HEAD' }
 T '5a 根只含普通文件标记 => 放行' {
