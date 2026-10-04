@@ -273,7 +273,8 @@ check('selectFresh 清理：超 30 天保留期的僵尸键被删（本轮仍存
  * 这一段就是「别把私人 topic 抄回源码」的机器判据 —— 谁抄回去、什么时候抄的，这里会红。
  * 同时锁住内核侧的两个死键，防止有人再把"看起来能配"的开关加回 DEFAULT_CONFIG。 */
 function readyLineOf(fileCfg) {
-  const root = join(TMP, 'cfgroot-' + Math.random().toString(36).slice(2))
+  const suffix = Math.random().toString(36).slice(2)
+  const root = join(TMP, 'cfgroot-' + suffix)
   mkdirSync(root, { recursive: true })
   if (fileCfg) writeFileSync(join(root, 'postmaster.config.json'), JSON.stringify(fileCfg))
   const seen = []
@@ -285,7 +286,13 @@ function readyLineOf(fileCfg) {
     setInterval() { return () => {} },
     tools: { register() { return () => {} } },
   }
-  mod.apply(ctx2, { root, kernelPath: join(root, 'no-such-kernel.mjs'), startupDelayMs: 0 })
+  mod.apply(ctx2, {
+    root, kernelPath: join(root, 'no-such-kernel.mjs'), startupDelayMs: 0,
+    // 显式给 fixture 的 state/log：不给就会落到真实用户目录（DSH_HOME 未设置时 = ~/.dsh/localpost-postmaster），
+    // 这正是 2026-10-04 复审指出的日志外溢缺陷；回归门禁见 localpost/test-isolation.test.mjs。
+    stateFile: join(TMP, 'cfgroot-' + suffix + '-state.json'),
+    logFile: join(TMP, 'cfgroot-' + suffix + '-plugin.log'),
+  })
   return (seen.join('\n').split('\n').filter((l) => l.includes('插件就绪')).pop() || '')
 }
 
