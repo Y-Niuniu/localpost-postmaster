@@ -2,6 +2,7 @@
 
 状态：**R3 已发布**；R3.1 基线升级候选**待复审、未部署、未整合**。基线：旧 = `864b19612ad4da0d86209612b73d6cf758c15d66`（已批准、当前运行门禁固定值）→ 新 = `3684e84e908801f3088ddaad37d3939b4eb3990e`（codex 已复审通过的技术修复）。生产自动派发 / receiver 仍关闭。
 R2 已停用：首次重建路径必然失败（`-ConfirmHostExited` 误绑到 RootPath），且 receiver/错误传播存在 fail-open，见文末「R3 修复」。
+> 可核指针（只记出处，不复抄全文、不另造副本）：本批次的复审与裁决来源 = 信 ID `codex-20261004-dsh-0dfe402-runbook-fix-001`；附件 `.mailbox/attachments/codex-0dfe402-baseline-review-20261004.md`（候选 0dfe402 复审）与 `.mailbox/attachments/codex-e2-3684e84-review-20261004.md`（运行修复 3684e84 复审）。
 
 ## 路径（发布后）
 - 启动入口：`C:\AI_ASSIST\work\localpost-six-gates-evidence\start-isolated-e.ps1`。只作用于 canonical 测试根，参数只有 `-RebuildRoot` / `-ContinueAcceptance`
@@ -39,23 +40,23 @@ R3 发布后，运行门禁固定 `main` = 旧基线，而两处消息契约修�
 1. **备份**：五文件复制到 `localpost-six-gates-evidence/baseline-upgrade-backup-<stamp>/`，逐字节核对 SHA256 = 上表发布版。
 2. **部署候选**：候选 commit 的 `ops/live-e/` 五文件复制回 `localpost-six-gates-evidence/`，核对 SHA256 = 上表候选版。
 3. **ff 整合**：`git -C tools/dsh-localpost-postmaster merge --ff-only 3684e84e908801f3088ddaad37d3939b4eb3990e`。
-4. **验证**：先跑 `pwsh -NoProfile -File e-gates.test.ps1`（末行 `RESULT pass=61 fail=0`），再按“阶段二”用 `-RebuildRoot`（首跑）或 `-ContinueAcceptance`（续跑）启动；预检应报 `OK 预检通过`。
+4. **验证**：先跑 `pwsh -NoProfile -File e-gates.test.ps1`（末行 `RESULT pass=61 fail=0`），再按“阶段二”用 `-ContinueAcceptance` 启动（**本批次主路径**；`-RebuildRoot` 仅见“阶段二”末尾的历史/全新独立试验说明，不在本步照做）；预检应报 `OK 预检通过`。
    > 步骤 2/3 必须在同一个维护窗口（宿主已完全退出）内连续完成。若先部署候选、后整合，两者之间的窗口里门禁会因 HEAD 仍等于旧基线而**按设计拒绝启动**（fail closed，无副作用）；要完全避开这个窗口，也可以先 ff 整合、再部署候选——两种顺序对门禁安全性等价。
-5. **回滚（任一步失败，逆序）**：
-   1. main 已 ff 时：`git -C tools/dsh-localpost-postmaster reset --hard 864b19612ad4da0d86209612b73d6cf758c15d66`（或 `git update-ref refs/heads/main <旧基线>`）；
-   2. 用备份目录的五文件覆盖 `localpost-six-gates-evidence/` 对应文件，核对 SHA256 = 发布版清单；
-   3. 测试根按下面“恢复（回滚）”一节处理（旁移的备份原样移回，不删除任何东西）。
-   回滚不需要改 profile、不需要重新 bind；生产自动派发始终关闭。
+   > **维护窗口与执行者**：备份、部署、ff 整合、验证这些维护动作，必须由**用户本人或用户指定、且不依赖该 DSH 宿主的执行者**完成——宿主完全退出后，承载在它里面的 agent 就不可用，不能把步骤留在关掉的会话里。整合目标**只是运行代码那个已审提交** `3684e84`，不是含 `ops/` 的候选 commit（`ops/` 不在 main 内，也不是整合对象）。若确需一个维护执行器，先报范围并复审，**不得**临时新增未审脚本。
+5. **失败即停（不做自动 Git 回退）**：任一步失败时——
+   1. **立即保持隔离派发关闭**：不启动、不重启、不重跑、不重建；
+   2. **原样保留**：新旧 commit 与分支、已部署的五文件及其备份、真实测试根、原日志与状态，一个都不动；
+   3. **只做核对**：检查当前 HEAD / 分支 / 索引 / 工作区，以及维护窗口开始后是否有外部改动；**任何一项与预期不符即停止并回报**；
+   4. **不自动执行 Git 历史回退**：`reset --hard` 与 `update-ref` 都不是本流程的动作（前者可能丢掉维护窗口里新增的用户改动；后者会让 HEAD/工作区与 refs 不一致，两者也不等价）。回退交**用户或获授权集成人**处理，且必须同时具备：明确目标、可恢复快照、对回滚本身的单独批准；完成后验证 HEAD/文件树一致、`status` 干净、门禁预期不变。
+   5. **未经完整回滚不得重启**：失败停机与存证不需要新的危险动作授权；但在完成上面这条完整回滚之前，不得重新启动验收，也不得为让门禁通过而忽略 git 状态。
+   6. **绑定按实际状态判断**：绑定是否保留取决于维护窗口里的真实状态，**不能无条件承诺“不需要重新 bind”**——当前 canonical 根只有 `.e-acceptance`、没有绑定与队列，重开后要按“阶段二”重新 `bind/status/start/status`。生产自动派发始终关闭。
 
 ## 用户需要亲自做的（阶段二）
+
+> **本批次（R3.1 基线升级）的主路径是 `-ContinueAcceptance`**：基线升级不重建真实根。`-RebuildRoot` 只保留在“历史/全新独立试验”说明里（见本节末），不放进本次可直接照做的步骤。
+
 1. **保存并完全退出桌面 DSH**：任务管理器里 `DeepSeek Harness` 进程为 0。若手动起过 `receiver-cli.mjs` 等指向测试根的 node 进程，也一并结束。
-2. **首次验收**（重建测试根并启动）：在普通 PowerShell 窗口原样执行：
-   ```
-   pwsh -NoProfile -File C:\AI_ASSIST\work\localpost-six-gates-evidence\start-isolated-e.ps1 -RebuildRoot
-   ```
-   正常输出依次为：`OK 预检通过` → `OK 停机门禁通过` → `OK 证据：…` → `OK 旁移 -> …localpost-e-test.bak-<stamp>` → `OK 重建完成…` → `OK 重建后置条件通过` → `OK 已启动，PID=…`。
-   出现任何一行以 `X ` 开头，表示**已拒绝且没有启动**（退出码 1），原因写在这一行，并且只报 PID，不打印命令行。
-3. **续跑同一验收**（E3/E4 需要重启宿主时；不重建、保留队列）：先完全退出 DSH，再原样执行：
+2. **按主路径启动（不重建）**：先完全退出 DSH，再原样执行：
    ```
    pwsh -NoProfile -File C:\AI_ASSIST\work\localpost-six-gates-evidence\start-isolated-e.ps1 -ContinueAcceptance
    ```
@@ -64,15 +65,26 @@ R3 发布后，运行门禁固定 `main` = 旧基线，而两处消息契约修�
    - 路径是规范 canonical 路径，且祖先链上没有重解析点；
    - 根下有根级普通文件 `.e-acceptance`；
    - 根内任何位置都没有 junction/符号链接（否则验收写入可能被引到根外，例如生产 `.mailbox`）。
+   正常输出：`OK 预检通过` → `OK 停机门禁通过` → `OK 已启动，PID=…`；出现任何一行以 `X ` 开头，表示**已拒绝且没有启动**（退出码 1），原因写在这一行，并且只报 PID，不打印命令行。
+   > 当前 canonical 根只有 `.e-acceptance` 标记、**没有绑定、没有队列**：宿主重开后需要按第 5 步重新 `bind` → `status` → `start` → `status`。这是重开后的正常状态，不是故障。
+3. **每次重启宿主后重复启动**（E3/E4 需要重启时）：重复第 1 步退出，再重复第 2 步同一条 `-ContinueAcceptance`（不重建、保留队列）。
 4. 启动后确认日志：出现「插件就绪：root=…」与「隔离验收入口已就绪：status=ready_for_live_E」。
    若出现「未启用（allow_from_required / disabled_by_default / version_evidence_missing）」，表示**仍未开启（fail closed）**，不是故障。
 5. 隔离聊天 A：依次执行 `/localpost-bind` → `/localpost-e-status`（应 running:false）→ `/localpost-e-start` → `/localpost-e-status`（应 running:true）。
 6. 隔离聊天 B：执行 `/localpost-e-start`、`/localpost-e-stop`、`/localpost-e-status`，**应全部被拒**，且不影响 A。
 
+> **历史/全新独立试验说明（不属于本批次步骤，不要照做）**：`start-isolated-e.ps1 -RebuildRoot` 只用于“全新独立试验”或历史 R3 场景——它会**旁移现有测试根**并重建只含标记的新根，正常输出依次为 `OK 预检通过` → `OK 停机门禁通过` → `OK 证据：…` → `OK 旁移 -> …localpost-e-test.bak-<stamp>` → `OK 重建完成…` → `OK 重建后置条件通过` → `OK 已启动，PID=…`。**本次基线升级不得使用该路径**；重建在旁移之后失败时的专用人工恢复见下一节，且只适用于该场景。
+
 ## 恢复（回滚）
+
+> **升级回滚与邮件根恢复是两件事，不要互相套用**：
+> - 本次基线发布走 `-ContinueAcceptance`，**不重建真实根**，所以**基线升级失败本身不需要恢复邮件根**；升级失败只按“部署与回滚次序”第 5 步处理（保持派发关闭、原样保留、只核对、不自动 Git 回退）。
+> - **禁止**自动把历史备份 `localpost-e-test.bak-20261004-162606`、`localpost-e-test.bak-20261004-162956`（以及其它旧备份）移回测试根；**禁止**旧信重投；**禁止**用旧 claim 覆盖新状态。恢复邮件根必须**另行审查真实状态并取得授权**，不属于本次升级的回滚动作。
+> - 下面这些 `X ` 行含义对任何一次启动都适用，但**“旁移后重建失败的人工恢复”只是历史/异常场景（`-RebuildRoot` 走旁移之后失败）的专用步骤**，本次升级不得套用。
+
 看 `X ` 行判断状态：
 - `证据枚举失败（原根未动）`、`证据写入失败（原根未动）`、`证据回读条数不符（…原根未动）`、`旁移失败（原根未动）`，以及任何预检/停机门禁拒绝：**测试根没有任何变化**。后几种情况下，证据目录里可能多出一份本次的证据文件，留作记录即可。处理掉原因后重跑。
-- `重建未完成：…原根已完整旁移至 <backup>（未删除、未改写）`：原根完整在 `<backup>`。DSH 退出状态下按以下步骤恢复，不删除任何东西：
+- **[历史/异常场景专用]** `重建未完成：…原根已完整旁移至 <backup>（未删除、未改写）`：原根完整在 `<backup>`。仅当确实执行过 `-RebuildRoot` 且旁移后失败时，才在 DSH 退出状态下按以下步骤人工恢复，不删除任何东西（本次基线升级不使用该路径）：
   ```
   if (Test-Path -LiteralPath C:\AI_ASSIST\work\localpost-e-test) { Rename-Item -LiteralPath C:\AI_ASSIST\work\localpost-e-test -NewName localpost-e-test.failed-<stamp> }
   Move-Item -LiteralPath C:\AI_ASSIST\work\localpost-e-test.bak-<stamp> -Destination C:\AI_ASSIST\work\localpost-e-test
@@ -83,7 +95,7 @@ R3 发布后，运行门禁固定 `main` = 旧基线，而两处消息契约修�
 ## 仍然有效的边界
 - 生产 `.mailbox` 不参与任何 E 测试；不启用生产自动派发，不改生产 profile。
 - watcher.close 失败时，不得凭 running=false 声称句柄已释放，也不得在同一个存疑实例上重复 start。
-- **历史批次约束（R3 当时，仅存档）**：R3 发布时要求“候选只在 `ops/live-e/` 内，**不要合入 main**”——因为当时 HEAD≠864b196 会让基线预检按设计拒绝，且尚无经审的基线更新流程。该约束**只属于 R3 批次**，不适用于 R3.1：R3.1 已按“先升级固定基线（864b196 → 已审 3684e84）、备份 → 部署候选 → `--ff-only` 整合 → 验证”的受控流程执行。硬约束不变：**不得跳过门禁、不得接受任意 HEAD、不得忽略 git 脏状态**；若将来再入库，仍先定基线更新机制（例如把固定值改为运行代码子树的 tree hash）。
+- **历史批次约束（R3 当时，仅存档）**：R3 发布时要求“候选只在 `ops/live-e/` 内，**不要合入 main**”——因为当时 HEAD≠864b196 会让基线预检按设计拒绝，且尚无经审的基线更新流程。该约束**只属于 R3 批次**，不适用于 R3.1：R3.1 的文档**已把受控流程写成“先升级固定基线（864b196 → 已审 3684e84）、备份 → 部署候选 → `--ff-only` 整合 → 验证”，并明确在收到基线发布审定后才按此执行**——真实部署与整合结果另行记录，本文件不预先宣告已完成。硬约束不变：**不得跳过门禁、不得接受任意 HEAD、不得忽略 git 脏状态**；若将来再入库，仍先定基线更新机制（例如把固定值改为运行代码子树的 tree hash）。
 
 ## R3 修复（2026-10-04，回应 codex R2 复审四项 + 必守边界）
 1. **启动链真实串接**：start 不再起子脚本，而是在同一进程里调用 `EGate-Rebuild -Context $c -ConfirmHostExited`，开关按命名开关真实绑定；任何失败都以异常终止 start，不构造、不传递 E 变量，也不调用启动器。生产入口只是两三行的薄壳，只构造 canonical 上下文，没有任何路径、探针、启动器参数。夹具接缝只存在于库函数的上下文参数里，而且夹具上下文的根、work、证据目录中，任一位于 `C:\AI_ASSIST\work` 之内、或是它的祖先（例如 `C:\AI_ASSIST`），都会在任何探测或写入之前被拒绝（`EGate-ValidateContext`）。
