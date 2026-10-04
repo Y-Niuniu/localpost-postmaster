@@ -6,6 +6,7 @@ import { createDshHostBridge, SUPPORTED_VERSION } from './dsh-host-bridge.mjs';
 import { createMailTools } from './dsh-mail-tools.mjs';
 import { createLedgerAcceptance } from './ledger-acceptance.mjs';
 import { createDshAdapter } from './dsh-adapter.mjs';
+import { createReceiver } from './receiver.mjs';
 
 /**
  * The isolated acceptance entry point.
@@ -49,7 +50,7 @@ function refused(reason, decisions) {
  * @param {{ctx?: object, config?: {enabled?: boolean, root?: string}, runtimeVersion?: string, identity?: string, hostId?: string}} input
  * @returns {{enabled: boolean, status: string, reason?: string, decisions: readonly string[], dispose: () => void, parts?: object}}
  */
-export function createIsolatedWiring({ ctx, config = {}, runtimeVersion, identity = 'dsh', hostId = 'local' } = {}) {
+export function createIsolatedWiring({ ctx, config = {}, runtimeVersion, versionEvidence, identity = 'dsh', hostId = 'local' } = {}) {
   const decisions = [];
   if (config?.enabled !== true) return refused('disabled_by_default', decisions);
   decisions.push('explicitly_enabled');
@@ -65,6 +66,10 @@ export function createIsolatedWiring({ ctx, config = {}, runtimeVersion, identit
 
   if (runtimeVersion !== SUPPORTED_VERSION) return refused('runtime_version_mismatch', decisions);
   decisions.push('runtime_version_confirmed');
+  // The version is configuration, so a recorded external pre-check is required alongside it: the real
+  // gate stays the capability probe below, which a wrong host cannot pass by editing a string.
+  if (typeof versionEvidence !== 'string' || versionEvidence.trim() === '') return refused('version_evidence_missing', decisions);
+  decisions.push('version_evidence_recorded');
 
   const store = createSessionStore({ root });
   const mailbox = createMailbox({ root, identity });
@@ -81,6 +86,32 @@ export function createIsolatedWiring({ ctx, config = {}, runtimeVersion, identit
     return refused('tools_' + String(registered.reason ?? 'refused'), decisions);
   }
   decisions.push('commands_registered', 'tools_registered');
+
+  /**
+   * The restricted receiver control. Selected but never started here: loading the plugin must not start
+   * scanning. The root and identity are closed over the values validated above, so a caller cannot point
+   * it at production, and an explicit sender allowlist is required before it can be constructed at all.
+   */
+  const receiverControl = ({ allowFrom, scanIntervalMs, debounceMs } = {}) => {
+    if (!Array.isArray(allowFrom) || allowFrom.length === 0 ||
+        !allowFrom.every(entry => typeof entry === 'string' && entry.trim() !== '')) {
+      return { ok: false, reason: 'allow_from_required' };
+    }
+    const receiver = createReceiver({
+      root, agent: identity, allowFrom: [...allowFrom], adapter,
+      ...(Number.isInteger(scanIntervalMs) ? { scanIntervalMs } : {}),
+      ...(Number.isInteger(debounceMs) ? { debounceMs } : {}),
+    });
+    let stopped = true;
+    return {
+      ok: true,
+      /** Starts scanning the isolated inbox; repeated calls are idempotent. */
+      async start() { if (stopped) { await receiver.start(); stopped = false; } return receiver.diagnostics(); },
+      /** Stops and leaves no watcher, timer or interval behind; repeated calls are idempotent. */
+      async stop() { if (!stopped) { await receiver.stop(); stopped = true; } return receiver.diagnostics(); },
+      diagnostics: () => ({ ...receiver.diagnostics(), stopped }),
+    };
+  };
 
   let observed = null;
   const release = () => {
@@ -102,11 +133,12 @@ export function createIsolatedWiring({ ctx, config = {}, runtimeVersion, identit
       root, store, mailbox, bridge, tools, acceptance, adapter,
       capabilities: Object.freeze({ ...tools.capabilities(), adapter: adapter.capabilities }),
       diagnostics: () => adapter.diagnostics(),
+      versionEvidence,
       /**
-       * Live E1-E6 are not a side effect of loading a plugin: the receiver is handed back unstarted,
+       * Live E1-E6 are not a side effect of loading a plugin: the control is handed back unstarted,
        * and starting it stays a separately authorized step on the isolated root.
        */
-      receiverFactory: undefined,
+      receiverControl,
     }),
   });
 }

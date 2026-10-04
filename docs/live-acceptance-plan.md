@@ -87,12 +87,39 @@ E 通过只是**第一道门槛 T1**。仍需：
 接线点：`lib/index.js` 内 `ctx.effect(...)`（标签 `dsh-localpost-postmaster: isolated E entry`），
 逻辑在 `localpost/dsh-wiring.mjs`；插件由 profile 以 `link:C:/AI_ASSIST/tools/dsh-localpost-postmaster` 加载。
 
-### 隔离启动 / 停止
+### 隔离启动 / 停止（不改 profile，避免重复行）
 
-1. 启动：在插件配置（或 row config）加 `eAcceptance: { enabled: true, root: 'C:/AI_ASSIST/work/localpost-e-test' }`，
-   并令插件重载；日志出现 `隔离验收入口已就绪：status=ready_for_live_E`。
-2. 停止：把 `enabled` 改回 `false`（或不设）并重载 —— 日志出现 `隔离验收入口未启用（disabled_by_default）`；
-   重载/卸载由 `ctx.effect` 的 disposer 负责，命令、工具与 guard 全部释放，**零残留**。
+本插件的装配来自 profile 的 `package.json`（`link:` 依赖 + bundles 列表），**不在 `cordis.patch.yml` 里**。
+因此**不要**为了开关去加 patch row（会与 bundle 行重复）。改用环境变量显式开启：
+
+```
+DSH_LOCALPOST_E_ENABLED=1
+DSH_LOCALPOST_E_ROOT=C:/AI_ASSIST/work/localpost-e-test
+DSH_LOCALPOST_E_RUNTIME=0.2.0-rc.2
+DSH_LOCALPOST_E_EVIDENCE=precheck:desktop app.asar package.json 0.2.0-rc.2 + sha256:<外部预检哈希>
+```
+
+1. **启动**：以上四个变量齐备后重载插件；日志出现
+   `隔离验收入口已就绪：status=ready_for_live_E`，此时注册 3 条人类命令与 5 个工具。
+2. **停止**：把 `DSH_LOCALPOST_E_ENABLED` 置 0 或删除这四个变量并重载；日志出现
+   `隔离验收入口未启用（disabled_by_default）`，`ctx.effect` 的 disposer 释放命令、工具与 guard，**零残留**。
+3. **row config 方式**（可选）：如果确实要用 `eAcceptance` 行配置，需要在插件装配层改配置 ——
+   **那属于改生产 profile**，须先取得用户授权（回 `needs_authorization`），不得自行修改。
+
+### 版本来源（不是模型可随意伪造的）
+
+- 运行时门禁 = **能力探测**（`tools.register/get/guard` + `agents.get` + `commands.register`），
+  版本字符串只是配置；`versionEvidence` 必填，用来记录**外部预检**。
+- 外部预检事实（codex 直接读桌面版 `app.asar` 核对）：`@deepseek-ai/dsh-desktop 0.2.0-rc.2`、
+  `dsh-desktop-runtime 0.2.0-rc.2`、`dsh-base 0.2.0-rc.2`；PATH 里的 `dsh --version = 0.1.5-rc.1`
+  **是另一个旧 npm CLI，不代表运行中的桌面版**（不得据此改兼容、也不得升级 DSH）。
+
+### 真机 E 的 receiver 控制
+
+加载插件**不会**启动 receiver。`wiring.parts.receiverControl({ allowFrom })` 返回受限控制面：
+root 与 identity 在闭包内固定为隔离根与 `dsh`（调用者无法指向生产根），
+`allowFrom` 必须显式非空，`start()/stop()` 幂等，`diagnostics()` 给出 `running/stopped/dispatchEnabled`。
+启动它属于**真机 E 的单独授权步骤**。
 
 ### 尚未发生（不要误读）
 

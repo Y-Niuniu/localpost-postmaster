@@ -27,13 +27,14 @@ function fakeCtx() {
   };
 }
 const enabled = (extra = {}) => ({ enabled: true, root: ISOLATED_ROOT, ...extra });
-const build = (host, config = enabled(), runtimeVersion = SUPPORTED_VERSION) =>
-  createIsolatedWiring({ ctx: host.ctx, config, runtimeVersion });
+const EVIDENCE = 'precheck:app.asar package.json 0.2.0-rc.2';
+const build = (host, config = enabled(), runtimeVersion = SUPPORTED_VERSION, versionEvidence = EVIDENCE) =>
+  createIsolatedWiring({ ctx: host.ctx, config, runtimeVersion, versionEvidence });
 
 test('without an explicit switch nothing is registered at all: the default is production-safe', () => {
   const host = fakeCtx();
   // No configuration at all is its own case: it must behave exactly like an explicit false.
-  const bare = createIsolatedWiring({ ctx: host.ctx, runtimeVersion: SUPPORTED_VERSION });
+  const bare = createIsolatedWiring({ ctx: host.ctx, runtimeVersion: SUPPORTED_VERSION, versionEvidence: EVIDENCE });
   assert.equal(bare.enabled, false);
   assert.equal(bare.reason, 'disabled_by_default');
   bare.dispose();
@@ -93,6 +94,36 @@ test('the runtime version and the host capabilities both gate the wiring', () =>
   assert.equal(noAgents.tools.length + noAgents.commands.length, 0);
 });
 
+test('a missing external version pre-check keeps the wiring closed', () => {
+  const host = fakeCtx();
+  for (const evidence of [null, '', '   ']) {
+    const wiring = build(host, enabled(), SUPPORTED_VERSION, evidence);
+    assert.equal(wiring.enabled, false);
+    assert.equal(wiring.reason, 'version_evidence_missing');
+    assert.equal(host.commands.length + host.tools.length + host.guards.length, 0);
+  }
+  const recorded = build(host);
+  assert.equal(recorded.enabled, true);
+  assert.equal(recorded.parts.versionEvidence, EVIDENCE);
+  recorded.dispose();
+});
+
+test('the receiver control is restricted, never started by the wiring, and stops leaving nothing', async () => {
+  const host = fakeCtx();
+  const wiring = build(host);
+  const control = wiring.parts.receiverControl;
+  assert.equal(typeof control, 'function', 'the entry must expose a receiver control');
+  assert.equal(control({}).ok, false, 'an explicit sender allowlist is required');
+  assert.equal(control({ allowFrom: [] }).ok, false);
+  assert.equal(control({ allowFrom: [''] }).ok, false);
+  assert.equal(control({ allowFrom: ['codex'] }).ok, true);
+  const started = control({ allowFrom: ['codex'], scanIntervalMs: 60000, debounceMs: 1 });
+  assert.equal(started.ok, true);
+  assert.equal(started.diagnostics().stopped, true, 'the control must not start by itself');
+  assert.equal(started.diagnostics().running, false);
+  wiring.dispose();
+});
+
 test('an enabled wiring on the isolated root registers the commands, the tools and the guard', () => {
   const host = fakeCtx();
   const wiring = build(host);
@@ -104,7 +135,7 @@ test('an enabled wiring on the isolated root registers the commands, the tools a
   for (const definition of host.commands) assert.equal(definition.recordInput, false);
   // path.resolve returns native separators; compare slash-normalised so Windows and POSIX agree.
   assert.equal(wiring.parts.root.replaceAll(String.fromCharCode(92), '/').toLowerCase(), ISOLATED_ROOT.toLowerCase());
-  assert.equal(wiring.parts.receiverFactory, undefined, 'live E must not start from loading the plugin');
+  assert.equal(typeof wiring.parts.receiverControl, 'function', 'live E stays a separate start, not a load side effect');
   wiring.dispose();
 });
 

@@ -88,9 +88,12 @@ mod.apply(ctx, {
 })
 
 /* ---- 1. 注册形状 ---- */
-check('导出了 name / inject / apply', mod.name === '@dsh-external/dsh-localpost-postmaster' &&
+check('导出了 name / inject / apply（含接线所需的 commands 与 agents）', mod.name === '@dsh-external/dsh-localpost-postmaster' &&
   Array.isArray(mod.inject) && mod.inject.includes('tools') && mod.inject.includes('timer') &&
+  mod.inject.includes('commands') && mod.inject.includes('agents') &&
   typeof mod.apply === 'function', JSON.stringify(mod.inject))
+check('隔离验收入口默认关闭（未注册任何命令）', logs.some(line => String(line).includes('隔离验收入口未启用')),
+  logs.filter(line => String(line).includes('隔离验收入口')).join(' | '))
 check('注册了 localpost_check 工具', !!toolDef && toolDef.name === 'localpost_check',
   toolDef ? toolDef.description : '未注册')
 check('工具 output 形状合法（register 的硬性校验）',
