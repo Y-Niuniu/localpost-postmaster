@@ -2,9 +2,10 @@
  * LocalPost 局长外壳 · 离线自测（改完插件先跑这个，别拿真宿主当调试器）
  * 用法: node test/selftest.mjs
  *
- * 覆盖：工具注册形状 / 手动查（suppress）/ 定时器新告警冒泡（ntfy 真发到本地假服务器）/
- *       error 级是否走 toast 分支 / 冷却去重 / 告警消失后状态清理 / dry-run 不写盘 /
- *       内核缺失时的报错文案 / 单例守卫（防重复冒泡）/ 不改写内核账本
+ * 覆盖：工具注册形状 / **localpost_check 入口拒绝（零锁、零读写信箱账本状态、零冒泡、零日志）** /
+ *       定时器新告警冒泡（ntfy 真发到本地假服务器，入口停用不影响后台定时器）/
+ *       error 级是否走 toast 分支 / 冷却去重 / 告警消失后状态清理 / dry-run 同样被入口拒绝 /
+ *       入口拒绝与内核无关（内核缺失也拒绝且不抛异常）/ 单例守卫（防重复冒泡）/ 不改写内核账本
  * 说明：toast 分支在受限沙箱里会以 spawn EPERM 失败，属预期；宿主机内应为「toast 已弹出」。
  */
 import { createServer } from 'node:http'
@@ -105,60 +106,75 @@ check('工具 parameters 是 JSON Schema（object + 两个布尔参数）',
   toolDef.parameters.properties.verbose.type === 'boolean')
 check('挂上了启动检查与周期定时器', typeof startupFn === 'function' && typeof intervalFn === 'function')
 
-/* ---- 2. 手动查（suppress：对话内回报，不弹窗，但算「已告知」） ---- */
+/* ---- 2. localpost_check 入口拒绝：不取锁、不读写信箱/账本/状态、不冒泡、不追加日志 ---- */
+const logBefore2 = existsSync(logFile) ? readFileSync(logFile, 'utf8') : ''
 const manual = await toolDef.execute({})
 const stateOf = () => JSON.parse(readFileSync(stateFile, 'utf8')).notified
 const K1 = 'overdue|task-1|agents/opencode/inbox/task-1.json|'
-check('手动查返回人话报告（含超时结论）', manual.includes('超时') && manual.includes('task-1'),
+check('入口拒绝：返回停用说明，不再返回对账报告',
+  manual.includes('已停用') && manual.includes('入口无条件拒绝') && !manual.includes('超时'),
   manual.split('\n')[0])
-check('手动查抑制冒泡（本轮不推 ntfy）', pushed.length === 0, 'pushed=' + pushed.length)
-check('手动查把本轮告警记为「已告知」（冷却状态落盘）', existsSync(stateFile) && stateOf()[K1] !== undefined,
-  Object.keys(existsSync(stateFile) ? stateOf() : {}).join(', '))
-check('手动查后在报告尾部说明「已回报、不再弹窗」', manual.includes('已在对话内回报'))
+check('入口拒绝：不写冷却状态（stateFile 仍未创建）', !existsSync(stateFile), 'exists=' + existsSync(stateFile))
+check('入口拒绝：不取根锁、不落账本/告警',
+  !existsSync(join(FIXTURE, '.postmaster.lock')) && !existsSync(join(FIXTURE, 'ledger.json')) &&
+  !existsSync(join(FIXTURE, 'alerts.json')) && !existsSync(join(FIXTURE, 'postmaster.log')),
+  '锁=' + existsSync(join(FIXTURE, '.postmaster.lock')) + ' 账本=' + existsSync(join(FIXTURE, 'ledger.json')))
+check('入口拒绝：不冒泡', pushed.length === 0, 'pushed=' + pushed.length)
+check('入口拒绝：不追加插件日志',
+  (existsSync(logFile) ? readFileSync(logFile, 'utf8') : '') === logBefore2)
+check('入口拒绝：逐个列出真实可用的原生工具（不含 localpost_check / localpost_e_*）',
+  manual.includes('localpost_status') && manual.includes('localpost_inbox') && manual.includes('localpost_read') &&
+  manual.includes('localpost_reply') && manual.includes('localpost_archive') && !manual.includes('localpost_e_'),
+  manual.split('\n')[2])
 
-/* ---- 3. 定时器路径：同一告警不该重复响（手动查过 = 已告知） ---- */
+/* ---- 3. 定时器路径不受入口停用影响：后台照跑、真·新告警照常冒泡 ---- */
 writeEnvelope('task-2.json', envelope('task-2', 'free', 10 * 60e3)) // free 阈值 1440min -> 未超时
 await intervalFn()
-await new Promise((r) => setTimeout(r, 300))
-check('定时器路径：手动查过的告警不重复响', pushed.length === 0, 'pushed=' + pushed.length)
+await new Promise((r) => setTimeout(r, 500))
+check('入口停用不影响后台定时器：新告警照常冒泡（task-1 overdue）',
+  pushed.length === 1 && pushed[0].message.includes('task-1'), 'pushed=' + pushed.length)
+check('定时器路径照常写冷却状态', existsSync(stateFile) && stateOf()[K1] !== undefined,
+  Object.keys(existsSync(stateFile) ? stateOf() : {}).join(', '))
 
 /* ---- 3b. 定时器路径：真·新告警 -> 冒泡（warn 级：只 ntfy，不 toast） ---- */
 writeEnvelope('task-3.json', envelope('task-3', 'urgent', 40 * 60e3)) // urgent 阈值 15min -> overdue
 await intervalFn()
 await new Promise((r) => setTimeout(r, 500))
-check('定时器路径推送了 ntfy', pushed.length === 1, JSON.stringify(pushed[0] || {}).slice(0, 160))
-check('汇总文案含告警条数与要点', pushed.length === 1 && /LocalPost 局长 · \d+ 条告警/.test(pushed[0].title) &&
-  pushed[0].message.includes('task-3'), pushed.length ? pushed[0].title + ' | ' + pushed[0].message.split('\n')[0] : '')
+check('定时器路径推送了 ntfy', pushed.length === 2, JSON.stringify(pushed[1] || {}).slice(0, 160))
+check('汇总文案含告警条数与要点', pushed.length === 2 && /LocalPost 局长 · \d+ 条告警/.test(pushed[1].title) &&
+  pushed[1].message.includes('task-3'), pushed.length > 1 ? pushed[1].title + ' | ' + pushed[1].message.split('\n')[0] : '')
 check('warn 级不弹 toast（仅 error 级）', !readFileSync(logFile, 'utf8').includes('toast 已弹出'))
 
 /* ---- 4. 冷却：同一告警再跑不重复响 ---- */
 await intervalFn()
 await new Promise((r) => setTimeout(r, 300))
-check('冷却生效：第二次跑不重复推送', pushed.length === 1, 'pushed=' + pushed.length)
+check('冷却生效：第二次跑不重复推送', pushed.length === 2, 'pushed=' + pushed.length)
 
 /* ---- 5. 升级：改成严重超时（>4x 阈值）应再次响，并走 toast 分支 ---- */
 writeEnvelope('task-1.json', envelope('task-1', 'standard', 10 * 3600e3)) // 600min > 480min -> error
 await intervalFn()
 await new Promise((r) => setTimeout(r, 2500))
 const logText = readFileSync(logFile, 'utf8')
-check('严重度升级到 error 时再次冒泡', pushed.length === 2, 'pushed=' + pushed.length)
+check('严重度升级到 error 时再次冒泡', pushed.length === 3, 'pushed=' + pushed.length)
 check('error 级触发了 toast 分支（沙箱内 EPERM 属预期，宿主机内应为「已弹出」）',
   logText.includes('toast 已弹出') || logText.includes('toast 失败'),
   (logText.split('\n').filter((l) => l.includes('toast')).pop() || '').slice(0, 140))
 
-/* ---- 6. dry-run：不写盘、不冒泡、不改状态 ---- */
+/* ---- 6. 入口拒绝对 dry-run 同样生效：不写盘、不冒泡、不动状态、不追加日志 ---- */
 const before = readFileSync(stateFile, 'utf8')
+const logBefore6 = readFileSync(logFile, 'utf8')
 const dry = await toolDef.execute({ dry_run: true })
-check('dry-run 报告标注预览', dry.includes('dry-run 预览'), dry.split('\n')[0])
-check('dry-run 不动冷却状态', readFileSync(stateFile, 'utf8') === before)
-check('dry-run 不新增推送', pushed.length === 2, 'pushed=' + pushed.length)
+check('dry-run 也被入口拒绝（不进入内核）', dry.includes('已停用'), dry.split('\n')[0])
+check('入口拒绝不动冷却状态', readFileSync(stateFile, 'utf8') === before)
+check('入口拒绝不新增推送', pushed.length === 3, 'pushed=' + pushed.length)
+check('入口拒绝不追加插件日志', readFileSync(logFile, 'utf8') === logBefore6)
 
 /* ---- 7. 坏信：error 级 + 独立键（不受冷却影响） ---- */
 writeFileSync(join(FIXTURE, 'agents', 'opencode', 'inbox', 'broken.json'), '{ 这不是 JSON')
 await intervalFn()
 await new Promise((r) => setTimeout(r, 2500))
-check('坏信被判为告警并冒泡', pushed.length === 3 && pushed[2].message.includes('坏信'),
-  pushed.length > 2 ? pushed[2].message.split('\n')[0] : 'pushed=' + pushed.length)
+check('坏信被判为告警并冒泡', pushed.length === 4 && pushed[3].message.includes('坏信'),
+  pushed.length > 3 ? pushed[3].message.split('\n')[0] : 'pushed=' + pushed.length)
 
 /* ---- 7b. 状态清理：告警消失（收到回执）后旧键必须被删掉 ---- */
 writeEnvelope('task-1.result.json', Object.assign(
@@ -168,7 +184,7 @@ await new Promise((r) => setTimeout(r, 300))
 check('告警消失后冷却键被清理（下次再超时会重新响）', stateOf()[K1] === undefined,
   Object.keys(stateOf()).join(', '))
 
-/* ---- 8. 内核缺失：不崩、给出可诊断文案 ---- */
+/* ---- 8. 入口拒绝与内核无关：内核路径不存在也照样拒绝、不抛异常、不尝试加载内核 ---- */
 const mod2 = await import(PLUGIN + '?v=2')
 let tool2 = null
 const ctx2 = Object.assign({}, ctx, { tools: { register(def) { tool2 = def; return () => {} } } })
@@ -177,8 +193,8 @@ mod2.apply(ctx2, {
   ntfyEnabled: false, toastEnabled: false, stateFile: join(TMP, 'state2.json'), logFile: join(TMP, 'log2.log'),
 })
 const broken = await tool2.execute({})
-check('内核缺失时工具返回可诊断错误（不抛异常）',
-  broken.includes('跑不起来') && broken.includes('不存在的内核.mjs'), broken.split('\n')[0])
+check('入口拒绝不依赖内核（内核缺失也返回同一拒绝，不出现「跑不起来」）',
+  broken.includes('已停用') && !broken.includes('跑不起来'), broken.split('\n')[0])
 
 /* ---- 9. 单例守卫：新实例接管后，旧实例的定时器必须闭嘴（防重复冒泡） ---- */
 const pushedBefore = pushed.length
