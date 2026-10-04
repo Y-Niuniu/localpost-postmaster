@@ -34,13 +34,13 @@ R2 已停用：首次重建路径必然失败（`-ConfirmHostExited` 误绑到 R
 
 ## 恢复（回滚）
 看 `X ` 行判断状态：
-- `证据枚举失败（原根未动）`、`证据写入失败（原根未动）`、`证据回读条数不符（…原根未动）`、`旁移失败（原根未动）`，以及任何预检/停机门禁拒绝：**什么都没变**。处理掉原因后重跑即可。
+- `证据枚举失败（原根未动）`、`证据写入失败（原根未动）`、`证据回读条数不符（…原根未动）`、`旁移失败（原根未动）`，以及任何预检/停机门禁拒绝：**测试根没有任何变化**。后几种情况下，证据目录里可能多出一份本次的证据文件，留作记录即可。处理掉原因后重跑。
 - `重建未完成：…原根已完整旁移至 <backup>（未删除、未改写）`：原根完整在 `<backup>`。DSH 退出状态下按以下步骤恢复，不删除任何东西：
   ```
   if (Test-Path -LiteralPath C:\AI_ASSIST\work\localpost-e-test) { Rename-Item -LiteralPath C:\AI_ASSIST\work\localpost-e-test -NewName localpost-e-test.failed-<stamp> }
   Move-Item -LiteralPath C:\AI_ASSIST\work\localpost-e-test.bak-<stamp> -Destination C:\AI_ASSIST\work\localpost-e-test
   ```
-- 启动器本身失败（`X` 行是启动错误）：此时重建已完成，根里只有标记。修好原因后用 `-ContinueAcceptance` 续跑即可，不要再重建。
+- 启动器本身失败（`X` 行是启动错误）：如果用的是 `-RebuildRoot`，此时重建已完成，根里只有标记，修好原因后用 `-ContinueAcceptance` 续跑即可，不要再重建；如果用的是 `-ContinueAcceptance`，什么都没变，直接重跑。
 - 回到默认关闭：不设 E 变量、用平常方式启动桌面 DSH 即可。脚本只在启动瞬间把 7 个 E 变量写进本进程环境供子进程继承，随即还原（原本不存在的变量会被真正删除）。脚本不持久化任何变量。
 
 ## 仍然有效的边界
