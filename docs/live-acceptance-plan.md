@@ -77,3 +77,27 @@ E 通过只是**第一道门槛 T1**。仍需：
 ## 6. 本方案未做的事
 
 未启用任何派发、未启动 receiver、未创建测试根或测试会话、未改任何生产配置、未联系任何真实模型。
+## 接线状态（2026-10-04）
+
+**状态：`ready_for_live_E`。** 宿主桥与邮件工具已接到真实 DSH 插件入口（`lib/index.js`），
+但**默认关闭**：只有显式 `eAcceptance.enabled === true` **且** `root` 恰为隔离根
+`C:/AI_ASSIST/work/localpost-e-test/` **且** 运行时为受支持版本时，才会注册命令与工具。
+生产根 `C:/AI_ASSIST/.mailbox` **及其任何子路径一律拒绝**（`production_root_refused`）。
+
+接线点：`lib/index.js` 内 `ctx.effect(...)`（标签 `dsh-localpost-postmaster: isolated E entry`），
+逻辑在 `localpost/dsh-wiring.mjs`；插件由 profile 以 `link:C:/AI_ASSIST/tools/dsh-localpost-postmaster` 加载。
+
+### 隔离启动 / 停止
+
+1. 启动：在插件配置（或 row config）加 `eAcceptance: { enabled: true, root: 'C:/AI_ASSIST/work/localpost-e-test' }`，
+   并令插件重载；日志出现 `隔离验收入口已就绪：status=ready_for_live_E`。
+2. 停止：把 `enabled` 改回 `false`（或不设）并重载 —— 日志出现 `隔离验收入口未启用（disabled_by_default）`；
+   重载/卸载由 `ctx.effect` 的 disposer 负责，命令、工具与 guard 全部释放，**零残留**。
+
+### 尚未发生（不要误读）
+
+- **E1–E6 真机验收尚未执行**；本状态只表示入口可执行。
+- **生产自动派发、receiver、真实宿主投递仍然全部关闭**。
+- receiver 以**未启动**的形式返回（不提供 factory），启用属于后续单独授权的步骤。
+- 残余风险：`runtimeVersion` 目前由配置声明（不是宿主自证），真正的门禁是能力探测
+  （`tools.register/get/guard` + `agents.get` + `commands.register`）；接线后插件加载时会多引入若干模块。
