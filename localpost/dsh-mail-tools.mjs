@@ -68,6 +68,50 @@ export function shadowReason(tools, ours, exec) {
   return undefined;
 }
 
+/** Every denial by the mail-turn allowlist starts with this, so a denied call can be traced to it. */
+export const MAIL_TURN_DENY_PREFIX = 'localpost-mail-turn:';
+const MAIL_TURN_SET = TOOL_NAMES.join(', ');
+const nameLabel = name => typeof name !== 'string' ? '<' + (name === null ? 'null' : typeof name) + ' name>'
+  : JSON.stringify(name.length > 64 ? name.slice(0, 64) + '...' : name);
+
+/**
+ * The tool policy of an automatic mail turn: the reason this execution must be denied, or undefined to let it through.
+ * It admits exactly the five TOOL_NAMES, compared as exact strings - no prefix, pattern, case folding or trimming - and
+ * only the definition this bridge registered, as the calling agent resolves it (the host keys a registration by the
+ * definition's own name, and dispatch runs get(name, agent)). So localpost_check, re-cased or suffixed look-alikes,
+ * every built-in, management (dev_*), PTC (run_code), delegation and MCP tool, and a same-named definition anyone else
+ * registered - a scoped shadow, or a re-registration after this bridge released its own - are all denied.
+ * Total and fail-closed: an unreadable execution or lookup is a denial, never an allow and never a throw.
+ * The tool bodies keep their own caller, binding and owner checks; this only decides which bodies may be reached.
+ * Like shadowReason it proves the definition at guard time; dispatch resolves again after the around-dispatch stage.
+ */
+export function mailTurnReason(tools, ours, exec) {
+  let name;
+  try {
+    name = exec?.name;
+    if (typeof name !== 'string' || !TOOL_NAMES.includes(name)) {
+      return MAIL_TURN_DENY_PREFIX + ' tool ' + nameLabel(name) + ' is not one of the five LocalPost mail tools (' + MAIL_TURN_SET
+        + '); an automatic mail turn may call only those. Denied before dispatch.';
+    }
+    const mine = ours?.get(name);
+    if (!mine || mine.size === 0) {
+      return MAIL_TURN_DENY_PREFIX + ' ' + nameLabel(name) + ' is not registered by the LocalPost bridge right now. Denied before dispatch.';
+    }
+    const effective = tools.get(name, exec.agent);
+    if (effective === undefined) {
+      return MAIL_TURN_DENY_PREFIX + ' ' + nameLabel(name) + ' is not visible to this caller (restricted or unregistered). Denied before dispatch.';
+    }
+    if (!mine.has(effective)) {
+      return MAIL_TURN_DENY_PREFIX + ' ' + nameLabel(name) + ' resolves to a definition the LocalPost bridge did not register'
+        + ' (shadowed or replaced). Denied before dispatch.';
+    }
+    return undefined;
+  } catch (error) {
+    return MAIL_TURN_DENY_PREFIX + ' ' + nameLabel(name) + ' could not be checked (' + String(error?.message ?? error).slice(0, 120)
+      + '). Denied before dispatch.';
+  }
+}
+
 /** True only when the identity's current binding is exactly this chat, workspace included. */
 function requireBoundChat(state, caller) {
   const binding = state?.binding;
@@ -240,5 +284,7 @@ export function createMailTools({ ctx, mailbox, store, identity, hostId = 'local
     capabilities: () => ({ runtimeVersion: versionOk, toolRegistry: canRegister, toolLookup: canGet, toolGuard: canGuard, liveAgentLookup: canLookup, reasons: [...reasons] }),
     attestedCaller: exec => attestedCaller(ctx, exec, hostId),
     shadowReason: exec => shadowReason(tools, registration?.ours ?? new Map(), exec),
+    // Bound to the CURRENT registration: before register() and after its release every call is denied.
+    mailTurnReason: exec => mailTurnReason(tools, registration?.ours, exec),
   };
 }
