@@ -122,6 +122,7 @@ async function mounted(name, { mode = 'manual', letter = 'l1' } = {}) {
  * evidence and is not modified). It admitted every name that merely starts with "localpost_".
  */
 const LEGACY_ALLOWLIST_PATTERN = /^localpost_/;
+const NAME_LAYER = /is not one of the five LocalPost mail tools/;
 const legacyReason = exec => {
   const name = typeof exec?.name === 'string' ? exec.name : '';
   return name !== '' && LEGACY_ALLOWLIST_PATTERN.test(name) ? undefined : 'b-probe-default-deny: ' + name;
@@ -206,6 +207,8 @@ test('every name outside the five is denied by the allowlist before any body run
     const outcome = await host.execute(name, agent, { id: letter, command: 'Remove-Item -Recurse C:\\' });
     assert.equal(outcome.denied, true, JSON.stringify(name) + ' must be denied, got ' + JSON.stringify(outcome));
     assert.ok(outcome.text.startsWith('Error: ' + MAIL_TURN_DENY_PREFIX), JSON.stringify(name) + ' must be denied by the mail-turn allowlist: ' + outcome.text);
+    // Denied by NAME, not merely because nothing of ours is registered under it.
+    assert.match(outcome.text, NAME_LAYER, JSON.stringify(name) + ' must be denied at the name layer');
   }
   assert.deepEqual(ran, [], 'no decoy body may run');
   assert.deepEqual(host.bodyRuns, [], 'the host invoked no tool body at all');
@@ -234,6 +237,25 @@ test('red/green: the legacy prefix policy fails the same gate, the exact allowli
   for (const name of LOOKALIKES) if (name !== '') host.ctx.tools.register(decoy(name, ranExact));
   for (const name of LOOKALIKES) await host.execute(name, agent);
   assert.deepEqual(ranExact, [], 'green: under the exact allowlist no body ran');
+});
+
+test('the name layer stands on its own: a lookalike is denied even where a registration would vouch for it', () => {
+  // A bridge that registered MORE than the five (a future localpost_send, say) must not widen the allowlist: hand the
+  // pure decision a registry and an identity map that vouch for every lookalike, and only the name check is left.
+  const odd = [new String('localpost_read'), { toString: () => 'localpost_read' }, ['localpost_read']];
+  const keys = [...LOOKALIKES.filter(name => name !== ''), ...odd];
+  const vouched = new Map(keys.map(key => [key, { name: String(key) }]));
+  const tools = { get: key => vouched.get(key) };
+  const ours = new Map(keys.map(key => [key, new Set([vouched.get(key)])]));
+  const agent = chatAgent(SESSION.id);
+  for (const name of keys) {
+    const reason = mailTurnReason(tools, ours, { name, agent });
+    assert.ok(typeof reason === 'string', JSON.stringify(String(name)) + ' must be denied although the registry vouches for it');
+    assert.match(reason, NAME_LAYER, JSON.stringify(String(name)) + ' must be denied by name');
+  }
+  // The same registry vouching for a real name admits it: the check above is the name layer, not a broken registry.
+  const real = { name: 'localpost_read' };
+  assert.equal(mailTurnReason({ get: () => real }, new Map([['localpost_read', new Set([real])]]), { name: 'localpost_read', agent }), undefined);
 });
 
 test('the five names prove nothing by themselves: a definition this bridge did not register is denied', async () => {
@@ -301,6 +323,7 @@ test('the decision is total and fail-closed: odd names, hostile executions and a
   for (const name of [undefined, null, 0, 123, true, Symbol('localpost_read'), ['localpost_read'], { toString: () => 'localpost_read' },
     new String('localpost_read')]) {
     assert.ok(deniedFor({ name, agent }), 'non-string name ' + String(typeof name) + ' must be denied');
+    assert.match(mail.mailTurnReason({ name, agent }), NAME_LAYER, 'a non-string name is refused by name, never coerced');
   }
   assert.ok(deniedFor(undefined), 'no execution');
   assert.ok(deniedFor(null), 'null execution');
