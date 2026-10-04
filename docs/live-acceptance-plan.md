@@ -138,7 +138,7 @@ DSH_LOCALPOST_E_DEBOUNCE_MS=250             # 可选：整数 50..600000
 
     /localpost-e-start    启动隔离 receiver（扫描隔离根）
     /localpost-e-stop     停止（关闭 watcher 与 interval）
-    /localpost-e-status   查看 running / dispatchEnabled / lastError / lastStartError / shutdownError
+    /localpost-e-status   查看 running / dispatchEnabled / lastError / lastStartError / lastStopError / shutdownError
 
 每条命令执行前依次检查：
 
@@ -156,6 +156,18 @@ DSH_LOCALPOST_E_DEBOUNCE_MS=250             # 可选：整数 50..600000
 - start 失败不会报告 running，并会关闭半启动的 watcher；之后可以安全地 stop 或卸载。
 - 卸载（Cordis rc.2 会等待 effect disposer 返回的 Promise）：先停 receiver，**无论停止是否成功都释放全部注册**；
   停止失败的原因记在 `status().shutdownError`，并由插件入口写入错误日志，不会出现「卸了一半」。
+- **`receiver.stop()` 本身（2026-10-04 加固）**：
+  - 先断掉新的调度：停止标记生效，interval 和 debounce 两个定时器都清掉；
+  - 再关闭 watcher：先丢弃引用，所以重复 stop 不会再碰它；
+  - 然后等待正在跑的扫描结束；
+  - 最后，如果关闭 watcher 失败，才把这个错误抛出来。
+
+  中途有一步失败，其余步骤照样完成，错误也不会被吞掉。start 和 stop 在 receiver 内部串行执行：
+  stop 撞上还没走完的 start 时，会排在它后面，把它打开的东西拆掉；并发的 start 只会打开一个 watcher。
+- `/localpost-e-stop` 失败时：
+  - 错误返回给调用者，并记进 `status().lastStopError`；
+  - `running` 以 receiver 自己报告的为准：清理都做完了，只是关闭 watcher 失败时，它已经不再运行。
+- start 失败后的清理如果也失败，两条错误会合成一个 `AggregateError` 一起报出，并分别记进 `lastStartError` 和 `lastStopError`。
 
 ### 隔离启动 runbook（desktop rc.2；只写步骤，**不执行**、不改快捷方式或 profile）
 

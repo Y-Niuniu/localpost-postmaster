@@ -380,6 +380,31 @@ test('a start that fails is not reported running, cleans up after itself, and le
   assert.deepEqual(counts(host), [0, 0, 0]);
 });
 
+test('a failing receiver stop is reported to the caller and kept in status; the receiver decides whether it still runs', async t => {
+  const { host, wiring, receiver, a } = await boundWorld(t, fakeReceiver({ stopFails: true }));
+  assert.equal((await run(host, E.start, a)).kind, 'success');
+  const answer = await run(host, E.stop, a);
+  assert.equal(answer.kind, 'error');
+  assert.match(answer.text, /stop failed/);
+  const status = wiring.parts.receiver.status();
+  assert.deepEqual([status.running, status.lastStopError], [false, 'stop failed'], 'the receiver stopped despite the error, and the error is kept');
+  assert.equal(receiver.seen.watchers, 0);
+  await wiring.dispose();
+  assert.deepEqual(counts(host), [0, 0, 0]);
+});
+
+test('when a failed start cannot be cleaned up either, both failures are reported and kept', async t => {
+  const { host, wiring, a } = await boundWorld(t, fakeReceiver({ startFails: true, stopFails: true }));
+  const answer = await run(host, E.start, a);
+  assert.equal(answer.kind, 'error');
+  assert.match(answer.text, /scan failed/);
+  assert.match(answer.text, /stop failed/, 'the cleanup failure is not dropped');
+  const status = wiring.parts.receiver.status();
+  assert.deepEqual([status.running, status.lastStartError, status.lastStopError], [false, 'scan failed', 'stop failed']);
+  await wiring.dispose();
+  assert.deepEqual(counts(host), [0, 0, 0]);
+});
+
 test('the receiver is built on the validated isolated root with the validated inputs', t => {
   const host = fakeCtx();
   const { wiring, receiver, root } = build(t, host, { config: { allowFrom: ['codex'], scanIntervalMs: 1000, debounceMs: 50 } });

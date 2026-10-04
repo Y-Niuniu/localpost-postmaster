@@ -45,7 +45,10 @@ const underPath = (child, parent) => {
   return low === base || low.startsWith(base.endsWith(path.sep) ? base : base + path.sep);
 };
 const safeId = value => { try { assertId(value); return true; } catch { return false; } };
-const errorText = error => String(error?.message ?? error);
+// An AggregateError carries its parts' messages, so a combined failure still says what each part was.
+const errorText = error => (error instanceof AggregateError
+  ? String(error.message) + ': ' + error.errors.map(part => String(part?.message ?? part)).join('; ')
+  : String(error?.message ?? error));
 
 /**
  * The sender list as the environment carries it: a comma-separated string. Nothing is trimmed or dropped here, so a
@@ -137,6 +140,7 @@ export function createIsolatedWiring({ ctx, config = {}, runtimeVersion, version
   let disposed = false;
   let startedBy = null;
   let lastStartError = null;
+  let lastStopError = null;
   let shutdownError = null;
   let queue = Promise.resolve();
   const serialize = task => {
@@ -146,6 +150,7 @@ export function createIsolatedWiring({ ctx, config = {}, runtimeVersion, version
   };
   const status = () => Object.freeze({ ...receiver.diagnostics(), owned: true, running, disposed, root,
     ...(lastStartError === null ? {} : { lastStartError: errorText(lastStartError) }),
+    ...(lastStopError === null ? {} : { lastStopError: errorText(lastStopError) }),
     ...(shutdownError === null ? {} : { shutdownError: errorText(shutdownError) }) });
   const control = Object.freeze({
     /** Starts the single watcher; repeat and concurrent calls start it once. A failed start is never reported running. */
@@ -156,9 +161,11 @@ export function createIsolatedWiring({ ctx, config = {}, runtimeVersion, version
           await receiver.start();
         } catch (error) {
           lastStartError = error;
-          // A start that failed half-way may already hold a watcher: close it before reporting the failure.
-          try { await receiver.stop(); } catch { /* the start failure is the one to report */ }
-          throw error;
+          // A start that failed half-way may already hold a watcher: close it before reporting the failure. If that
+          // cleanup fails too, both failures are reported - neither is dropped.
+          let cleanupError = null;
+          try { await receiver.stop(); } catch (failure) { cleanupError = failure; lastStopError = failure; }
+          throw cleanupError === null ? error : new AggregateError([error, cleanupError], 'receiver start failed, and closing what it had opened failed too');
         }
         running = true;
         startedBy = caller;
@@ -166,13 +173,24 @@ export function createIsolatedWiring({ ctx, config = {}, runtimeVersion, version
         return status();
       });
     },
-    /** Stops the watcher and its interval; repeat calls are no-ops, and a failed stop leaves it running so it can be retried. */
+    /**
+     * Stops the watcher and its interval; repeat calls are no-ops. The receiver's stop attempts every cleanup step before
+     * it reports a failure, so afterwards the receiver's own report decides whether it still runs; the failure itself is
+     * passed on and kept in status().lastStopError.
+     */
     async stop() {
       return serialize(async () => {
         if (running) {
-          await receiver.stop();
-          running = false;
-          startedBy = null;
+          try {
+            await receiver.stop();
+            lastStopError = null;
+          } catch (error) {
+            lastStopError = error;
+            throw error;
+          } finally {
+            running = receiver.diagnostics().running === true;
+            if (!running) startedBy = null;
+          }
         }
         return status();
       });

@@ -22,7 +22,7 @@ const json = async file => {
 };
 
 // Receiver records transport facts only. It never writes ledger or business files.
-export function createReceiver({ root, agent, allowFrom = [], adapter, now = () => Date.now(), scanIntervalMs = 30000, debounceMs = 300 } = {}) {
+export function createReceiver({ root, agent, allowFrom = [], adapter, now = () => Date.now(), scanIntervalMs = 30000, debounceMs = 300, watch = fs.watch } = {}) {
   assertId(agent); allowFrom.forEach(assertId);
   root = path.resolve(root);
   let ancestor = root;
@@ -164,19 +164,48 @@ export function createReceiver({ root, agent, allowFrom = [], adapter, now = () 
   };
   let lastError;
   const onError = error => { lastError = { at: new Date(now()).toISOString(), message: error.message }; };
+  // start() and stop() run one at a time. start() waits twice (the inbox directory, the first scan); a stop() arriving in
+  // between runs after it and tears down what it opened, so nothing is scheduled once stop() has returned, and two
+  // concurrent starts open one watcher, not two.
+  let lifecycle = Promise.resolve();
+  const serially = task => {
+    const next = lifecycle.then(task, task);
+    lifecycle = next.catch(() => {});
+    return next;
+  };
   return {
     scan,
     snapshot: () => json(stateFile()),
     diagnostics: () => ({ running: !stopped, dispatchEnabled: verifiedAdapter, lastError }),
-    async start() {
-      if (!stopped) return;
-      await fsp.mkdir(inbox(), { recursive: true });
-      stopped = false;
-      try { watcher = fs.watch(inbox(), hint); watcher.on('error', onError); }
-      catch (error) { onError(error); }
-      await scan();
-      interval = setInterval(() => { void scan().catch(onError); }, scanIntervalMs);
+    start() {
+      return serially(async () => {
+        if (!stopped) return;
+        await fsp.mkdir(inbox(), { recursive: true });
+        stopped = false;
+        try { watcher = watch(inbox(), hint); watcher.on('error', onError); }
+        catch (error) { onError(error); }
+        await scan();
+        interval = setInterval(() => { void scan().catch(onError); }, scanIntervalMs);
+      });
     },
-    async stop() { stopped = true; watcher?.close(); clearInterval(interval); clearTimeout(debounce); await Promise.allSettled([...active]); },
+    /**
+     * Stops for good even when a step fails. New scheduling ends first (the flag silences watcher hints, both timers are
+     * cleared), then the watcher is closed, then scans already running are awaited; a close failure is reported only after
+     * all of that. The watcher reference is dropped before closing, so a repeated stop touches nothing and throws nothing.
+     * Clearing a timer or awaiting allSettled cannot throw, so closing the watcher is the one step that can fail.
+     */
+    stop() {
+      return serially(async () => {
+        stopped = true;
+        clearInterval(interval); interval = undefined;
+        clearTimeout(debounce); debounce = undefined;
+        const closing = watcher;
+        watcher = undefined;
+        let failure = null;
+        try { closing?.close(); } catch (error) { failure = error; }
+        await Promise.allSettled([...active]);
+        if (failure !== null) throw failure;
+      });
+    },
   };
 }
