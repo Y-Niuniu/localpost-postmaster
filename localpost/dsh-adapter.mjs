@@ -7,6 +7,31 @@ function failure(code, message, extra = {}) {
 }
 const text = value => typeof value === 'string' && value.trim() !== '';
 
+// Host v4 admission (verified against the installed 0.2.0-rc.2; team evidence:
+// work/e2-contract/host-producer-kind-contract.md §0 and §3 item 3): an interpreted message is persisted only
+// when its source is an object whose `kind` is a nonempty string and not 'plugin'. There is no registry to
+// enlist in - any other kind is kept verbatim.
+//
+// The receiver still speaks the released V3 wrapper {kind:'plugin', plugin:'localpost', form:'relay'}, so the
+// adapter translates it here, at the host boundary. 'plugin:localpost' is byte-for-byte what the host's own
+// V3->V4 migration derives from plugin='localpost' (contract §2), so historical and new records name one
+// producer instead of splitting it in two. `form:'relay'` is kept as-is: the client renders `form` from a
+// closed union and throws on unknown values (contract §6 risk 2).
+//
+// This constant is the exact object handed to the host, and assertHostSource below checks it, so the file's
+// own source self-check can never drift from what it emits.
+const HOST_RELAY_SOURCE = Object.freeze({ kind: 'plugin:localpost', form: 'relay' });
+
+// The host admission predicate (contract §3 item 3: a nonempty string kind other than 'plugin' - the row
+// guard applies it to the retired 'plugin' wrapper, and every declared native message slot applies it to every
+// message). It is a fail-fast self-check of HOST_RELAY_SOURCE, not a policy check on inbound requests.
+function assertHostSource(source) {
+  if (typeof source?.kind !== 'string' || source.kind.length === 0 || source.kind === 'plugin') {
+    throw failure('delivery_source_invalid',
+      'The host accepts only a producer-owned source kind: a nonempty string other than "plugin"');
+  }
+}
+
 /**
  * Same-host adapter for the installed DSH rc.2 public Agent API.
  *
@@ -20,6 +45,7 @@ const text = value => typeof value === 'string' && value.trim() !== '';
  */
 export function createDshAdapter({ ctx, runtimeVersion, bindingProvider, acceptance, hostId = 'local', mailboxAgent = 'dsh' } = {}) {
   assertId(mailboxAgent);
+  assertHostSource(HOST_RELAY_SOURCE);
   const capabilities = Object.freeze({
     trustedBinding: bindingProvider?.trusted === true &&
       typeof bindingProvider.resolve === 'function' && typeof bindingProvider.verifyBinding === 'function',
@@ -65,7 +91,7 @@ export function createDshAdapter({ ctx, runtimeVersion, bindingProvider, accepta
       }
       const messageReference = Object.freeze({ agent: reference.agent, id: reference.id });
       const message = Object.freeze({
-        source: Object.freeze({ kind: 'plugin', plugin: 'localpost', form: 'relay' }),
+        source: HOST_RELAY_SOURCE,
         content: Object.freeze([Object.freeze({ type: 'text', text:
           `LocalPost agent mail relay. Authorized scope: analysis-reply. ` +
           `Read your own mailbox envelope ${JSON.stringify(messageReference)}; analyze and reply. ` +

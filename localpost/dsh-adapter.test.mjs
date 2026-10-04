@@ -32,6 +32,8 @@ async function setup(t, { capabilities, version = '0.2.0-rc.2', bound = true } =
     acceptance: createLedgerAcceptance({ store: createSessionStore({ root }), identity: 'dsh' }) });
   return { root, host, store, make, adapter: make(), route: bound ? arrivalRoute(await store.read('dsh')).route : null };
 }
+// Request vocabulary: the released V3 wrapper the receiver speaks. The adapter translates it at the host
+// boundary into the producer-owned kind the host persists (see HOST_RELAY_SOURCE in dsh-adapter.mjs).
 const request = (route, extra = {}) => ({
   route, digest, idempotencyKey: 'dsh:letter-a', source: { kind: 'plugin', plugin: 'localpost', form: 'relay' },
   scope: 'analysis-reply', after: 'whole-turn', messageReference: { agent: 'dsh', id: 'letter-a' }, ...extra,
@@ -56,8 +58,26 @@ test('the arrival route A is kept and the mail goes as a plugin relay after a wh
   const [delivered] = host.followups();
   assert.equal(host.followups().length, 1);
   assert.equal(delivered.threadId, 'chat-a');
-  assert.deepEqual(delivered.source, { kind: 'plugin', plugin: 'localpost', form: 'relay' });
+  assert.deepEqual(delivered.source, { kind: 'plugin:localpost', form: 'relay' });
   for (const pattern of [/analysis-reply/, /letter-a/, /untrusted/]) assert.match(delivered.text, pattern);
+});
+
+test('the delivered source satisfies the host v4 producer-owned kind contract', async t => {
+  const { adapter, host, route } = await setup(t);
+  await adapter.submit(request(route));
+  const [delivered] = host.followups();
+  // Host admission, copied verbatim from work/e2-contract/host-producer-kind-contract.md §3 item 3: the host
+  // accepts a source whose kind is a nonempty string other than 'plugin'; any other kind is kept verbatim.
+  const { kind } = delivered.source;
+  assert.equal(typeof kind, 'string');
+  assert.notEqual(kind.length, 0);
+  assert.notEqual(kind, 'plugin');
+  // 'plugin:localpost' is what the host's own V3->V4 migration derives from plugin='localpost' (contract §2),
+  // so a record written now and a migrated record name the same producer.
+  assert.equal(kind, 'plugin:localpost');
+  // form stays 'relay': the client renders form from a closed union and throws on unknown values (contract §6).
+  assert.equal(delivered.source.form, 'relay');
+  assert.equal(Object.hasOwn(delivered.source, 'plugin'), false, 'the V3 wrapper must not reach the host');
 });
 
 test('the same mail key wakes the chat once, also through a restarted adapter', async t => {
