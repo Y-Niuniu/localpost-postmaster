@@ -77,41 +77,56 @@ E 通过只是**第一道门槛 T1**。仍需：
 ## 6. 本方案未做的事
 
 未启用任何派发、未启动 receiver、未创建测试根或测试会话、未改任何生产配置、未联系任何真实模型。
-## 接线状态（2026-10-04）
 
-**状态：`ready_for_live_E`。** 宿主桥与邮件工具已接到真实 DSH 插件入口（`lib/index.js`），
-但**默认关闭**：只有显式 `eAcceptance.enabled === true` **且** `root` 恰为隔离根
-`C:/AI_ASSIST/work/localpost-e-test/` **且** 运行时为受支持版本时，才会注册命令与工具。
+## 接线状态（2026-10-04，R4 修订）
+
+**状态：代码就绪（`ready_for_live_E`），待 codex 复审；真机 E1–E6 尚未执行。** `ready_for_live_E` 只表示入口代码可以开始真机验收，
+**不表示 E 已通过**，也不是启用生产派发的许可。
+
+宿主桥与邮件工具已接到真实 DSH 插件入口（`lib/index.js`），但**默认关闭**：只有显式开启、`root` 恰为隔离根
+`C:/AI_ASSIST/work/localpost-e-test/`、运行时为受支持版本且有外部预检记录、`allowFrom` 合法时，才会注册命令与工具。
 生产根 `C:/AI_ASSIST/.mailbox` **及其任何子路径一律拒绝**（`production_root_refused`）。
 
 接线点：`lib/index.js` 内 `ctx.effect(...)`（标签 `dsh-localpost-postmaster: isolated E entry`），
 逻辑在 `localpost/dsh-wiring.mjs`；插件由 profile 以 `link:C:/AI_ASSIST/tools/dsh-localpost-postmaster` 加载。
 
+### 注册是一个事务（全有或全无）
+
+1. 先做全部无副作用的校验：开关、根、版本与预检记录、`allowFrom`、两个计时参数、`commands.find` 可用。
+2. 再构造全部对象，**包括 receiver**（只构造、不启动）；构造失败返回 `build_failed`，此时什么都没注册。
+3. 用 `commands.find` 预检三条 E 命令名：已被占用返回 `e_command_name_taken`，查找本身抛错返回 `e_lookup_failed`，都在任何注册之前。
+4. 依次注册基础三命令、邮件工具（含 shadow guard）、三条 E 命令。任一步失败都会**逆序释放已注册的全部**，
+   返回结构化拒绝（`commands_*` / `tools_*` / `registration_failed`），宿主侧最终零残留，之后可以重试。
+5. 每个 wiring 只释放自己注册的东西；旧实例的 dispose 不会碰后继实例。
+
 ### 隔离启动 / 停止（不改 profile，避免重复行）
 
 本插件的装配来自 profile 的 `package.json`（`link:` 依赖 + bundles 列表），**不在 `cordis.patch.yml` 里**。
-因此**不要**为了开关去加 patch row（会与 bundle 行重复）。改用环境变量显式开启：
+因此**不要**为了开关去加 patch row（会与 bundle 行重复）。改用环境变量显式开启，共 **7 个变量**：
 
 ```
 DSH_LOCALPOST_E_ENABLED=1
 DSH_LOCALPOST_E_ROOT=C:/AI_ASSIST/work/localpost-e-test
 DSH_LOCALPOST_E_RUNTIME=0.2.0-rc.2
 DSH_LOCALPOST_E_EVIDENCE=precheck:desktop app.asar package.json 0.2.0-rc.2 + sha256:<外部预检哈希>
-DSH_LOCALPOST_E_ALLOW_FROM=codex            # 精确发件人（逗号分隔），不得留空
-DSH_LOCALPOST_E_SCAN_MS=30000               # 可选：1000..3600000
-DSH_LOCALPOST_E_DEBOUNCE_MS=250             # 可选：50..600000
+DSH_LOCALPOST_E_ALLOW_FROM=codex            # 必填。逗号分隔，不得有空格或空项；每项都须是安全标识符
+DSH_LOCALPOST_E_SCAN_MS=30000               # 可选：整数 1000..3600000
+DSH_LOCALPOST_E_DEBOUNCE_MS=250             # 可选：整数 50..600000
 ```
 
-1. **启动**：以上四个变量齐备后重载插件；日志出现
-   `隔离验收入口已就绪：status=ready_for_live_E`，此时注册 3 条人类命令与 5 个工具。
-2. **停止**：把 `DSH_LOCALPOST_E_ENABLED` 置 0 或删除这四个变量并重载；日志出现
-   `隔离验收入口未启用（disabled_by_default）`，`ctx.effect` 的 disposer 释放命令、工具与 guard，**零残留**。
+`allowFrom` 不做任何清洗：`codex, dsh`（带空格）、`codex,,dsh`（空项）、`../x` 这类值会整体拒绝（`allow_from_invalid`），
+不会被悄悄过滤掉。安全标识符 = 字母或数字开头，其余只含 `A-Z a-z 0-9 _ . -`。
+
+1. **启动**：7 个变量齐备（后两个可省）后启动宿主；日志出现
+   `隔离验收入口已就绪：status=ready_for_live_E`，此时注册 6 条人类命令（基础 3 条 + E 3 条）、5 个工具与 1 个 guard。
+2. **停止**：把 `DSH_LOCALPOST_E_ENABLED` 置 0 或删掉这 7 个变量，然后重启宿主；日志出现
+   `隔离验收入口未启用（disabled_by_default）`。
 3. **row config 方式**（可选）：如果确实要用 `eAcceptance` 行配置，需要在插件装配层改配置 ——
    **那属于改生产 profile**，须先取得用户授权（回 `needs_authorization`），不得自行修改。
 
 ### 版本来源（不是模型可随意伪造的）
 
-- 运行时门禁 = **能力探测**（`tools.register/get/guard` + `agents.get` + `commands.register`），
+- 运行时门禁 = **能力探测**（`tools.register/get/guard` + `agents.get` + `commands.register/find`），
   版本字符串只是配置；`versionEvidence` 必填，用来记录**外部预检**。
 - 外部预检事实（codex 直接读桌面版 `app.asar` 核对）：`@deepseek-ai/dsh-desktop 0.2.0-rc.2`、
   `dsh-desktop-runtime 0.2.0-rc.2`、`dsh-base 0.2.0-rc.2`；PATH 里的 `dsh --version = 0.1.5-rc.1`
@@ -119,37 +134,65 @@ DSH_LOCALPOST_E_DEBOUNCE_MS=250             # 可选：50..600000
 
 ### 真机 E 的 receiver 控制（人类命令，不是工具）
 
-隔离 receiver 由 wiring **单例拥有**，且**只能从三条人类命令启动/停止/查询**（须为已绑定测试聊天 + 宿主证明调用者）：
+隔离 receiver 由 wiring **单例拥有**，**只能**通过三条无参数、`recordInput:false` 的人类命令操作：
 
     /localpost-e-start    启动隔离 receiver（扫描隔离根）
     /localpost-e-stop     停止（关闭 watcher 与 interval）
-    /localpost-e-status   查看 running/stopped/dispatchEnabled/lastError
+    /localpost-e-status   查看 running / dispatchEnabled / lastError / lastStartError / shutdownError
 
-它们**不是模型可调用的工具**；插件加载与热重载都**不会**自动启动。wiring.dispose() 会先停掉自己启动的
-receiver（排空 start/stop 队列）再释放注册；旧 disposer 不会停到后继实例。
+每条命令执行前依次检查：
 
-### 隔离启动 runbook（desktop rc.2；只写步骤，不执行）
+1. **遮蔽**：宿主为这个 agent 实际解析到的定义（`commands.find(invocation.agent, name)`）必须正是本 wiring 注册的那一个。
+   被 scoped 命令遮蔽或查找出错时一律拒绝，不启动也不停止 receiver。
+2. **调用者**：由宿主证明（`agents.get(id) === invocation.agent`，工作目录为绝对路径）。
+3. **权限**：
+   - `start`：只有已绑定的测试聊天，且绑定处于 active + 自动模式；
+   - `stop` / `status`：已绑定的测试聊天（任何绑定状态）**或启动这个 receiver 的聊天**。
+     所以即使绑定被改成手动、被冻结、被删除，receiver 也总能停下来；卸载插件也会停掉它。
 
-1. **环境变量必须在宿主启动前注入**：Windows 上已运行的进程不会获得另一个 shell 后设的变量。
-   关闭桌面版 → 在启动它的那个 shell/快捷方式里设好上面 7 个变量 → 再启动桌面版。
-2. **确认命中当前 profile**：启动后插件日志出现「隔离验收入口已就绪：status=ready_for_live_E」；
-   若出现「未启用（allow_from_required / disabled_by_default / version_evidence_missing）」，
-   说明变量没进到该进程或 AllowFrom 为空 —— 此时**仍是关闭状态**（fail closed），不是故障。
-3. **确认没有自动启动**：/localpost-e-status 应显示 running:false（加载不等于启动）。
-4. **停止**：/localpost-e-stop（或关闭该宿主进程）；卸载/重载后 receiver 不残留。
-5. 全程**不改生产 profile**；生产 .mailbox、receiver 与自动派发始终不参与。
+它们**不是模型可调用的工具**；插件加载与热重载都**不会**自动启动。
 
-### 原 receiver 控制说明（保留）
+- 重复、并发的 start 只会构造一个 receiver、底层只启动一次。
+- start 失败不会报告 running，并会关闭半启动的 watcher；之后可以安全地 stop 或卸载。
+- 卸载（Cordis rc.2 会等待 effect disposer 返回的 Promise）：先停 receiver，**无论停止是否成功都释放全部注册**；
+  停止失败的原因记在 `status().shutdownError`，并由插件入口写入错误日志，不会出现「卸了一半」。
 
-加载插件**不会**启动 receiver。`wiring.parts.receiverControl({ allowFrom })` 返回受限控制面：
-root 与 identity 在闭包内固定为隔离根与 `dsh`（调用者无法指向生产根），
-`allowFrom` 必须显式非空，`start()/stop()` 幂等，`diagnostics()` 给出 `running/stopped/dispatchEnabled`。
-启动它属于**真机 E 的单独授权步骤**。
+### 隔离启动 runbook（desktop rc.2；只写步骤，**不执行**、不改快捷方式或 profile）
+
+1. **环境变量必须在宿主启动前注入**：已运行的进程拿不到另一个 shell 事后设置的变量；
+   若宿主已在运行，再次启动可能只把请求交给已有实例（单实例行为，**未验证**）。所以要先完全退出桌面版。
+2. 在一个新的 PowerShell 窗口里设好变量，再从同一个窗口启动（命令草案，不要在生产会话里执行）：
+
+   ```powershell
+   $env:DSH_LOCALPOST_E_ENABLED = '1'
+   $env:DSH_LOCALPOST_E_ROOT = 'C:/AI_ASSIST/work/localpost-e-test'
+   $env:DSH_LOCALPOST_E_RUNTIME = '0.2.0-rc.2'
+   $env:DSH_LOCALPOST_E_EVIDENCE = 'precheck:desktop app.asar package.json 0.2.0-rc.2 + sha256:<外部预检哈希>'
+   $env:DSH_LOCALPOST_E_ALLOW_FROM = 'codex'
+   $env:DSH_LOCALPOST_E_SCAN_MS = '30000'
+   $env:DSH_LOCALPOST_E_DEBOUNCE_MS = '250'
+   & "$env:LOCALAPPDATA\Programs\DeepSeek Harness\DeepSeek Harness.exe"
+   ```
+
+   安装路径取自本机实测（`C:\Users\16548\AppData\Local\Programs\DeepSeek Harness\`，见 `docs/host-capability-report.md` §一）。
+3. **确认命中当前 profile**：启动后插件日志出现「隔离验收入口已就绪：status=ready_for_live_E」。
+   若出现「未启用（allow_from_required / allow_from_invalid / disabled_by_default / version_evidence_missing …）」，
+   说明变量没进到该进程或取值不合法 —— 此时**仍是关闭状态**（fail closed），不是故障。
+4. **确认没有自动启动**：在已绑定的测试聊天里执行 /localpost-e-status，应显示 `running:false`（加载不等于启动）。
+5. **停止**：/localpost-e-stop（或退出该宿主进程）；卸载或重启后 receiver 不残留。
+6. 全程**不改生产 profile**；生产 `.mailbox`、生产 receiver 与自动派发始终不参与。
+
+### 测试与隔离根
+
+- 单元测试**不读写**隔离根：每个用例用 `.localpost-tmp/dsh-wiring/` 下的唯一临时根加 fake receiver
+  （通过 `isolatedRoot` 与 `receiverFactory` 注入；插件入口两者都不传，生产固定用 canonical 根与真实 receiver）。
+  最后一个用例断言 canonical 根的目录与文件字节在测试前后完全一致。
+- 隔离根里目前残留 R3 测试的产物：`agents/dsh/inbox/`（空目录）、`runtime/queues/dsh.json`（178 字节，2026-10-04 10:31）。
+  **不要在代码或测试里删除**；真机 E 开始前由 dsh 按受控清单清空并重建这个**测试根**（只动测试根，不碰生产 `.mailbox`）。
 
 ### 尚未发生（不要误读）
 
-- **E1–E6 真机验收尚未执行**；本状态只表示入口可执行。
-- **生产自动派发、receiver、真实宿主投递仍然全部关闭**。
-- receiver 以**未启动**的形式返回（不提供 factory），启用属于后续单独授权的步骤。
-- 残余风险：`runtimeVersion` 目前由配置声明（不是宿主自证），真正的门禁是能力探测
-  （`tools.register/get/guard` + `agents.get` + `commands.register`）；接线后插件加载时会多引入若干模块。
+- **E1–E6 真机验收尚未执行**；本状态只表示入口代码可执行。
+- **生产自动派发、生产 receiver、真实宿主投递仍然全部关闭**。
+- receiver 由 wiring 单例拥有、以**未启动**的形式存在；启动它属于真机 E 的单独授权步骤。
+- 残余风险：`runtimeVersion` 目前由配置声明（不是宿主自证），真正的门禁是能力探测；接线后插件加载时会多引入若干模块。

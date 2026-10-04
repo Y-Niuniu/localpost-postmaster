@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { assertId } from './fs-safe.mjs';
 import { createSessionStore } from './session-binding.mjs';
 import { createMailbox } from './mailbox.mjs';
 import { createBindingProvider } from './binding-provider.mjs';
@@ -19,18 +20,21 @@ import { createReceiver } from './receiver.mjs';
  *   - nothing is registered unless the caller explicitly asked for it (default off);
  *   - only the isolated test root is accepted; the production mailbox root - and anything under it -
  *     is refused outright, so a typo can never point automatic handling at real mail;
- *   - every capability the bridge and the tools need is required, and the runtime must be the exact
- *     supported one, so a host that cannot attest a chat registers nothing;
- *   - the receiver is returned as a factory that is NOT started: live E1-E6 stay a separately
- *     authorized step, not a side effect of loading a plugin;
- *   - dispose releases commands, tools, guard and store handles and is idempotent.
+ *   - every input and capability is checked, and everything that can fail without side effects - the
+ *     receiver included - is built, before the first registration;
+ *   - the registrations (base commands, mail tools with their guard, E commands) are one transaction:
+ *     any failure releases what was registered, in reverse order, and returns a refusal;
+ *   - the receiver is owned here and handed out unstarted: only the E human commands start it, so live
+ *     E1-E6 stay a separately authorized step, not a side effect of loading a plugin;
+ *   - dispose stops the receiver and then releases every registration, even when stopping fails.
  *
- * Status of this entry point is `ready_for_live_E`. It is not evidence that E1-E6 ran, and it is not
- * permission to enable production dispatch.
+ * Status `ready_for_live_E` means the code is ready for the live run. It is not evidence that E1-E6
+ * ran, and it is not permission to enable production dispatch.
  */
 export const ISOLATED_ROOT = 'C:/AI_ASSIST/work/localpost-e-test';
 export const PRODUCTION_ROOT = 'C:/AI_ASSIST/.mailbox';
 export const WIRING_STATUS = 'ready_for_live_E';
+export const E_COMMANDS = Object.freeze({ start: 'localpost-e-start', stop: 'localpost-e-stop', status: 'localpost-e-status' });
 
 const resolved = value => { try { return path.resolve(String(value)); } catch { return null; } };
 const samePath = (left, right) => left !== null && right !== null && left.toLowerCase() === right.toLowerCase();
@@ -40,23 +44,39 @@ const underPath = (child, parent) => {
   const base = parent.toLowerCase();
   return low === base || low.startsWith(base.endsWith(path.sep) ? base : base + path.sep);
 };
+const safeId = value => { try { assertId(value); return true; } catch { return false; } };
+const errorText = error => String(error?.message ?? error);
+
+/**
+ * The sender list as the environment carries it: a comma-separated string. Nothing is trimmed or dropped here, so a
+ * blank or padded entry reaches the strict check in createIsolatedWiring and refuses the wiring instead of vanishing.
+ */
+export function allowFromConfig(value) {
+  return value === undefined || value === null || value === '' ? [] : String(value).split(',');
+}
 
 /** A refusal that registered nothing and disposes nothing, so callers can treat every shape alike. */
-function refused(reason, decisions) {
-  return Object.freeze({ enabled: false, status: WIRING_STATUS, reason, decisions: Object.freeze([...decisions]), dispose: () => {} });
+function refused(reason, decisions, detail) {
+  return Object.freeze({ enabled: false, status: WIRING_STATUS, reason, ...(detail === undefined ? {} : { detail }),
+    decisions: Object.freeze([...decisions]), dispose: () => {} });
 }
 
 /**
- * @param {{ctx?: object, config?: {enabled?: boolean, root?: string}, runtimeVersion?: string, identity?: string, hostId?: string}} input
- * @returns {{enabled: boolean, status: string, reason?: string, decisions: readonly string[], dispose: () => void, parts?: object}}
+ * @param {{ctx?: object, config?: {enabled?: boolean, root?: string, allowFrom?: string[], scanIntervalMs?: number, debounceMs?: number},
+ *   runtimeVersion?: string, versionEvidence?: string, identity?: string, hostId?: string,
+ *   isolatedRoot?: string, receiverFactory?: (options: object) => {start: Function, stop: Function, diagnostics: Function}}} input
+ *   isolatedRoot and receiverFactory exist for tests (a unique temporary root, a counting fake); the plugin entry passes
+ *   neither, so production always gets the canonical isolated root and the real receiver.
+ * @returns {{enabled: boolean, status: string, reason?: string, detail?: string, decisions: readonly string[], dispose: () => Promise<void> | void, parts?: object}}
  */
-export function createIsolatedWiring({ ctx, config = {}, runtimeVersion, versionEvidence, identity = 'dsh', hostId = 'local' } = {}) {
+export function createIsolatedWiring({ ctx, config = {}, runtimeVersion, versionEvidence, identity = 'dsh', hostId = 'local',
+  isolatedRoot = ISOLATED_ROOT, receiverFactory = createReceiver } = {}) {
   const decisions = [];
   if (config?.enabled !== true) return refused('disabled_by_default', decisions);
   decisions.push('explicitly_enabled');
 
   const root = resolved(config.root);
-  const isolated = resolved(ISOLATED_ROOT);
+  const isolated = resolved(isolatedRoot);
   const production = resolved(PRODUCTION_ROOT);
   if (root === null || String(config.root ?? '').trim() === '') return refused('root_invalid', decisions);
   // The production mailbox root first: a misconfigured path must never reach real mail.
@@ -71,140 +91,183 @@ export function createIsolatedWiring({ ctx, config = {}, runtimeVersion, version
   if (typeof versionEvidence !== 'string' || versionEvidence.trim() === '') return refused('version_evidence_missing', decisions);
   decisions.push('version_evidence_recorded');
 
-  // Inputs are validated here, not left to whoever calls the control: an interval of 0 or a negative
-  // value would spin a timer, and an open sender list would widen who may wake a chat.
-  const allowFrom = Array.isArray(config?.allowFrom)
-    ? config.allowFrom.filter(entry => typeof entry === 'string' && entry.trim() !== '')
-    : [];
-  if (allowFrom.length === 0) return refused('allow_from_required', decisions);
+  // Every sender must be an exact safe identifier: a blank, padded or malformed entry refuses the wiring rather than
+  // being dropped, so the list that runs is the list that was written.
+  const allowFrom = config?.allowFrom;
+  if (allowFrom === undefined || (Array.isArray(allowFrom) && allowFrom.length === 0)) return refused('allow_from_required', decisions);
+  if (!Array.isArray(allowFrom) || !allowFrom.every(entry => typeof entry === 'string' && safeId(entry))) return refused('allow_from_invalid', decisions);
+  // An interval of 0 or a negative value would spin a timer; the bounds fail closed on both sides.
   const scanIntervalMs = config?.scanIntervalMs === undefined ? 30000 : config.scanIntervalMs;
   if (!Number.isInteger(scanIntervalMs) || scanIntervalMs < 1000 || scanIntervalMs > 3600000) return refused('scan_interval_invalid', decisions);
   const debounceMs = config?.debounceMs === undefined ? 250 : config.debounceMs;
   if (!Number.isInteger(debounceMs) || debounceMs < 50 || debounceMs > 600000) return refused('debounce_invalid', decisions);
   decisions.push('allowlist_and_timers_validated');
+  // The E commands are guarded against shadowing through the host's own lookup, so it is a required capability.
+  if (typeof ctx?.commands?.find !== 'function') return refused('e_lookup_unavailable', decisions);
 
-  const store = createSessionStore({ root });
-  const mailbox = createMailbox({ root, identity });
-  const bridge = createDshHostBridge({ ctx, runtimeVersion, store, identity, hostId });
-  const tools = createMailTools({ ctx, mailbox, store, identity, runtimeVersion, hostId });
-  const acceptance = createLedgerAcceptance({ store, identity });
-
-  // Nothing is registered before every piece that could fail has been built.
-  const commands = bridge.registerCommands();
-  if (commands.ok !== true) return refused('commands_' + String(commands.reason ?? 'refused'), decisions);
-  const registered = tools.register();
-  if (registered.ok !== true) {
-    commands.dispose();
-    return refused('tools_' + String(registered.reason ?? 'refused'), decisions);
+  // Everything that can fail without side effects is built before the first registration - the receiver included.
+  let store, bridge, tools, adapter, receiver;
+  try {
+    store = createSessionStore({ root });
+    const mailbox = createMailbox({ root, identity });
+    bridge = createDshHostBridge({ ctx, runtimeVersion, store, identity, hostId });
+    tools = createMailTools({ ctx, mailbox, store, identity, runtimeVersion, hostId });
+    const acceptance = createLedgerAcceptance({ store, identity });
+    adapter = createDshAdapter({ ctx, runtimeVersion, hostId, mailboxAgent: identity, acceptance,
+      bindingProvider: createBindingProvider({ store, identity, host: bridge }) });
+    receiver = receiverFactory({ root, agent: identity, allowFrom: [...allowFrom], adapter, scanIntervalMs, debounceMs });
+  } catch (error) {
+    return refused('build_failed', decisions, errorText(error));
   }
-  decisions.push('commands_registered', 'tools_registered');
+  decisions.push('built');
 
-  // The E entry points are human commands, registered only in E mode: no model-callable tool can start
-  // automatic dispatch, and nothing starts merely because the plugin loaded.
-  const eCommands = [];
-  const callerOf = invocation => attestedCommandCaller(invocation, ctx?.agents, hostId);
-  const boundToCaller = async caller => {
-    const state = await store.read(identity);
-    const bound = state?.binding?.session;
-    return Boolean(caller) && bound?.host === caller.host && bound?.id === caller.session && (bound?.cwd ?? null) === caller.cwd;
-  };
-  const defineE = (name, description, act) => {
-    const dispose = ctx.commands.register({
-      name, description, recordInput: false,
-      handler: async invocation => {
-        const caller = callerOf(invocation);
-        if (!caller) return { kind: 'error', text: 'LocalPost: 无法证明调用者身份，已拒绝。' };
-        if (!(await boundToCaller(caller))) return { kind: 'error', text: 'LocalPost: 只有已绑定的测试聊天可以操作隔离 receiver。' };
-        try { return { kind: 'success', text: 'LocalPost E: ' + JSON.stringify(await act()) }; }
-        catch (error) { return { kind: 'error', text: 'LocalPost E: ' + String(error?.message ?? error) }; }
-      },
-    });
-    eCommands.push(dispose);
-  };
+  // The E names are checked with the host before anything is registered; an unreadable lookup is not "free".
+  for (const name of Object.values(E_COMMANDS)) {
+    let existing;
+    try { existing = ctx.commands.find(undefined, name); }
+    catch (error) { return refused('e_lookup_failed', decisions, name + ': ' + errorText(error)); }
+    if (existing !== undefined) return refused('e_command_name_taken', decisions, name);
+  }
 
-  let shutdownPromise = null;
-  /**
-   * Stops the receiver this wiring owns - draining the start/stop queue - and only then releases the
-   * registrations. Idempotent, and it refuses to admit a later start. A host disposer that cannot await
-   * still gets the synchronous half (no new start from here on); the drain completes as soon as the
-   * queue it was already running finishes.
+  /*
+   * The one receiver this wiring owns: one watcher, one interval, one owner. Constructing it touched nothing; only
+   * start() scans. Every start/stop runs through one queue, so concurrent calls queue instead of racing the watcher.
    */
-  const shutdown = () => {
-    if (shutdownPromise !== null) return shutdownPromise;
-    disposed = true;
-    shutdownPromise = control.stop().then(() => { release(); });
-    return shutdownPromise;
-  };
-
-  defineE('localpost-e-start', '启动隔离验收 receiver（仅 E 模式、仅已绑定测试聊天、无参数）。', () => control.start());
-  defineE('localpost-e-stop', '停止隔离验收 receiver（无参数）。', () => control.stop());
-  defineE('localpost-e-status', '查看隔离验收 receiver 状态（无参数）。', () => control.status());
-
-  let observed = null;
-  const release = () => {
-    if (observed !== null) return;
-    observed = true;
-    for (const dispose of eCommands.splice(0).reverse()) { try { dispose(); } catch { /* release is best effort */ } }
-    try { registered.dispose(); } catch { /* release is best effort */ }
-    try { commands.dispose(); } catch { /* release is best effort */ }
-  };
-
-  const adapter = createDshAdapter({
-    ctx, runtimeVersion, hostId, mailboxAgent: identity, acceptance,
-    bindingProvider: createBindingProvider({ store, identity, host: bridge }),
-  });
-
-  /**
-   * The receiver, owned HERE as a singleton: one watcher, one interval, one owner.
-   *
-   * Constructing it touches nothing; only start() scans. Because the wiring owns it, dispose() can stop
-   * what it started - a receiver that outlived its registration would keep scanning a root nobody watches.
-   * Root and identity are the validated isolated values, so no caller can point it at production.
-   */
-  const receiver = createReceiver({ root, agent: identity, allowFrom: [...allowFrom], adapter, scanIntervalMs, debounceMs });
   let running = false;
   let disposed = false;
-  // Every start/stop/dispose runs through this chain: concurrent calls queue instead of racing the watcher.
+  let startedBy = null;
+  let lastStartError = null;
+  let shutdownError = null;
   let queue = Promise.resolve();
   const serialize = task => {
     const next = queue.then(task, task);
     queue = next.catch(() => {});
     return next;
   };
-  const status = () => Object.freeze({ ...receiver.diagnostics(), owned: true, running, disposed, root });
+  const status = () => Object.freeze({ ...receiver.diagnostics(), owned: true, running, disposed, root,
+    ...(lastStartError === null ? {} : { lastStartError: errorText(lastStartError) }),
+    ...(shutdownError === null ? {} : { shutdownError: errorText(shutdownError) }) });
   const control = Object.freeze({
-    /** Starts the single watcher; repeat calls are no-ops, concurrent calls are serialised. */
-    async start() {
+    /** Starts the single watcher; repeat and concurrent calls start it once. A failed start is never reported running. */
+    async start(caller = null) {
       return serialize(async () => {
-        if (disposed) return status();
-        if (!running) { await receiver.start(); running = true; }
+        if (disposed || running) return status();
+        try {
+          await receiver.start();
+        } catch (error) {
+          lastStartError = error;
+          // A start that failed half-way may already hold a watcher: close it before reporting the failure.
+          try { await receiver.stop(); } catch { /* the start failure is the one to report */ }
+          throw error;
+        }
+        running = true;
+        startedBy = caller;
+        lastStartError = null;
         return status();
       });
     },
-    /** Stops the watcher and its interval; repeat calls are no-ops. */
+    /** Stops the watcher and its interval; repeat calls are no-ops, and a failed stop leaves it running so it can be retried. */
     async stop() {
       return serialize(async () => {
-        if (running) { await receiver.stop(); running = false; }
+        if (running) {
+          await receiver.stop();
+          running = false;
+          startedBy = null;
+        }
         return status();
       });
     },
     status,
   });
 
+  /*
+   * The E entry points are human commands: no model-callable tool can start automatic dispatch. Each one first proves
+   * that the definition the host resolves for this very agent is the one registered here (a scoped command can shadow a
+   * global one), then that the host attests the caller. Start needs the bound chat under an active, automatic binding;
+   * stop and status are open to the bound chat in any binding state and to the chat that started the running receiver,
+   * so a receiver can always be stopped - and unloading the plugin stops it in any case.
+   */
+  const handlers = new Map();
+  const effectiveIsOurs = (name, invocation) => {
+    try { return ctx.commands.find(invocation?.agent, name)?.handler === handlers.get(name); } catch { return false; }
+  };
+  const sameChat = (session, caller) => caller !== null && session?.host === caller.host && session?.id === caller.session &&
+    (session?.cwd ?? null) === caller.cwd;
+  const mayStart = (state, caller) => sameChat(state?.binding?.session, caller) && state.binding.state === 'active' && state.binding.mode === 'auto';
+  const mayControl = (state, caller) => sameChat(state?.binding?.session, caller) ||
+    (startedBy !== null && sameChat({ host: startedBy.host, id: startedBy.session, cwd: startedBy.cwd }, caller));
+  const defineE = (name, description, allowed, refusal, act) => {
+    const handler = async invocation => {
+      if (!effectiveIsOurs(name, invocation)) return { kind: 'error', text: 'LocalPost: /' + name + ' 被其他定义遮蔽或无法解析，未执行任何操作（shadowed）。' };
+      const caller = attestedCommandCaller(invocation, ctx.agents, hostId);
+      if (!caller) return { kind: 'error', text: 'LocalPost: 无法证明调用者身份，已拒绝。' };
+      let state = null;
+      let unreadable = null;
+      try { state = await store.read(identity); } catch (error) { unreadable = error; }
+      if (!allowed(state, caller)) return { kind: 'error', text: 'LocalPost: ' + refusal + (unreadable === null ? '' : '（绑定状态无法读取：' + errorText(unreadable) + '）') };
+      try { return { kind: 'success', text: 'LocalPost E: ' + JSON.stringify(await act(caller)) }; }
+      catch (error) { return { kind: 'error', text: 'LocalPost E: ' + errorText(error) }; }
+    };
+    handlers.set(name, handler);
+    return { name, description, recordInput: false, handler };
+  };
+  const eDefinitions = [
+    defineE(E_COMMANDS.start, '启动隔离验收 receiver（仅已绑定且处于自动模式的测试聊天、无参数）。', mayStart,
+      '只有已绑定且处于自动模式的测试聊天可以启动隔离 receiver。', caller => control.start(caller)),
+    defineE(E_COMMANDS.stop, '停止隔离验收 receiver（已绑定聊天或启动它的聊天、无参数）。', mayControl,
+      '只有已绑定的测试聊天或启动它的聊天可以停止隔离 receiver。', () => control.stop()),
+    defineE(E_COMMANDS.status, '查看隔离验收 receiver 状态（已绑定聊天或启动它的聊天、无参数）。', mayControl,
+      '只有已绑定的测试聊天或启动它的聊天可以查看隔离 receiver。', () => control.status()),
+  ];
+
+  // One transaction: base commands, mail tools with their guard, then the E commands. Any failure releases everything
+  // registered so far, in reverse order, and the caller gets a refusal instead of a half-registered wiring.
+  const disposers = [];
+  const release = () => { for (const dispose of disposers.splice(0).reverse()) { try { dispose(); } catch { /* release is best effort */ } } };
+  try {
+    const commands = bridge.registerCommands();
+    if (commands.ok !== true) { release(); return refused('commands_' + String(commands.reason ?? 'refused'), decisions, commands.name); }
+    disposers.push(commands.dispose);
+    const registered = tools.register();
+    if (registered.ok !== true) { release(); return refused('tools_' + String(registered.reason ?? 'refused'), decisions, registered.name); }
+    disposers.push(registered.dispose);
+    for (const definition of eDefinitions) {
+      const dispose = ctx.commands.register(definition);
+      disposers.push(typeof dispose === 'function' ? dispose : () => {});
+    }
+  } catch (error) {
+    release();
+    return refused('registration_failed', decisions, errorText(error));
+  }
+  decisions.push('commands_registered', 'tools_registered', 'e_commands_registered');
+
+  /*
+   * Stops the receiver this wiring owns - after whatever start/stop is queued - and then releases every registration,
+   * even if stopping fails; that failure is kept and shown by status().shutdownError. Idempotent, and no start is admitted
+   * from here on. Cordis rc.2 awaits a Promise returned by an effect disposer (fiber unload runs runDisposable), so the
+   * host waits for all of it.
+   */
+  let shutdownPromise = null;
+  const shutdown = () => {
+    if (shutdownPromise === null) {
+      disposed = true;
+      shutdownPromise = (async () => {
+        try { await control.stop(); } catch (error) { shutdownError = error; } finally { release(); }
+      })();
+    }
+    return shutdownPromise;
+  };
+
   decisions.push(adapter.capabilities.trustedBinding ? 'adapter_binding_trusted' : 'adapter_binding_untrusted');
 
   return Object.freeze({
     enabled: true, status: WIRING_STATUS, decisions: Object.freeze([...decisions]), dispose: shutdown,
     parts: Object.freeze({
-      root, store, mailbox, bridge, tools, acceptance, adapter,
+      root, store, bridge, tools, adapter,
       capabilities: Object.freeze({ ...tools.capabilities(), adapter: adapter.capabilities }),
       diagnostics: () => adapter.diagnostics(),
       versionEvidence,
-      /**
-       * Live E1-E6 are not a side effect of loading a plugin: the control is handed back unstarted,
-       * and starting it stays a separately authorized step on the isolated root.
-       */
-      /** The one receiver this wiring owns, handed out unstarted; start it from the E commands. */
+      /** The one receiver this wiring owns, handed out unstarted; it is started from the E commands only. */
       receiver: control,
     }),
   });
