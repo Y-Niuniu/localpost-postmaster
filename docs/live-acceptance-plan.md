@@ -97,6 +97,9 @@ DSH_LOCALPOST_E_ENABLED=1
 DSH_LOCALPOST_E_ROOT=C:/AI_ASSIST/work/localpost-e-test
 DSH_LOCALPOST_E_RUNTIME=0.2.0-rc.2
 DSH_LOCALPOST_E_EVIDENCE=precheck:desktop app.asar package.json 0.2.0-rc.2 + sha256:<外部预检哈希>
+DSH_LOCALPOST_E_ALLOW_FROM=codex            # 精确发件人（逗号分隔），不得留空
+DSH_LOCALPOST_E_SCAN_MS=30000               # 可选：1000..3600000
+DSH_LOCALPOST_E_DEBOUNCE_MS=250             # 可选：50..600000
 ```
 
 1. **启动**：以上四个变量齐备后重载插件；日志出现
@@ -114,7 +117,29 @@ DSH_LOCALPOST_E_EVIDENCE=precheck:desktop app.asar package.json 0.2.0-rc.2 + sha
   `dsh-desktop-runtime 0.2.0-rc.2`、`dsh-base 0.2.0-rc.2`；PATH 里的 `dsh --version = 0.1.5-rc.1`
   **是另一个旧 npm CLI，不代表运行中的桌面版**（不得据此改兼容、也不得升级 DSH）。
 
-### 真机 E 的 receiver 控制
+### 真机 E 的 receiver 控制（人类命令，不是工具）
+
+隔离 receiver 由 wiring **单例拥有**，且**只能从三条人类命令启动/停止/查询**（须为已绑定测试聊天 + 宿主证明调用者）：
+
+    /localpost-e-start    启动隔离 receiver（扫描隔离根）
+    /localpost-e-stop     停止（关闭 watcher 与 interval）
+    /localpost-e-status   查看 running/stopped/dispatchEnabled/lastError
+
+它们**不是模型可调用的工具**；插件加载与热重载都**不会**自动启动。wiring.dispose() 会先停掉自己启动的
+receiver（排空 start/stop 队列）再释放注册；旧 disposer 不会停到后继实例。
+
+### 隔离启动 runbook（desktop rc.2；只写步骤，不执行）
+
+1. **环境变量必须在宿主启动前注入**：Windows 上已运行的进程不会获得另一个 shell 后设的变量。
+   关闭桌面版 → 在启动它的那个 shell/快捷方式里设好上面 7 个变量 → 再启动桌面版。
+2. **确认命中当前 profile**：启动后插件日志出现「隔离验收入口已就绪：status=ready_for_live_E」；
+   若出现「未启用（allow_from_required / disabled_by_default / version_evidence_missing）」，
+   说明变量没进到该进程或 AllowFrom 为空 —— 此时**仍是关闭状态**（fail closed），不是故障。
+3. **确认没有自动启动**：/localpost-e-status 应显示 running:false（加载不等于启动）。
+4. **停止**：/localpost-e-stop（或关闭该宿主进程）；卸载/重载后 receiver 不残留。
+5. 全程**不改生产 profile**；生产 .mailbox、receiver 与自动派发始终不参与。
+
+### 原 receiver 控制说明（保留）
 
 加载插件**不会**启动 receiver。`wiring.parts.receiverControl({ allowFrom })` 返回受限控制面：
 root 与 identity 在闭包内固定为隔离根与 `dsh`（调用者无法指向生产根），

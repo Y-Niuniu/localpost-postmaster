@@ -26,7 +26,7 @@ function fakeCtx() {
     },
   };
 }
-const enabled = (extra = {}) => ({ enabled: true, root: ISOLATED_ROOT, ...extra });
+const enabled = (extra = {}) => ({ enabled: true, root: ISOLATED_ROOT, allowFrom: ['codex'], scanIntervalMs: 60000, debounceMs: 60, ...extra });
 const EVIDENCE = 'precheck:app.asar package.json 0.2.0-rc.2';
 const build = (host, config = enabled(), runtimeVersion = SUPPORTED_VERSION, versionEvidence = EVIDENCE) =>
   createIsolatedWiring({ ctx: host.ctx, config, runtimeVersion, versionEvidence });
@@ -108,34 +108,78 @@ test('a missing external version pre-check keeps the wiring closed', () => {
   recorded.dispose();
 });
 
-test('the receiver control is restricted, never started by the wiring, and stops leaving nothing', async () => {
+test('the inputs the receiver runs on are validated before anything is registered', () => {
   const host = fakeCtx();
-  const wiring = build(host);
-  const control = wiring.parts.receiverControl;
-  assert.equal(typeof control, 'function', 'the entry must expose a receiver control');
-  assert.equal(control({}).ok, false, 'an explicit sender allowlist is required');
-  assert.equal(control({ allowFrom: [] }).ok, false);
-  assert.equal(control({ allowFrom: [''] }).ok, false);
-  assert.equal(control({ allowFrom: ['codex'] }).ok, true);
-  const started = control({ allowFrom: ['codex'], scanIntervalMs: 60000, debounceMs: 1 });
-  assert.equal(started.ok, true);
-  assert.equal(started.diagnostics().stopped, true, 'the control must not start by itself');
-  assert.equal(started.diagnostics().running, false);
-  wiring.dispose();
+  for (const [extra, reason] of [
+    [{ allowFrom: undefined }, 'allow_from_required'],
+    [{ allowFrom: [] }, 'allow_from_required'],
+    [{ allowFrom: ['', '  '] }, 'allow_from_required'],
+    [{ allowFrom: ['codex'], scanIntervalMs: 0 }, 'scan_interval_invalid'],
+    [{ allowFrom: ['codex'], scanIntervalMs: -5 }, 'scan_interval_invalid'],
+    [{ allowFrom: ['codex'], debounceMs: 0 }, 'debounce_invalid'],
+    [{ allowFrom: ['codex'], debounceMs: -1 }, 'debounce_invalid'],
+  ]) {
+    const wiring = build(host, enabled(extra));
+    assert.equal(wiring.enabled, false, JSON.stringify(extra) + ' must be refused');
+    assert.equal(wiring.reason, reason, JSON.stringify(extra));
+    assert.equal(host.commands.length + host.tools.length + host.guards.length, 0);
+  }
 });
 
+test('the wiring owns ONE receiver: start is idempotent, stop is idempotent, dispose stops it', async () => {
+  const host = fakeCtx();
+  const wiring = build(host);
+  const control = wiring.parts.receiver;
+  assert.equal(typeof control.start, 'function');
+  assert.equal(typeof control.stop, 'function');
+  assert.equal(control.status().running, false, 'loading must not start anything');
+  assert.equal(control.status().root.toLowerCase().includes('localpost-e-test'), true, 'the root is the isolated one');
+  const first = await control.start();
+  assert.equal(first.running, true);
+  const again = await control.start();
+  assert.equal(again.running, true, 'a second start must not add a second watcher');
+  const both = await Promise.all([control.start(), control.start()]);
+  assert.deepEqual(both.map(entry => entry.running), [true, true], 'concurrent starts are serialised');
+  const stopped = await control.stop();
+  assert.equal(stopped.running, false);
+  assert.equal((await control.stop()).running, false, 'a second stop is a no-op');
+  await control.start();
+  await wiring.dispose();
+  assert.equal(control.status().running, false, 'dispose must stop the receiver it owns');
+  assert.equal(control.status().disposed, true);
+  assert.deepEqual([host.commands.length, host.tools.length, host.guards.length], [0, 0, 0], 'dispose also releases every registration');
+  await wiring.dispose();
+  assert.equal(control.status().running, false, 'the second dispose is idempotent');
+});
+
+test('the E entry points are argument-free human commands restricted to the bound chat', () => {
+  const host = fakeCtx();
+  const wiring = build(host);
+  const names = host.commands.map(entry => entry.name);
+  for (const name of ['localpost-e-start', 'localpost-e-stop', 'localpost-e-status']) {
+    assert.ok(names.includes(name), name + ' must be registered in E mode');
+  }
+  for (const definition of host.commands.filter(entry => entry.name.startsWith('localpost-e-'))) {
+    assert.equal(definition.input, undefined, definition.name + ' must take no input');
+    assert.equal(definition.recordInput, false);
+  }
+  assert.equal(host.tools.some(entry => /start|dispatch|enable/.test(entry.name)), false, 'no model-callable tool may start dispatch');
+  wiring.dispose();
+});
 test('an enabled wiring on the isolated root registers the commands, the tools and the guard', () => {
   const host = fakeCtx();
   const wiring = build(host);
   assert.equal(wiring.enabled, true);
   assert.equal(wiring.status, WIRING_STATUS);
-  assert.deepEqual(host.commands.map(entry => entry.name).sort(), [COMMANDS.bind, COMMANDS.status, COMMANDS.unbind].sort());
+  const names = host.commands.map(entry => entry.name);
+  for (const name of [COMMANDS.bind, COMMANDS.status, COMMANDS.unbind]) assert.ok(names.includes(name), name + ' must be registered');
   assert.deepEqual(host.tools.map(entry => entry.name).sort(), [...TOOL_NAMES].sort());
   assert.equal(host.guards.length, 1, 'the shadow guard must be registered with the tools');
   for (const definition of host.commands) assert.equal(definition.recordInput, false);
   // path.resolve returns native separators; compare slash-normalised so Windows and POSIX agree.
   assert.equal(wiring.parts.root.replaceAll(String.fromCharCode(92), '/').toLowerCase(), ISOLATED_ROOT.toLowerCase());
-  assert.equal(typeof wiring.parts.receiverControl, 'function', 'live E stays a separate start, not a load side effect');
+  assert.equal(typeof wiring.parts.receiver.start, 'function', 'the receiver control must be reachable from the wiring');
+  assert.equal(wiring.parts.receiver.status().running, false, 'loading the wiring must not start scanning');
   wiring.dispose();
 });
 
@@ -151,16 +195,17 @@ test('a second wiring on the same host is refused and leaves the first one worki
   first.dispose();
 });
 
-test('a dispose releases everything, is idempotent, and allows a fresh wiring afterwards', () => {
+test('a dispose releases everything, is idempotent, and allows a fresh wiring afterwards', async () => {
   const host = fakeCtx();
   const first = build(host);
-  first.dispose();
-  first.dispose();   // idempotent
+  // dispose stops the owned receiver first (draining the queue), so it is awaited by callers that care.
+  await first.dispose();
+  await first.dispose();   // idempotent
   assert.deepEqual([host.commands.length, host.tools.length, host.guards.length], [0, 0, 0], 'no commands, tools or guard may survive a dispose');
   const again = build(host);
   assert.equal(again.enabled, true, 'a hot reload after dispose must be able to register again');
   assert.equal(host.tools.length, TOOL_NAMES.length);
-  again.dispose();
+  await again.dispose();
   assert.deepEqual([host.commands.length, host.tools.length, host.guards.length], [0, 0, 0]);
 });
 
