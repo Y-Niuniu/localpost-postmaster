@@ -7,6 +7,7 @@ import { attestedCommandCaller, createDshHostBridge, SUPPORTED_VERSION } from '.
 import { createMailTools } from './dsh-mail-tools.mjs';
 import { createLedgerAcceptance } from './ledger-acceptance.mjs';
 import { createDshAdapter } from './dsh-adapter.mjs';
+import { CHILD_REFUSED, createMailTurnGuard } from './mail-turn-guard.mjs';
 import { createReceiver } from './receiver.mjs';
 
 /**
@@ -26,7 +27,11 @@ import { createReceiver } from './receiver.mjs';
  *     any failure releases what was registered, in reverse order, and returns a refusal;
  *   - the receiver is owned here and handed out unstarted: only the E human commands start it, so live
  *     E1-E6 stay a separately authorized step, not a side effect of loading a plugin;
- *   - dispose stops the receiver and then releases every registration, even when stopping fails.
+ *   - every relay is armed with the mail-turn guard on its target agent before it is enqueued (mail-turn-guard.mjs):
+ *     the claimed turn reaches only the five LocalPost tools and cannot create child agents;
+ *   - dispose stops the receiver, drains the mail-turn guard (a waiting relay is withdrawn, a running mail turn is
+ *     cancelled and released only by its own turn/end) and then releases every registration, even when stopping fails.
+ *     An armament that did not drain in time stays on its agent - denying - and is reported, never disposed early.
  *
  * Status `ready_for_live_E` means the code is ready for the live run. It is not evidence that E1-E6
  * ran, and it is not permission to enable production dispatch.
@@ -35,6 +40,8 @@ export const ISOLATED_ROOT = 'C:/AI_ASSIST/work/localpost-e-test';
 export const PRODUCTION_ROOT = 'C:/AI_ASSIST/.mailbox';
 export const WIRING_STATUS = 'ready_for_live_E';
 export const E_COMMANDS = Object.freeze({ start: 'localpost-e-start', stop: 'localpost-e-stop', status: 'localpost-e-status' });
+/** How long unloading waits for running mail turns to end after cancelling them; what is left stays guarded. */
+export const DRAIN_TIMEOUT_MS = 10000;
 
 const resolved = value => { try { return path.resolve(String(value)); } catch { return null; } };
 const samePath = (left, right) => left !== null && right !== null && left.toLowerCase() === right.toLowerCase();
@@ -73,7 +80,7 @@ function refused(reason, decisions, detail) {
  * @returns {{enabled: boolean, status: string, reason?: string, detail?: string, decisions: readonly string[], dispose: () => Promise<void> | void, parts?: object}}
  */
 export function createIsolatedWiring({ ctx, config = {}, runtimeVersion, versionEvidence, identity = 'dsh', hostId = 'local',
-  isolatedRoot = ISOLATED_ROOT, receiverFactory = createReceiver } = {}) {
+  isolatedRoot = ISOLATED_ROOT, receiverFactory = createReceiver, drainTimeoutMs = DRAIN_TIMEOUT_MS } = {}) {
   const decisions = [];
   if (config?.enabled !== true) return refused('disabled_by_default', decisions);
   decisions.push('explicitly_enabled');
@@ -107,16 +114,20 @@ export function createIsolatedWiring({ ctx, config = {}, runtimeVersion, version
   decisions.push('allowlist_and_timers_validated');
   // The E commands are guarded against shadowing through the host's own lookup, so it is a required capability.
   if (typeof ctx?.commands?.find !== 'function') return refused('e_lookup_unavailable', decisions);
+  // The mail-turn guard's child barrier listens to the host's agent creation and asks it who owns the new agent.
+  if (typeof ctx?.on !== 'function' || typeof ctx?.agents?.isOwnedBy !== 'function') return refused('mail_turn_barrier_unavailable', decisions);
 
   // Everything that can fail without side effects is built before the first registration - the receiver included.
-  let store, bridge, tools, adapter, receiver;
+  let store, bridge, tools, mailTurnGuard, adapter, receiver;
   try {
     store = createSessionStore({ root });
     const mailbox = createMailbox({ root, identity });
     bridge = createDshHostBridge({ ctx, runtimeVersion, store, identity, hostId });
     tools = createMailTools({ ctx, mailbox, store, identity, runtimeVersion, hostId });
+    // Bound to the CURRENT tool registration: once the tools are released, a still-armed mail turn reaches nothing.
+    mailTurnGuard = createMailTurnGuard({ policy: exec => tools.mailTurnReason(exec), agents: ctx.agents });
     const acceptance = createLedgerAcceptance({ store, identity });
-    adapter = createDshAdapter({ ctx, runtimeVersion, hostId, mailboxAgent: identity, acceptance,
+    adapter = createDshAdapter({ ctx, runtimeVersion, hostId, mailboxAgent: identity, acceptance, mailTurnGuard,
       bindingProvider: createBindingProvider({ store, identity, host: bridge }) });
     receiver = receiverFactory({ root, agent: identity, allowFrom: [...allowFrom], adapter, scanIntervalMs, debounceMs });
   } catch (error) {
@@ -142,6 +153,7 @@ export function createIsolatedWiring({ ctx, config = {}, runtimeVersion, version
   let lastStartError = null;
   let lastStopError = null;
   let shutdownError = null;
+  let lastDrain = null;
   let queue = Promise.resolve();
   const serialize = task => {
     const next = queue.then(task, task);
@@ -149,6 +161,8 @@ export function createIsolatedWiring({ ctx, config = {}, runtimeVersion, version
     return next;
   };
   const status = () => Object.freeze({ ...receiver.diagnostics(), owned: true, running, disposed, root,
+    mailTurnGuard: mailTurnGuard.status(),
+    ...(lastDrain === null ? {} : { lastDrain }),
     ...(lastStartError === null ? {} : { lastStartError: errorText(lastStartError) }),
     ...(lastStopError === null ? {} : { lastStopError: errorText(lastStopError) }),
     ...(shutdownError === null ? {} : { shutdownError: errorText(shutdownError) }) });
@@ -249,6 +263,13 @@ export function createIsolatedWiring({ ctx, config = {}, runtimeVersion, version
     const registered = tools.register();
     if (registered.ok !== true) { release(); return refused('tools_' + String(registered.reason ?? 'refused'), decisions, registered.name); }
     disposers.push(registered.dispose);
+    // The child barrier at the host's real creation entry: agent/created is a serial dispatch whose listener failure
+    // rejects the announcement, which rolls the new agent back (dsh-agent AgentRegistry.announce).
+    const barrier = ctx.on('agent/created', payload => {
+      const refusal = mailTurnGuard.childRefusal(payload?.agent);
+      if (refusal !== undefined) throw Object.assign(new Error('LocalPost: ' + refusal), { code: CHILD_REFUSED });
+    });
+    disposers.push(typeof barrier === 'function' ? barrier : () => {});
     for (const definition of eDefinitions) {
       const dispose = ctx.commands.register(definition);
       disposers.push(typeof dispose === 'function' ? dispose : () => {});
@@ -257,20 +278,34 @@ export function createIsolatedWiring({ ctx, config = {}, runtimeVersion, version
     release();
     return refused('registration_failed', decisions, errorText(error));
   }
-  decisions.push('commands_registered', 'tools_registered', 'e_commands_registered');
+  decisions.push('commands_registered', 'tools_registered', 'child_barrier_registered', 'e_commands_registered');
 
   /*
-   * Stops the receiver this wiring owns - after whatever start/stop is queued - and then releases every registration,
-   * even if stopping fails; that failure is kept and shown by status().shutdownError. Idempotent, and no start is admitted
-   * from here on. Cordis rc.2 awaits a Promise returned by an effect disposer (fiber unload runs runDisposable), so the
-   * host waits for all of it.
+   * Unload, in this order, each step whatever the previous one did:
+   *   1. stop the receiver (after whatever start/stop is queued): no new relay is accepted;
+   *   2. drain the mail-turn guard: a relay still waiting in a chat's inbox is withdrawn, a running mail turn is cancelled
+   *      (the user's queued input kept) and released only by its own turn/end; what does not drain within
+   *      drainTimeoutMs stays armed on its agent - still denying - and is reported in status().lastDrain;
+   *   3. release every registration.
+   * The armaments live on the agents' own scopes, so cordis disposing this plugin's effects concurrently with this
+   * function (Fiber._unload runs every disposable at once) cannot remove them. A stop failure is kept and shown by
+   * status().shutdownError. Idempotent; no start is admitted from here on. Cordis rc.2 awaits a Promise returned by an
+   * effect disposer (fiber unload runs runDisposable), so the host waits for all of it.
    */
   let shutdownPromise = null;
   const shutdown = () => {
     if (shutdownPromise === null) {
       disposed = true;
       shutdownPromise = (async () => {
-        try { await control.stop(); } catch (error) { shutdownError = error; } finally { release(); }
+        try {
+          try { await control.stop(); } catch (error) { shutdownError = error; }
+          try {
+            lastDrain = await mailTurnGuard.drain({ timeoutMs: drainTimeoutMs });
+            if (lastDrain.held.length > 0 && shutdownError === null) {
+              shutdownError = new Error('mail turns still guarded after unload: ' + lastDrain.held.map(item => item.messageId + '@turn ' + String(item.turn)).join(', '));
+            }
+          } catch (error) { shutdownError ??= error; }
+        } finally { release(); }
       })();
     }
     return shutdownPromise;
@@ -281,7 +316,7 @@ export function createIsolatedWiring({ ctx, config = {}, runtimeVersion, version
   return Object.freeze({
     enabled: true, status: WIRING_STATUS, decisions: Object.freeze([...decisions]), dispose: shutdown,
     parts: Object.freeze({
-      root, store, bridge, tools, adapter,
+      root, store, bridge, tools, adapter, mailTurnGuard,
       capabilities: Object.freeze({ ...tools.capabilities(), adapter: adapter.capabilities }),
       diagnostics: () => adapter.diagnostics(),
       versionEvidence,

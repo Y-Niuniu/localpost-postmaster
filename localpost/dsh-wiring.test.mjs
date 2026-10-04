@@ -44,7 +44,7 @@ function rootFor(t) {
  * below inject a failing lookup or a failing registration.
  */
 function fakeCtx() {
-  const host = { commands: [], tools: [], guards: [], agents: new Map(), findThrows: null, failRegister: null, shadow: null };
+  const host = { commands: [], tools: [], guards: [], listeners: [], owners: new Map(), agents: new Map(), findThrows: null, failRegister: null, shadow: null };
   const register = (list, kind) => definition => {
     if (list.some(entry => entry.name === definition.name)) throw new Error(`${kind} "${definition.name}" is already registered`);
     if (host.failRegister === definition.name) throw new Error('registry refused ' + definition.name);
@@ -52,7 +52,13 @@ function fakeCtx() {
     return () => { const at = list.indexOf(definition); if (at >= 0) list.splice(at, 1); };
   };
   host.ctx = {
-    agents: { get: id => host.agents.get(id) },
+    agents: { get: id => host.agents.get(id), isOwnedBy: (id, owner) => host.owners.get(id) === owner },
+    // Plain-context listeners (the child barrier listens to agent/created); each returns its exact disposer.
+    on: (name, listener) => {
+      const entry = { name, listener };
+      host.listeners.push(entry);
+      return () => { const at = host.listeners.indexOf(entry); if (at >= 0) host.listeners.splice(at, 1); };
+    },
     commands: {
       register: register(host.commands, 'command'),
       find: (agent, name) => {
@@ -88,13 +94,36 @@ function fakeReceiver({ startFails = false, stopFails = false } = {}) {
 }
 
 /** An enabled wiring on its own temporary isolated root with a fake receiver. */
-function build(t, host, { config = {}, receiver = fakeReceiver(), runtimeVersion = SUPPORTED_VERSION, versionEvidence = EVIDENCE, root } = {}) {
+function build(t, host, { config = {}, receiver = fakeReceiver(), runtimeVersion = SUPPORTED_VERSION, versionEvidence = EVIDENCE, root, drainTimeoutMs } = {}) {
   const isolatedRoot = root ?? rootFor(t);
   const wiring = createIsolatedWiring({
     ctx: host.ctx, runtimeVersion, versionEvidence, isolatedRoot, receiverFactory: receiver.factory,
+    ...(drainTimeoutMs === undefined ? {} : { drainTimeoutMs }),
     config: { enabled: true, root: isolatedRoot, allowFrom: ['codex'], scanIntervalMs: 60000, debounceMs: 60, ...config },
   });
   return { wiring, receiver, root: isolatedRoot };
+}
+
+/** A chat agent with its own scope (tools.guard / on), a session, an inbox and cancel / whenIdle, recording what is asked of it. */
+function scopedAgent(id, order = []) {
+  const listeners = [];
+  const guards = [];
+  const queue = [];
+  const fire = (name, ...args) => { for (const entry of [...listeners]) if (entry.name === name) entry.listener(...args); };
+  const agent = {
+    id, session: { id, header: { cwd: 'C:/work/' + id } }, guards, listeners, queue, fire,
+    ctx: {
+      tools: { guard: check => { guards.push(check); return () => { const at = guards.indexOf(check); if (at >= 0) guards.splice(at, 1); }; } },
+      on: (name, listener) => { const entry = { name, listener }; listeners.push(entry); return () => { const at = listeners.indexOf(entry); if (at >= 0) listeners.splice(at, 1); }; },
+    },
+    inbox: {
+      get nextTurn() { return queue.map(messageId => ({ id: messageId })); }, nextStep: [],
+      remove(messageId) { const at = queue.indexOf(messageId); if (at < 0) return false; queue.splice(at, 1); fire('agent/inbox/discarded', { message: { id: messageId }, agent }); return true; },
+    },
+    cancel(cause, options) { order.push('cancel:' + cause.kind + (options?.keepInbox ? ':keepInbox' : '')); },
+    async whenIdle() {},
+  };
+  return agent;
 }
 const chat = (host, id, cwd) => { const agent = { session: { id, header: { cwd } } }; host.agents.set(id, agent); return agent; };
 const run = (host, name, agent) => host.commands.find(entry => entry.name === name).handler({ agent });
@@ -250,6 +279,7 @@ for (const name of [E.start, E.stop, E.status]) {
     const { wiring } = build(t, host);
     assert.deepEqual([wiring.enabled, wiring.reason], [false, 'registration_failed']);
     assert.deepEqual(counts(host), [0, 0, 0], 'E commands, tools, base commands and guard were all released');
+    assert.deepEqual(host.listeners, [], 'and so was the child barrier');
     host.failRegister = null;
     const retry = build(t, host).wiring;
     assert.equal(retry.enabled, true);
@@ -423,6 +453,82 @@ test('the wired adapter reports its own capabilities instead of claiming they ar
   assert.deepEqual([capabilities.runtimeVersion, capabilities.toolRegistry, capabilities.toolLookup, capabilities.toolGuard, capabilities.liveAgentLookup],
     [true, true, true, true, true]);
   wiring.dispose();
+});
+
+/* ------------------------------------------------------------------ the mail-turn guard in the wiring (C2) */
+
+test('without agent creation events or ownership the mail-turn guard cannot be complete, so nothing is wired', t => {
+  for (const [label, strip] of [['no ctx.on', host => { delete host.ctx.on; }], ['no agents.isOwnedBy', host => { delete host.ctx.agents.isOwnedBy; }]]) {
+    const host = fakeCtx();
+    strip(host);
+    const { wiring, receiver } = build(t, host);
+    assert.deepEqual([wiring.enabled, wiring.reason], [false, 'mail_turn_barrier_unavailable'], label);
+    assert.deepEqual(counts(host), [0, 0, 0], label);
+    assert.deepEqual(host.listeners, [], label);
+    assert.equal(receiver.seen.construct, 0, label + ': nothing was built');
+  }
+});
+
+test('an enabled wiring dispatches only through the mail-turn guard and listens for agent creation', async t => {
+  const host = fakeCtx();
+  const { wiring } = build(t, host);
+  assert.equal(wiring.parts.capabilities.adapter.mailTurnGuard, true);
+  assert.ok(wiring.decisions.includes('child_barrier_registered'));
+  assert.deepEqual(host.listeners.map(entry => entry.name), ['agent/created']);
+  assert.deepEqual(wiring.parts.receiver.status().mailTurnGuard, { draining: false, armaments: [] });
+  await wiring.dispose();
+  assert.deepEqual(host.listeners, [], 'the barrier goes with the wiring');
+});
+
+test('the child barrier refuses a child of a chat inside a mail turn, and only then', async t => {
+  const host = fakeCtx();
+  const { wiring } = build(t, host);
+  const guard = wiring.parts.mailTurnGuard;
+  const barrier = host.listeners.find(entry => entry.name === 'agent/created').listener;
+  const a = scopedAgent('chat-A');
+  host.owners.set('child-1', a);
+  guard.arm(a, 'm1');
+  assert.doesNotThrow(() => barrier({ agent: { id: 'child-1' } }), 'armed but not claimed: not a mail turn yet');
+  a.fire('agent/inbox/claimed', { message: { id: 'm1' }, turn: 3, agent: a });
+  assert.throws(() => barrier({ agent: { id: 'child-1' }, source: 'fresh' }), { code: 'mail_turn_child_refused' });
+  assert.doesNotThrow(() => barrier({ agent: { id: 'someone-else' } }), 'a child of another chat');
+  a.fire('session/event', a.session, { type: 'turn/end', data: { turn: 3, reason: { kind: 'completed' } } });
+  assert.doesNotThrow(() => barrier({ agent: { id: 'child-1' } }), 'the mail turn has ended');
+  await wiring.dispose();
+});
+
+test('unload: stop the receiver, then drain - a running mail turn is cancelled and stays guarded until its own end', async t => {
+  const host = fakeCtx();
+  const order = [];
+  const counted = fakeReceiver();
+  const receiver = { seen: counted.seen, factory: options => {
+    const built = counted.factory(options);
+    const stop = built.stop;
+    built.stop = async () => { order.push('receiver.stop'); return stop(); };
+    return built;
+  } };
+  const { wiring } = build(t, host, { receiver, drainTimeoutMs: 30 });
+  await wiring.parts.receiver.start();
+  const guard = wiring.parts.mailTurnGuard;
+  const a = scopedAgent('chat-A', order);
+  guard.arm(a, 'm-running');
+  a.fire('agent/inbox/claimed', { message: { id: 'm-running' }, turn: 7, agent: a });
+  guard.arm(a, 'm-queued');
+  a.queue.push('m-queued');
+  await wiring.dispose();
+  assert.deepEqual(order, ['receiver.stop', 'cancel:hook:keepInbox'], 'first no new relay, then the running turn is cancelled, the user\'s input kept');
+  const status = wiring.parts.receiver.status();
+  assert.deepEqual(status.lastDrain.released.map(item => [item.messageId, item.releasedBy]), [['m-queued', 'discarded-before-claim']]);
+  assert.deepEqual(status.lastDrain.held.map(item => [item.messageId, item.turn]), [['m-running', 7]]);
+  assert.match(String(status.shutdownError), /mail turns still guarded after unload: m-running@turn 7/);
+  assert.deepEqual(counts(host), [0, 0, 0], 'every plugin registration is released regardless');
+  assert.deepEqual(host.listeners, []);
+  assert.equal(a.guards.length, 1, 'but the chat keeps its guard: the turn has not ended');
+  assert.throws(() => guard.arm(a, 'late'), { code: 'guard_unavailable' }, 'and nothing new is armed');
+  // Its own turn/end - nothing else - releases it, plugin gone or not.
+  a.fire('session/event', a.session, { type: 'turn/end', data: { turn: 7, reason: { kind: 'aborted' } } });
+  assert.equal(a.guards.length, 0);
+  assert.deepEqual(wiring.parts.receiver.status().mailTurnGuard.armaments, []);
 });
 
 /* ------------------------------------------------------------------ last: the canonical root is untouched */

@@ -43,8 +43,10 @@ function assertHostSource(source) {
  *                     Its trust comes from a host capability the installed DSH rc.2 does not have; without it
  *                     the adapter stays disabled. There is no "current focus" fallback of any kind.
  *   acceptance        durable, idempotent acceptance (ledger-acceptance.mjs): acceptOnce.
+ *   mailTurnGuard     the mail-turn guard (mail-turn-guard.mjs): every relay is armed on its target agent before it is
+ *                     enqueued, so the turn that claims it can reach only the five LocalPost tools. No guard, no dispatch.
  */
-export function createDshAdapter({ ctx, runtimeVersion, bindingProvider, acceptance, hostId = 'local', mailboxAgent = 'dsh' } = {}) {
+export function createDshAdapter({ ctx, runtimeVersion, bindingProvider, acceptance, mailTurnGuard, hostId = 'local', mailboxAgent = 'dsh' } = {}) {
   assertId(mailboxAgent);
   assertHostSource(HOST_RELAY_SOURCE);
   const capabilities = Object.freeze({
@@ -54,6 +56,7 @@ export function createDshAdapter({ ctx, runtimeVersion, bindingProvider, accepta
     sourceIsRelay: true,
     dispatchIdempotent: acceptance?.durable === true && acceptance?.idempotent === true &&
       typeof acceptance.acceptOnce === 'function',
+    mailTurnGuard: typeof mailTurnGuard?.arm === 'function' && typeof mailTurnGuard?.settleUnenqueued === 'function',
   });
   const enabled = Object.values(capabilities).every(value => value === true) && typeof ctx?.agents?.get === 'function';
 
@@ -121,10 +124,23 @@ export function createDshAdapter({ ctx, runtimeVersion, bindingProvider, accepta
         if (typeof agent?.followup !== 'function') {
           throw failure('client_unavailable', 'The bound DSH agent is not live; mail must remain pending');
         }
+        // The guard goes in before the message: the turn that claims it can only open after the enqueue. A guard that
+        // cannot be put in place sends nothing (guard_unavailable is definitive: the letter waits for a later scan).
+        let armament;
+        try { armament = mailTurnGuard.arm(agent, message.id); }
+        catch (error) {
+          throw failure('guard_unavailable', 'The bound chat could not be put under the mail-turn guard; nothing was sent',
+            { cause: error, reason: error?.message });
+        }
         enqueued = true;
         // Installed rc.2 followup queues next-turn and wakes the existing driver.
         // No steer/inject/create/resume/session-controller path is used here.
-        await agent.followup(message);
+        try {
+          await agent.followup(message);
+        } catch (error) {
+          mailTurnGuard.settleUnenqueued(armament);         // keeps it armed unless the message is provably not queued
+          throw error;
+        }
       });
       if (receipt?.accepted !== true || receipt?.durable !== true || !text(receipt?.receipt)) {
         throw failure('acceptance_unconfirmed', 'Host did not confirm durable acceptance; delivery requires reconciliation');

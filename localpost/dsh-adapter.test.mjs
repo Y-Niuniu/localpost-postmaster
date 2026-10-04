@@ -7,6 +7,7 @@ import { createSessionStore } from './session-binding.mjs';
 import { createBindingProvider, bindFromChatAction, arrivalRoute } from './binding-provider.mjs';
 import { createLedgerAcceptance } from './ledger-acceptance.mjs';
 import { envelopeDigest } from './mailbox.mjs';
+import { createMailTurnGuard } from './mail-turn-guard.mjs';
 import { createFakeDshHost } from './fixtures/fake-dsh-host.mjs';
 import { removeTreeSync } from './temp-tree.mjs';
 
@@ -30,19 +31,20 @@ function hostPendingIds(messages) {
   }
 }
 
-async function setup(t, { capabilities, version = '0.2.0-rc.2', bound = true } = {}) {
+async function setup(t, { capabilities, version = '0.2.0-rc.2', bound = true, scoped = true, guard } = {}) {
   fs.mkdirSync(tempRoot, { recursive: true });
   const root = fs.mkdtempSync(path.join(tempRoot, 'case-'));
   t.after(() => removeTreeSync(root));
-  const host = createFakeDshHost({ root, ...(capabilities ? { capabilities } : {}) });
+  const host = createFakeDshHost({ root, scoped, ...(capabilities ? { capabilities } : {}) });
   host.openThread('chat-a', CWD_A);
   host.openThread('chat-b', 'C:/work/project-b');
   const store = createSessionStore({ root });
   if (bound) assert.equal((await bindFromChatAction(store, 'dsh', { host, action: host.userBindAction('chat-a'), authority: AUTHORITY })).ok, true);
-  const make = () => createDshAdapter({ ctx: host.ctx, runtimeVersion: version,
+  const mailTurnGuard = guard === undefined ? createMailTurnGuard({ policy: () => 'test: outside the five', agents: host.ctx.agents }) : guard;
+  const make = () => createDshAdapter({ ctx: host.ctx, runtimeVersion: version, mailTurnGuard,
     bindingProvider: createBindingProvider({ store: createSessionStore({ root }), identity: 'dsh', host }),
     acceptance: createLedgerAcceptance({ store: createSessionStore({ root }), identity: 'dsh' }) });
-  return { root, host, store, make, adapter: make(), route: bound ? arrivalRoute(await store.read('dsh')).route : null };
+  return { root, host, store, make, mailTurnGuard, adapter: make(), route: bound ? arrivalRoute(await store.read('dsh')).route : null };
 }
 // Request vocabulary: the released V3 wrapper the receiver speaks. The adapter translates it at the host
 // boundary into the producer-owned kind the host persists (see HOST_RELAY_SOURCE in dsh-adapter.mjs).
@@ -163,14 +165,88 @@ test('an unsupported DSH version cannot enable automatic dispatch', async t => {
 });
 
 test('an acceptance provider may not enqueue twice, and an undurable answer is not a receipt', async t => {
-  const { host, root } = await setup(t);
+  const { host, root, mailTurnGuard } = await setup(t);
   const bindingProvider = createBindingProvider({ store: createSessionStore({ root }), identity: 'dsh', host });
   const route = arrivalRoute(await createSessionStore({ root }).read('dsh')).route;
-  const twice = createDshAdapter({ ctx: host.ctx, runtimeVersion: '0.2.0-rc.2', bindingProvider,
+  const twice = createDshAdapter({ ctx: host.ctx, runtimeVersion: '0.2.0-rc.2', bindingProvider, mailTurnGuard,
     acceptance: { durable: true, idempotent: true, acceptOnce: async (_, enqueue) => { await enqueue(); await enqueue(); } } });
   await assert.rejects(twice.submit(request(route)), { code: 'acceptance_contract_invalid' });
-  const undurable = createDshAdapter({ ctx: host.ctx, runtimeVersion: '0.2.0-rc.2', bindingProvider,
+  const undurable = createDshAdapter({ ctx: host.ctx, runtimeVersion: '0.2.0-rc.2', bindingProvider, mailTurnGuard,
     acceptance: { durable: true, idempotent: true, acceptOnce: async (_, enqueue) => { await enqueue(); return { accepted: true }; } } });
   await assert.rejects(undurable.submit(request(route)), { code: 'acceptance_unconfirmed' });
   assert.equal(host.followups().length, 2, 'one enqueue each; the second enqueue of the first provider was refused');
+});
+
+// --- the mail-turn guard at the adapter boundary (C2) ---------------------------------------------------------------
+
+test('without a mail-turn guard automatic dispatch stays off', async t => {
+  const { host, root } = await setup(t);
+  const adapter = createDshAdapter({ ctx: host.ctx, runtimeVersion: '0.2.0-rc.2',
+    bindingProvider: createBindingProvider({ store: createSessionStore({ root }), identity: 'dsh', host }),
+    acceptance: createLedgerAcceptance({ store: createSessionStore({ root }), identity: 'dsh' }) });
+  assert.equal(adapter.capabilities.mailTurnGuard, false);
+  assert.ok(adapter.diagnostics().reasons.includes('mailTurnGuard'));
+  assert.equal(adapter.diagnostics().dispatchEnabled, false);
+  await assert.rejects(adapter.submit({}), { code: 'runtime_capabilities_unverified' });
+  assert.equal(host.followups().length, 0);
+});
+
+test('every relay is armed on its target chat before it is enqueued, keyed by the relay message id', async t => {
+  const { adapter, host, route, mailTurnGuard } = await setup(t);
+  // Witness the order: the moment followup runs, the guard for that very message must already stand on chat A.
+  const original = host.ctx.agents.get;
+  let armedAtFollowup = null;
+  host.ctx.agents.get = threadId => {
+    const agent = original(threadId);
+    if (agent) {
+      const followup = agent.followup;
+      agent.followup = async message => {
+        armedAtFollowup = mailTurnGuard.status().armaments.filter(item => item.messageId === message.id && item.state === 'pending').length;
+        return followup(message);
+      };
+    }
+    return agent;
+  };
+  await adapter.submit(request(route));
+  const [delivered] = host.followups();
+  assert.equal(armedAtFollowup, 1, 'armed before the enqueue');
+  assert.deepEqual(mailTurnGuard.status().armaments.map(item => [item.messageId, item.state]), [[delivered.id, 'pending']]);
+  // One guard and three lifecycle listeners, all on chat A's own scope - none on the plugin context.
+  assert.deepEqual(host.armed('chat-a').map(entry => entry.kind === 'on' ? entry.name : 'guard').sort(),
+    ['agent/inbox/claimed', 'agent/inbox/discarded', 'guard', 'session/event']);
+  assert.deepEqual(host.armed('chat-b'), []);
+});
+
+test('a chat that cannot be guarded receives nothing: guard_unavailable is definitive and the letter waits', async t => {
+  const { adapter, host, route, store } = await setup(t, { scoped: false });
+  await assert.rejects(adapter.submit(request(route)), { code: 'guard_unavailable' });
+  assert.equal(host.followups().length, 0, 'nothing was enqueued');
+  // The ledger released the attempt (definitive, nothing sent): the receiver may try again on a later scan.
+  assert.equal((await store.read('dsh')).claims['letter-a'].status, 'released');
+});
+
+test('a guard that is draining arms nothing and sends nothing', async t => {
+  const { adapter, host, route, mailTurnGuard } = await setup(t);
+  await mailTurnGuard.drain({ timeoutMs: 50 });
+  await assert.rejects(adapter.submit(request(route)), { code: 'guard_unavailable' });
+  assert.equal(host.followups().length, 0);
+});
+
+test('a lost followup confirmation keeps the relay armed; a followup that provably enqueued nothing releases it', async t => {
+  const { adapter, host, route, mailTurnGuard } = await setup(t);
+  host.breakFollowups('lost');                       // queued on the host, the answer lost: it may still be claimed
+  await assert.rejects(adapter.submit(request(route)), { code: 'acceptance_uncertain' });
+  const [queued] = host.followups();
+  assert.deepEqual(mailTurnGuard.status().armaments.map(item => [item.messageId, item.state]), [[queued.id, 'pending']]);
+
+  const other = await setup(t);
+  const original = other.host.ctx.agents.get;
+  other.host.ctx.agents.get = threadId => {
+    const agent = original(threadId);
+    if (agent) agent.followup = async () => { throw new Error('rejected before queueing'); };
+    return agent;
+  };
+  await assert.rejects(other.adapter.submit(request(other.route)), { code: 'acceptance_uncertain' });
+  assert.deepEqual(other.mailTurnGuard.status().armaments, [], 'not in the inbox: released as never enqueued');
+  assert.deepEqual(other.host.armed('chat-a'), [], 'and every registration it made is gone');
 });

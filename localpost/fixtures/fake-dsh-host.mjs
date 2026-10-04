@@ -6,11 +6,15 @@
  *   confirmBindAction(action)   用户在聊天 A 里执行「绑定为 LocalPost 收信聊天」后，宿主确认这个动作
  *   describeThread(threadId)    宿主此刻看到的聊天：所在宿主、工作目录、是否在线
  *   ctx.agents.get(id).followup 只给在线聊天提供；投递记录落盘，测试据此数唤醒次数
+ *
+ * 每个在线聊天的 agent 还带一个最小的作用域 ctx（tools.guard / on）、session 与 inbox，刚好够邮件回合守卫
+ * （mail-turn-guard.mjs）在入队前武装；这些登记只记在内存里（armed() 可查），不模拟回合本身 ——
+ * 回合语义的测试在 mail-turn-guard.test.mjs，用的是照宿主源码实现的回合宿主。
  */
 import fs from 'node:fs';
 import path from 'node:path';
 
-export function createFakeDshHost({ root, hostId = 'local', capabilities = { chatBinding: true } } = {}) {
+export function createFakeDshHost({ root, hostId = 'local', capabilities = { chatBinding: true }, scoped = true } = {}) {
   const file = path.join(root, 'fake-dsh-host.json');
   const load = () => {
     try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
@@ -18,6 +22,11 @@ export function createFakeDshHost({ root, hostId = 'local', capabilities = { cha
   };
   const save = data => { fs.writeFileSync(`${file}.tmp`, JSON.stringify(data, null, 2)); fs.renameSync(`${file}.tmp`, file); };
   const change = mutate => { const data = load(); mutate(data); save(data); };
+  const registrations = [];
+  const scopeFor = threadId => ({
+    tools: { guard: check => { const entry = { threadId, kind: 'guard', check }; registrations.push(entry); return () => { entry.disposed = true; }; } },
+    on: (name, listener) => { const entry = { threadId, kind: 'on', name, listener }; registrations.push(entry); return () => { entry.disposed = true; }; },
+  });
   return {
     hostId, capabilities, state: load,
     openThread(threadId, cwd) { change(data => { data.threads[threadId] = { cwd, online: true }; }); },
@@ -46,15 +55,22 @@ export function createFakeDshHost({ root, hostId = 'local', capabilities = { cha
         get(threadId) {
           const thread = load().threads[threadId];
           if (!thread?.online) return undefined;
+          const queued = () => load().followups.filter(entry => entry.threadId === threadId).map(entry => ({ id: entry.id }));
           return {
+            id: threadId,
+            ...(scoped ? { ctx: scopeFor(threadId), session: { id: threadId } } : {}),
+            inbox: { get nextTurn() { return queued(); }, nextStep: [], remove: () => false },
             async followup(message) {
               change(data => { data.followups.push({ threadId, id: message.id, role: message.role, source: message.source, text: message.content[0].text }); });
               if (load().followupFault === 'lost') throw new Error('connection lost after the followup was queued');
             },
           };
         },
+        isOwnedBy: () => false,
       },
     },
     followups: () => load().followups,
+    /** Live mail-turn guard registrations per chat (in memory; this process only). */
+    armed: threadId => registrations.filter(entry => entry.threadId === threadId && !entry.disposed),
   };
 }

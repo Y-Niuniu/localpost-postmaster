@@ -7,7 +7,8 @@ import { envelopeDigest } from './mailbox.mjs';
 
 const digest = envelopeDigest;
 // A dispatch that failed with one of these sent nothing: the letter waits for a later scan. Anything else is uncertain.
-const PENDING = { binding_unverified: 'binding_unverified', client_unavailable: 'client_closed', binding_frozen: 'binding_frozen', acceptance_busy: 'acceptance_busy' };
+const PENDING = { binding_unverified: 'binding_unverified', client_unavailable: 'client_closed', binding_frozen: 'binding_frozen', acceptance_busy: 'acceptance_busy',
+  guard_unavailable: 'guard_unavailable' };
 const SOFT_REFUSALS = new Set(['mode_manual', 'frozen', 'capacity_full', 'held']);
 function afterFailure(error) {
   if (Object.hasOwn(PENDING, error?.code)) return { state: 'queued', reason: PENDING[error.code] };

@@ -10,6 +10,7 @@ import { createDshAdapter } from './dsh-adapter.mjs';
 import { createSessionStore } from './session-binding.mjs';
 import { createBindingProvider, bindFromChatAction } from './binding-provider.mjs';
 import { createLedgerAcceptance } from './ledger-acceptance.mjs';
+import { createMailTurnGuard } from './mail-turn-guard.mjs';
 import { createFakeDshHost } from './fixtures/fake-dsh-host.mjs';
 import { removeTree, removeTreeSync } from './temp-tree.mjs';
 
@@ -30,7 +31,8 @@ async function world(t, { bound = true } = {}) {
   host.openThread('chat-a', CWD_A);
   host.openThread('chat-b', 'C:/work/project-b');
   if (bound) assert.equal((await bindFromChatAction(createSessionStore({ root }), 'dsh', { host, action: host.userBindAction('chat-a'), authority: AUTHORITY })).ok, true);
-  const adapter = () => createDshAdapter({ ctx: host.ctx, runtimeVersion: '0.2.0-rc.2',
+  const mailTurnGuard = createMailTurnGuard({ policy: () => 'test: outside the five', agents: host.ctx.agents });
+  const adapter = () => createDshAdapter({ ctx: host.ctx, runtimeVersion: '0.2.0-rc.2', mailTurnGuard,
     bindingProvider: createBindingProvider({ store: createSessionStore({ root }), identity: 'dsh', host }),
     acceptance: createLedgerAcceptance({ store: createSessionStore({ root }), identity: 'dsh' }) });
   const receiver = (extra = {}) => createReceiver({ root, agent: 'dsh', allowFrom: ['codex'], adapter: adapter(), ...extra });

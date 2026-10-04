@@ -26,28 +26,36 @@ export function createLedgerAcceptance({ store, identity } = {}) {
     idempotent: true,
     /**
      * `target` is where the binding provider resolved this letter to; the ledger owner of the attempt must be exactly it.
-     * `enqueue` wakes the session; it throws { code: 'client_unavailable' } when the session is not live (nothing sent).
+     * `enqueue` wakes the session; it throws { code: 'client_unavailable' } when the session is not live, and
+     * { code: 'guard_unavailable' } when the mail-turn guard could not be put in place - in both cases nothing was sent.
      */
     async acceptOnce({ key, target, messageReference, digest } = {}, enqueue) {
       assertId(messageReference?.id);
       if (messageReference.agent !== identity || key !== `${identity}:${messageReference.id}` || typeof enqueue !== 'function')
         throw failure('acceptance_contract_invalid', 'The acceptance key must name this identity and letter');
       let mismatch = false;
+      let unguarded = null;
       const result = await dispatchLetter(store, identity, { id: messageReference.id, digest }, {
         async submit({ session, key: attemptKey }) {
           const generation = Number(/:g(\d+)$/.exec(attemptKey)?.[1]);
           if (!sameTarget(session, generation, target)) { mismatch = true; return { accepted: false, definitive: true }; }
           try { await enqueue(); return { accepted: true }; }
-          catch (error) { if (error?.code === 'client_unavailable') return { accepted: false, definitive: true }; throw error; }
+          catch (error) {
+            if (error?.code === 'client_unavailable') return { accepted: false, definitive: true };
+            if (error?.code === 'guard_unavailable') { unguarded = error; return { accepted: false, definitive: true }; }
+            throw error;
+          }
         },
       });
       if (result.skipped) throw failure('acceptance_busy', 'Another actor is working on this identity; nothing was sent');
       const { claim } = result;
       if (result.ok) {
         if (claim.status === 'accepted') return receiptOf(identity, claim);
-        if (claim.status === 'released')
-          throw mismatch ? failure('binding_changed', 'The ledger owner is no longer the resolved target; nothing was sent')
-            : failure('client_unavailable', 'The bound session is not live; nothing was sent');
+        if (claim.status === 'released') {
+          if (mismatch) throw failure('binding_changed', 'The ledger owner is no longer the resolved target; nothing was sent');
+          if (unguarded) throw failure('guard_unavailable', 'The mail-turn guard could not be put in place; nothing was sent', { cause: unguarded });
+          throw failure('client_unavailable', 'The bound session is not live; nothing was sent');
+        }
         throw failure('acceptance_uncertain', 'Acceptance could not be confirmed; the letter needs reconciliation');
       }
       // Already accepted by exactly this target: the same key never wakes the session again, even after a restart.

@@ -14,6 +14,7 @@ import { dispatchLetter, complete, transferForSwitchIn, resolveUncertain, beginC
 import { createRotation, candidateSessionId } from './rotation.mjs';
 import { switchMode } from './letter-claims.mjs';
 import { createMcpServer } from './mcp-server.mjs';
+import { createMailTurnGuard } from './mail-turn-guard.mjs';
 import { createFakeDshHost } from './fixtures/fake-dsh-host.mjs';
 import { createFakeHost } from './fixtures/fake-session-host.mjs';
 import { removeTreeSync } from './temp-tree.mjs';
@@ -42,8 +43,9 @@ async function world(t) {
     assert.equal((await bindFromChatAction(store, 'dsh', { host, action: host.userBindAction(thread), authority: AUTHORITY })).ok, true);
   await bindTo('chat-a');
   const acceptance = createLedgerAcceptance({ store, identity: 'dsh' });
+  const mailTurnGuard = createMailTurnGuard({ policy: () => 'test: outside the five', agents: host.ctx.agents });
   const receiver = () => createReceiver({ root, agent: 'dsh', allowFrom: ['codex'], adapter: createDshAdapter({ ctx: host.ctx,
-    runtimeVersion: '0.2.0-rc.2', bindingProvider: createBindingProvider({ store, identity: 'dsh', host }), acceptance }) });
+    runtimeVersion: '0.2.0-rc.2', bindingProvider: createBindingProvider({ store, identity: 'dsh', host }), acceptance, mailTurnGuard }) });
   const target = { identity: 'dsh', hostId: 'local', threadId: 'chat-a', cwd: CWD_A, generation: 1 };
   const acceptForA = id => acceptance.acceptOnce({ key: `dsh:${id}`, target, messageReference: { agent: 'dsh', id },
     digest: envelopeDigest(letter(id)) }, async () => {});
