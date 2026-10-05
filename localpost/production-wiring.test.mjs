@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
+import { watch, writesUnder } from './fixtures/production-write-witness.mjs';
 import { AUTO_COMMANDS, ISOLATED_ROOT, PRODUCTION_ROOT, PRODUCTION_WIRING_STATUS, createProductionWiring } from './dsh-wiring.mjs';
 import { SUPPORTED_VERSION } from './dsh-host-bridge.mjs';
 import { TOOL_NAMES } from './dsh-mail-tools.mjs';
@@ -15,23 +15,11 @@ import { removeTreeSync } from './temp-tree.mjs';
 const EVIDENCE = 'precheck:app.asar package.json 0.2.0-rc.2';
 
 /**
- * 真实生产根绝不能被这些测试碰到：每个用例都在自己的临时根上跑，最后一次再核对
- * `.mailbox/runtime` 的树快照没变（wiring 只在 start 时写盘，构造不写）。
+ * 真实生产根绝不能被这些测试碰到：每个用例都在自己的临时根上跑，最后断言本进程从没往生产根写过
+ * （wiring 只在 start 时写盘，构造不写）。原先用 `.mailbox/runtime` 整树快照核对；生产 receiver 上线后它会
+ * 定时重写 queues/dsh.json，快照会被真实流量随机打红，所以改成调用期写入见证（见 fixtures/production-write-witness.mjs）。
  */
-function treeSnapshot(root) {
-  if (!fs.existsSync(root)) return 'absent';
-  const entries = [];
-  (function walk(dir) {
-    for (const name of fs.readdirSync(dir).sort()) {
-      const full = path.join(dir, name);
-      const stat = fs.statSync(full);
-      if (stat.isDirectory()) { entries.push(['dir', path.relative(root, full)]); walk(full); }
-      else entries.push(['file', path.relative(root, full), stat.size, createHash('sha256').update(fs.readFileSync(full)).digest('hex')]);
-    }
-  })(root);
-  return entries;
-}
-const productionRuntimeBefore = treeSnapshot(path.join(PRODUCTION_ROOT, 'runtime'));
+watch(PRODUCTION_ROOT);
 
 const TMP = path.resolve(import.meta.dirname, '../.localpost-tmp/production-wiring');
 function rootFor(t) {
@@ -241,6 +229,18 @@ test('autoStart：已有 active+auto 绑定时装配即自启；未绑定时跳�
 
 /* ------------------------------------------------------------------ 生产零接触 */
 
-test('真实生产信箱的 runtime 树在这些测试前后逐字节一致', () => {
-  assert.deepEqual(treeSnapshot(path.join(PRODUCTION_ROOT, 'runtime')), productionRuntimeBefore);
+test('写入见证自检：真实绑定路径的写盘确实被见证到（临时根代替生产根）', async t => {
+  const probe = rootFor(t);
+  const stop = watch(probe);
+  const fakeHost = createFakeDshHost({ root: probe });
+  fakeHost.openThread('chat-probe', 'C:/work/probe');
+  try {
+    assert.equal((await bindFromChatAction(createSessionStore({ root: probe }), 'dsh',
+      { host: fakeHost, action: fakeHost.userBindAction('chat-probe'), authority: { scope: 'analysis-reply', source: 'policy:test' } })).ok, true);
+  } finally { stop(); }
+  assert.equal(writesUnder(probe).some(line => line.includes('sessions')), true, '绑定写盘没有被见证到：见证失效');
+});
+
+test('本进程从未写过真实生产信箱（调用期见证；生产 receiver 自己的定时重写不算在内）', () => {
+  assert.deepEqual(writesUnder(PRODUCTION_ROOT), []);
 });
