@@ -67,7 +67,7 @@ autoReceive:
 - **信封里的 `from` 不是认证。** 任何能写 `.mailbox` 的进程都能自称任何发件人，所以 allowFrom 只是策略过滤，不是身份认证（这是既有性质）。防注入靠的是 analysis-reply 授权范围，以及"信件内容是不可信数据"这条规则。
 - **解绑不释放身份。** `/localpost-<id>-unbind` 只把模式切到 manual，绑定记录仍点名该聊天，所以该聊天仍然代表这个身份。要把它"还给" dsh，需要运维清掉绑定记录（与原有"T1 不在聊天之间迁移绑定"的约定一致）。
 - **不要给外部客户端也在用的身份配 DSH 绑定。** 例如把 DSH 聊天绑成 `codex`，就会出现两个消费者。记账会让已被自动认领的信拒绝手动读取，所以不会重复处理，但这仍是配置错误。只给"只由 DSH 聊天消费"的身份配置。
-- 外部客户端（Codex / Claude Code / Gemini）的唤醒不在 T1 内，见 T2 调研结论 `docs/external-client-wake-survey.md`。
+- 外部客户端（Codex / Claude Code / Antigravity＝`gemini`）的唤醒不在 T1 内，见 T2 调研结论 `docs/external-client-wake-survey.md`。
 
 ## 验证
 

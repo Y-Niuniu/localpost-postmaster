@@ -68,5 +68,5 @@
 ## 未做（下一步）
 
 - **DSH 内其他聊天**：已由多身份接线解决（`docs/multi-identity.md`）。
-- **外部客户端（Codex / Claude Code / Gemini）的自动唤醒**：需要各自客户端那一侧的桥，不是本插件能单方面解决的；可行性与工作量见 `docs/external-client-wake-survey.md`（T2）。
+- **外部客户端（Codex / Claude Code / Antigravity＝`gemini`）的自动唤醒**：需要各自客户端那一侧的桥，不是本插件能单方面解决的；可行性与工作量见 `docs/external-client-wake-survey.md`（T2）。
 - 生产 ledgers/告警对"自动处理完成"的记账口径未变（仍由内核定时器负责）。
