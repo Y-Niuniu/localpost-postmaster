@@ -35,6 +35,10 @@ export const ISOLATED_ROOT = 'C:/AI_ASSIST/work/localpost-e-test';
 export const PRODUCTION_ROOT = 'C:/AI_ASSIST/.mailbox';
 export const WIRING_STATUS = 'ready_for_live_E';
 export const E_COMMANDS = Object.freeze({ start: 'localpost-e-start', stop: 'localpost-e-stop', status: 'localpost-e-status' });
+// 生产自动收信（2026-10-05 用户放行）：同一套装配，只有"根"与命令名不同。
+// 隔离入口拒绝生产根、生产入口拒绝隔离根——两个方向都 fail closed，永不会互相串。
+export const PRODUCTION_WIRING_STATUS = 'ready_for_live_production';
+export const AUTO_COMMANDS = Object.freeze({ start: 'localpost-auto-start', stop: 'localpost-auto-stop', status: 'localpost-auto-status' });
 
 const resolved = value => { try { return path.resolve(String(value)); } catch { return null; } };
 const samePath = (left, right) => left !== null && right !== null && left.toLowerCase() === right.toLowerCase();
@@ -59,54 +63,82 @@ export function allowFromConfig(value) {
 }
 
 /** A refusal that registered nothing and disposes nothing, so callers can treat every shape alike. */
-function refused(reason, decisions, detail) {
-  return Object.freeze({ enabled: false, status: WIRING_STATUS, reason, ...(detail === undefined ? {} : { detail }),
+function refused(reason, decisions, detail, status = WIRING_STATUS) {
+  return Object.freeze({ enabled: false, status, reason, ...(detail === undefined ? {} : { detail }),
     decisions: Object.freeze([...decisions]), dispose: () => {} });
 }
 
 /**
  * @param {{ctx?: object, config?: {enabled?: boolean, root?: string, allowFrom?: string[], scanIntervalMs?: number, debounceMs?: number},
  *   runtimeVersion?: string, versionEvidence?: string, identity?: string, hostId?: string,
- *   isolatedRoot?: string, receiverFactory?: (options: object) => {start: Function, stop: Function, diagnostics: Function}}} input
- *   isolatedRoot and receiverFactory exist for tests (a unique temporary root, a counting fake); the plugin entry passes
- *   neither, so production always gets the canonical isolated root and the real receiver.
+ *   isolatedRoot?: string, productionRoot?: string, receiverFactory?: (options: object) => {start: Function, stop: Function, diagnostics: Function}}} input
+ *   isolatedRoot / productionRoot / receiverFactory exist for tests (unique temporary roots, a counting fake); the plugin
+ *   entry passes none of them, so the real entries always get the canonical root of their own kind and the real receiver.
  * @returns {{enabled: boolean, status: string, reason?: string, detail?: string, decisions: readonly string[], dispose: () => Promise<void> | void, parts?: object}}
  */
-export function createIsolatedWiring({ ctx, config = {}, runtimeVersion, versionEvidence, identity = 'dsh', hostId = 'local',
-  isolatedRoot = ISOLATED_ROOT, receiverFactory = createReceiver } = {}) {
+export function createIsolatedWiring(input = {}) {
+  return createWiring({ ...input, kind: 'isolated' });
+}
+
+/**
+ * 生产自动收信（同一套装配，另一个根）。
+ *
+ * 与隔离入口互为镜像：隔离入口拒绝生产根，这里拒绝隔离根；两边都 fail closed，串不到一起。
+ * 注册的能力与隔离入口相同（base 命令、5 个邮件工具 + guard、3 个控制命令），只是根换成真实
+ * `.mailbox`、命令名换成 `localpost-auto-*`、状态串换成 `ready_for_live_production`。
+ */
+export function createProductionWiring(input = {}) {
+  return createWiring({ ...input, kind: 'production' });
+}
+
+function createWiring({ kind = 'isolated', ctx, config = {}, runtimeVersion, versionEvidence, identity = 'dsh', hostId = 'local',
+  isolatedRoot = ISOLATED_ROOT, productionRoot = PRODUCTION_ROOT, receiverFactory = createReceiver } = {}) {
+  const isProduction = kind === 'production';
+  const wiringStatus = isProduction ? PRODUCTION_WIRING_STATUS : WIRING_STATUS;
+  const actions = isProduction ? AUTO_COMMANDS : E_COMMANDS;
+  const label = isProduction ? 'LocalPost AUTO' : 'LocalPost E';
+  const subject = isProduction ? '生产收信' : '隔离验收';
   const decisions = [];
-  if (config?.enabled !== true) return refused('disabled_by_default', decisions);
+  const refuse = (reason, detail) => refused(reason, decisions, detail, wiringStatus);
+  if (config?.enabled !== true) return refuse('disabled_by_default');
   decisions.push('explicitly_enabled');
 
   const root = resolved(config.root);
   const isolated = resolved(isolatedRoot);
-  const production = resolved(PRODUCTION_ROOT);
-  if (root === null || String(config.root ?? '').trim() === '') return refused('root_invalid', decisions);
-  // The production mailbox root first: a misconfigured path must never reach real mail.
-  if (underPath(root, production)) return refused('production_root_refused', decisions);
-  if (!samePath(root, isolated)) return refused('root_not_isolated', decisions);
-  decisions.push('isolated_root_confirmed');
+  const production = resolved(productionRoot);
+  if (root === null || String(config.root ?? '').trim() === '') return refuse('root_invalid');
+  if (isProduction) {
+    // 生产入口只认生产根：隔离根（及其子路径）和一切别的路径都拒绝——方向与隔离入口相反，同样 fail closed。
+    if (samePath(root, isolated) || underPath(root, isolated)) return refuse('isolated_root_refused');
+    if (!samePath(root, production)) return refuse('root_not_production');
+    decisions.push('production_root_confirmed');
+  } else {
+    // The production mailbox root first: a misconfigured path must never reach real mail.
+    if (underPath(root, production)) return refuse('production_root_refused');
+    if (!samePath(root, isolated)) return refuse('root_not_isolated');
+    decisions.push('isolated_root_confirmed');
+  }
 
-  if (runtimeVersion !== SUPPORTED_VERSION) return refused('runtime_version_mismatch', decisions);
+  if (runtimeVersion !== SUPPORTED_VERSION) return refuse('runtime_version_mismatch');
   decisions.push('runtime_version_confirmed');
   // The version is configuration, so a recorded external pre-check is required alongside it: the real
   // gate stays the capability probe below, which a wrong host cannot pass by editing a string.
-  if (typeof versionEvidence !== 'string' || versionEvidence.trim() === '') return refused('version_evidence_missing', decisions);
+  if (typeof versionEvidence !== 'string' || versionEvidence.trim() === '') return refuse('version_evidence_missing');
   decisions.push('version_evidence_recorded');
 
   // Every sender must be an exact safe identifier: a blank, padded or malformed entry refuses the wiring rather than
   // being dropped, so the list that runs is the list that was written.
   const allowFrom = config?.allowFrom;
-  if (allowFrom === undefined || (Array.isArray(allowFrom) && allowFrom.length === 0)) return refused('allow_from_required', decisions);
-  if (!Array.isArray(allowFrom) || !allowFrom.every(entry => typeof entry === 'string' && safeId(entry))) return refused('allow_from_invalid', decisions);
+  if (allowFrom === undefined || (Array.isArray(allowFrom) && allowFrom.length === 0)) return refuse('allow_from_required');
+  if (!Array.isArray(allowFrom) || !allowFrom.every(entry => typeof entry === 'string' && safeId(entry))) return refuse('allow_from_invalid');
   // An interval of 0 or a negative value would spin a timer; the bounds fail closed on both sides.
   const scanIntervalMs = config?.scanIntervalMs === undefined ? 30000 : config.scanIntervalMs;
-  if (!Number.isInteger(scanIntervalMs) || scanIntervalMs < 1000 || scanIntervalMs > 3600000) return refused('scan_interval_invalid', decisions);
+  if (!Number.isInteger(scanIntervalMs) || scanIntervalMs < 1000 || scanIntervalMs > 3600000) return refuse('scan_interval_invalid');
   const debounceMs = config?.debounceMs === undefined ? 250 : config.debounceMs;
-  if (!Number.isInteger(debounceMs) || debounceMs < 50 || debounceMs > 600000) return refused('debounce_invalid', decisions);
+  if (!Number.isInteger(debounceMs) || debounceMs < 50 || debounceMs > 600000) return refuse('debounce_invalid');
   decisions.push('allowlist_and_timers_validated');
-  // The E commands are guarded against shadowing through the host's own lookup, so it is a required capability.
-  if (typeof ctx?.commands?.find !== 'function') return refused('e_lookup_unavailable', decisions);
+  // The control commands are guarded against shadowing through the host's own lookup, so it is a required capability.
+  if (typeof ctx?.commands?.find !== 'function') return refuse('e_lookup_unavailable');
 
   // Everything that can fail without side effects is built before the first registration - the receiver included.
   let store, bridge, tools, adapter, receiver;
@@ -120,16 +152,16 @@ export function createIsolatedWiring({ ctx, config = {}, runtimeVersion, version
       bindingProvider: createBindingProvider({ store, identity, host: bridge }) });
     receiver = receiverFactory({ root, agent: identity, allowFrom: [...allowFrom], adapter, scanIntervalMs, debounceMs });
   } catch (error) {
-    return refused('build_failed', decisions, errorText(error));
+    return refuse('build_failed', errorText(error));
   }
   decisions.push('built');
 
-  // The E names are checked with the host before anything is registered; an unreadable lookup is not "free".
-  for (const name of Object.values(E_COMMANDS)) {
+  // The control names are checked with the host before anything is registered; an unreadable lookup is not "free".
+  for (const name of Object.values(actions)) {
     let existing;
     try { existing = ctx.commands.find(undefined, name); }
-    catch (error) { return refused('e_lookup_failed', decisions, name + ': ' + errorText(error)); }
-    if (existing !== undefined) return refused('e_command_name_taken', decisions, name);
+    catch (error) { return refuse('e_lookup_failed', name + ': ' + errorText(error)); }
+    if (existing !== undefined) return refuse('e_command_name_taken', name);
   }
 
   /*
@@ -214,7 +246,7 @@ export function createIsolatedWiring({ ctx, config = {}, runtimeVersion, version
   const mayStart = (state, caller) => sameChat(state?.binding?.session, caller) && state.binding.state === 'active' && state.binding.mode === 'auto';
   const mayControl = (state, caller) => sameChat(state?.binding?.session, caller) ||
     (startedBy !== null && sameChat({ host: startedBy.host, id: startedBy.session, cwd: startedBy.cwd }, caller));
-  const defineE = (name, description, allowed, refusal, act) => {
+  const defineAction = (name, description, allowed, refusalText, act) => {
     const handler = async invocation => {
       if (!effectiveIsOurs(name, invocation)) return { kind: 'error', text: 'LocalPost: /' + name + ' 被其他定义遮蔽或无法解析，未执行任何操作（shadowed）。' };
       const caller = attestedCommandCaller(invocation, ctx.agents, hostId);
@@ -222,20 +254,20 @@ export function createIsolatedWiring({ ctx, config = {}, runtimeVersion, version
       let state = null;
       let unreadable = null;
       try { state = await store.read(identity); } catch (error) { unreadable = error; }
-      if (!allowed(state, caller)) return { kind: 'error', text: 'LocalPost: ' + refusal + (unreadable === null ? '' : '（绑定状态无法读取：' + errorText(unreadable) + '）') };
-      try { return { kind: 'success', text: 'LocalPost E: ' + JSON.stringify(await act(caller)) }; }
-      catch (error) { return { kind: 'error', text: 'LocalPost E: ' + errorText(error) }; }
+      if (!allowed(state, caller)) return { kind: 'error', text: 'LocalPost: ' + refusalText + (unreadable === null ? '' : '（绑定状态无法读取：' + errorText(unreadable) + '）') };
+      try { return { kind: 'success', text: label + ': ' + JSON.stringify(await act(caller)) }; }
+      catch (error) { return { kind: 'error', text: label + ': ' + errorText(error) }; }
     };
     handlers.set(name, handler);
     return { name, description, recordInput: false, handler };
   };
-  const eDefinitions = [
-    defineE(E_COMMANDS.start, '启动隔离验收 receiver（仅已绑定且处于自动模式的测试聊天、无参数）。', mayStart,
-      '只有已绑定且处于自动模式的测试聊天可以启动隔离 receiver。', caller => control.start(caller)),
-    defineE(E_COMMANDS.stop, '停止隔离验收 receiver（已绑定聊天或启动它的聊天、无参数）。', mayControl,
-      '只有已绑定的测试聊天或启动它的聊天可以停止隔离 receiver。', () => control.stop()),
-    defineE(E_COMMANDS.status, '查看隔离验收 receiver 状态（已绑定聊天或启动它的聊天、无参数）。', mayControl,
-      '只有已绑定的测试聊天或启动它的聊天可以查看隔离 receiver。', () => control.status()),
+  const actionDefinitions = [
+    defineAction(actions.start, '启动' + subject + ' receiver（仅已绑定且处于自动模式的聊天、无参数）。', mayStart,
+      '只有已绑定且处于自动模式的聊天可以启动' + subject + ' receiver。', caller => control.start(caller)),
+    defineAction(actions.stop, '停止' + subject + ' receiver（已绑定聊天或启动它的聊天、无参数）。', mayControl,
+      '只有已绑定的聊天或启动它的聊天可以停止' + subject + ' receiver。', () => control.stop()),
+    defineAction(actions.status, '查看' + subject + ' receiver 状态（已绑定聊天或启动它的聊天、无参数）。', mayControl,
+      '只有已绑定的聊天或启动它的聊天可以查看' + subject + ' receiver。', () => control.status()),
   ];
 
   // One transaction: base commands, mail tools with their guard, then the E commands. Any failure releases everything
@@ -244,18 +276,18 @@ export function createIsolatedWiring({ ctx, config = {}, runtimeVersion, version
   const release = () => { for (const dispose of disposers.splice(0).reverse()) { try { dispose(); } catch { /* release is best effort */ } } };
   try {
     const commands = bridge.registerCommands();
-    if (commands.ok !== true) { release(); return refused('commands_' + String(commands.reason ?? 'refused'), decisions, commands.name); }
+    if (commands.ok !== true) { release(); return refuse('commands_' + String(commands.reason ?? 'refused'), commands.name); }
     disposers.push(commands.dispose);
     const registered = tools.register();
-    if (registered.ok !== true) { release(); return refused('tools_' + String(registered.reason ?? 'refused'), decisions, registered.name); }
+    if (registered.ok !== true) { release(); return refuse('tools_' + String(registered.reason ?? 'refused'), registered.name); }
     disposers.push(registered.dispose);
-    for (const definition of eDefinitions) {
+    for (const definition of actionDefinitions) {
       const dispose = ctx.commands.register(definition);
       disposers.push(typeof dispose === 'function' ? dispose : () => {});
     }
   } catch (error) {
     release();
-    return refused('registration_failed', decisions, errorText(error));
+    return refuse('registration_failed', errorText(error));
   }
   decisions.push('commands_registered', 'tools_registered', 'e_commands_registered');
 
@@ -279,13 +311,13 @@ export function createIsolatedWiring({ ctx, config = {}, runtimeVersion, version
   decisions.push(adapter.capabilities.trustedBinding ? 'adapter_binding_trusted' : 'adapter_binding_untrusted');
 
   return Object.freeze({
-    enabled: true, status: WIRING_STATUS, decisions: Object.freeze([...decisions]), dispose: shutdown,
+    enabled: true, status: wiringStatus, decisions: Object.freeze([...decisions]), dispose: shutdown,
     parts: Object.freeze({
-      root, store, bridge, tools, adapter,
+      root, store, bridge, tools, adapter, kind,
       capabilities: Object.freeze({ ...tools.capabilities(), adapter: adapter.capabilities }),
       diagnostics: () => adapter.diagnostics(),
       versionEvidence,
-      /** The one receiver this wiring owns, handed out unstarted; it is started from the E commands only. */
+      /** The one receiver this wiring owns, handed out unstarted; it is started from the control commands only. */
       receiver: control,
     }),
   });
