@@ -53,7 +53,14 @@ export function attestedCommandCaller(invocation, agents, hostId) {
   return Object.freeze({ host: hostId, session: session.id, cwd: session.cwd });
 }
 
-export function createDshHostBridge({ ctx, runtimeVersion, store, identity, hostId = 'local', now = Date.now, actionTtlMs = ACTION_TTL_MS } = {}) {
+/**
+ * `names` are the three command names (the host's own identity keeps COMMANDS; a further identity gets its own, see
+ * dsh-wiring.mjs). `admitBind(caller, proceed)` decides, before anything is written, whether this attested chat may become
+ * this identity's mail chat; it either calls `proceed()` and returns its result or returns a refusal `{ ok: false, reason }`.
+ * By default every attested chat is admitted, which is the single-identity behaviour.
+ */
+export function createDshHostBridge({ ctx, runtimeVersion, store, identity, hostId = 'local', now = Date.now, actionTtlMs = ACTION_TTL_MS,
+  names: commandNames = COMMANDS, admitBind = (_caller, proceed) => proceed() } = {}) {
   assertId(identity);
   const commands = ctx?.commands;
   const agents = ctx?.agents;
@@ -122,7 +129,7 @@ export function createDshHostBridge({ ctx, runtimeVersion, store, identity, host
       return { ok: false, reason: 'host_cannot_attest', reasons: [...reasons], dispose: () => {} };
     }
     if (registration) return { ok: true, existing: true, dispose: registration.dispose };
-    const names = [COMMANDS.bind, COMMANDS.status, COMMANDS.unbind];
+    const names = [commandNames.bind, commandNames.status, commandNames.unbind];
     if (typeof commands.find === 'function') {
       for (const name of names) {
         let existing;
@@ -151,15 +158,15 @@ export function createDshHostBridge({ ctx, runtimeVersion, store, identity, host
     };
     const release = () => { for (const dispose of disposers.splice(0).reverse()) { try { dispose(); } catch { /* release is best effort */ } } };
     try {
-      define(COMMANDS.bind, 'Bind this chat as the LocalPost mail chat (no arguments).', async invocation => {
-        const shadowed = guard(COMMANDS.bind, invocation);
+      define(commandNames.bind, 'Bind this chat as the LocalPost mail chat of ' + identity + ' (no arguments).', async invocation => {
+        const shadowed = guard(commandNames.bind, invocation);
         if (shadowed) return shadowed;
         const caller = attestedCommandCaller(invocation, agents, hostId);
         if (!caller) return { kind: 'error', text: 'LocalPost: the host did not prove this chat' + String.fromCharCode(39) + 's identity and absolute workspace, so no binding was created.' };
         const actionId = randomUUID();
         const action = { actionId, hostId, threadId: caller.session, cwd: caller.cwd };
         actions.set(actionId, { ...action, at: Number(now()) });
-        const result = await bindFromChatAction(store, identity, { host: bridge, action, authority: BIND_AUTHORITY });
+        const result = await admitBind(caller, () => bindFromChatAction(store, identity, { host: bridge, action, authority: BIND_AUTHORITY }));
         if (result?.ok) {
           return { kind: 'success', text: result.existing
             ? 'LocalPost: this chat was already the mail chat; nothing changed.'
@@ -177,11 +184,15 @@ export function createDshHostBridge({ ctx, runtimeVersion, store, identity, host
             ? { kind: 'success', text: 'LocalPost: this chat was already the mail chat; nothing changed.' }
             : { kind: 'error', text: 'LocalPost: this identity is bound to another chat. T1 cannot move a binding between chats (that needs its own protocol).' };
         }
-        return { kind: 'error', text: 'LocalPost: binding refused (' + reason + '). Nothing changed.' };
+        if (reason === 'chat_speaks_for_other_identity') {
+          return { kind: 'error', text: 'LocalPost: this chat is already the mail chat of ' + String(result?.identity ?? 'another identity') +
+            '; a chat speaks for one identity only, so it was not bound as ' + identity + '. Nothing changed.' };
+        }
+        return { kind: 'error', text: 'LocalPost: binding refused (' + reason + (result?.message ? ': ' + String(result.message) : '') + '). Nothing changed.' };
       });
 
-      define(COMMANDS.status, 'Show the current LocalPost mail binding for this host (no arguments).', async invocation => {
-        const shadowed = guard(COMMANDS.status, invocation);
+      define(commandNames.status, 'Show the current LocalPost mail binding of ' + identity + ' (no arguments).', async invocation => {
+        const shadowed = guard(commandNames.status, invocation);
         if (shadowed) return shadowed;
         const caller = attestedCommandCaller(invocation, agents, hostId);
         const state = await store.read(identity);
@@ -189,13 +200,13 @@ export function createDshHostBridge({ ctx, runtimeVersion, store, identity, host
         if (!state) return { kind: 'error', text: 'LocalPost: this identity has no binding state yet.' };
         const binding = boundTo(state, caller);
         if (!binding) return { kind: 'error', text: 'LocalPost: only the bound mail chat may read the binding.' };
-        return { kind: 'success', text: 'LocalPost: mode=' + binding.mode + ' generation=' + binding.generation +
+        return { kind: 'success', text: 'LocalPost: identity=' + identity + ' mode=' + binding.mode + ' generation=' + binding.generation +
           ' chat=' + String(binding.session?.id ?? '?') + ' cwd=' + String(binding.session?.cwd ?? '?') +
           ' attested=' + String(attestedNow(state)) };
       });
 
-      define(COMMANDS.unbind, 'Stop routing NEW mail automatically for this identity (no arguments).', async invocation => {
-        const shadowed = guard(COMMANDS.unbind, invocation);
+      define(commandNames.unbind, 'Stop routing NEW mail automatically for ' + identity + ' (no arguments).', async invocation => {
+        const shadowed = guard(commandNames.unbind, invocation);
         if (shadowed) return shadowed;
         const caller = attestedCommandCaller(invocation, agents, hostId);
         const state = await store.read(identity);

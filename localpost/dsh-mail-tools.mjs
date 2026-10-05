@@ -15,6 +15,9 @@ import { assertId } from './fs-safe.mjs';
  * mailbox's owner check instead (host, session and workspace of the letter's owner), which keeps an
  * already-claimed letter with its original owner across a rotation.
  *
+ * When one host serves several identities, which mailbox a call works on is derived the same way, from the
+ * attested caller and the bindings (`resolve`, see chat-identity.mjs) - it is never a tool argument either.
+ *
  * There is deliberately no send tool: this bridge finishes mail, it does not create it.
  */
 export const SUPPORTED_VERSION = '0.2.0-rc.2';
@@ -89,8 +92,11 @@ const letterLine = letter => shown({
  * Registers the mail tools. All-or-nothing: without every required host capability and the exact
  * supported runtime nothing is registered, a name conflict or an unreadable lookup registers
  * nothing, and a mid-way failure releases what was already registered, in reverse order.
+ *
+ * `resolve(caller)` (optional) names the identity and mailbox the attested caller speaks for; it is in-process
+ * code (dsh-wiring.mjs) and throws when that cannot be decided. Without it every call works on `identity`.
  */
-export function createMailTools({ ctx, mailbox, store, identity, hostId = 'local', runtimeVersion } = {}) {
+export function createMailTools({ ctx, mailbox, store, identity, hostId = 'local', runtimeVersion, resolve } = {}) {
   assertId(identity);
   const tools = ctx?.tools;
   const canRegister = typeof tools?.register === 'function';
@@ -109,8 +115,13 @@ export function createMailTools({ ctx, mailbox, store, identity, hostId = 'local
   // registered, so its guard can prove identity). A stale disposer can therefore never touch a successor's.
   let registration = null;
 
-  const withCaller = (name, exec, run) => run(attestedCaller(ctx, exec, hostId));
-  const bound = async caller => requireBoundChat(await store.read(identity), caller);
+  const laneOf = typeof resolve === 'function' ? resolve : async () => ({ identity, mailbox });
+  // The caller is proven first; only then is it asked which identity - and so which mailbox - it speaks for.
+  const withCaller = async (name, exec, run) => {
+    const caller = attestedCaller(ctx, exec, hostId);
+    return run(caller, await laneOf(caller));
+  };
+  const bound = async (caller, lane) => requireBoundChat(await store.read(lane.identity), caller);
 
   const definitions = () => [
     {
@@ -119,10 +130,10 @@ export function createMailTools({ ctx, mailbox, store, identity, hostId = 'local
       parameters: { type: 'object', properties: {} },
       output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: String(value) }] },
       async execute(args, exec) {
-        return withCaller('localpost_status', exec, async caller => {
-          const state = await store.read(identity);
+        return withCaller('localpost_status', exec, async (caller, lane) => {
+          const state = await store.read(lane.identity);
           const binding = requireBoundChat(state, caller);
-          return 'LocalPost: mode=' + binding.mode + ' generation=' + binding.generation
+          return 'LocalPost: identity=' + lane.identity + ' mode=' + binding.mode + ' generation=' + binding.generation
             + ' chat=' + String(binding.session?.id) + ' cwd=' + String(binding.session?.cwd)
             + ' claims=' + Object.keys(state.claims ?? {}).length;
         });
@@ -134,9 +145,9 @@ export function createMailTools({ ctx, mailbox, store, identity, hostId = 'local
       parameters: { type: 'object', properties: {} },
       output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: String(value) }] },
       async execute(args, exec) {
-        return withCaller('localpost_inbox', exec, async caller => {
-          await bound(caller);
-          const letters = mailbox.inbox(identity);
+        return withCaller('localpost_inbox', exec, async (caller, lane) => {
+          await bound(caller, lane);
+          const letters = lane.mailbox.inbox(lane.identity);
           return letters.length === 0 ? 'LocalPost: the inbox is empty.' : letters.map(letterLine).join(String.fromCharCode(10));
         });
       },
@@ -147,9 +158,9 @@ export function createMailTools({ ctx, mailbox, store, identity, hostId = 'local
       parameters: { type: 'object', properties: { id: { type: 'string', description: 'Envelope id from localpost_inbox.' } }, required: ['id'] },
       output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: String(value) }] },
       async execute(args, exec) {
-        return withCaller('localpost_read', exec, async caller => {
+        return withCaller('localpost_read', exec, async (caller, lane) => {
           if (!text(args?.id)) throw failure('INVALID_ARGS', 'localpost_read needs an envelope id');
-          const letter = await mailbox.take(identity, args.id, { caller });
+          const letter = await lane.mailbox.take(lane.identity, args.id, { caller });
           return shown({ id: letter?.envelope?.id ?? args.id, from: letter?.envelope?.from, subject: letter?.envelope?.subject,
             body: letter?.envelope?.body, attachments: letter?.attachments_resolved ?? [] });
         });
@@ -169,12 +180,12 @@ export function createMailTools({ ctx, mailbox, store, identity, hostId = 'local
       },
       output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: String(value) }] },
       async execute(args, exec) {
-        return withCaller('localpost_reply', exec, async caller => {
+        return withCaller('localpost_reply', exec, async (caller, lane) => {
           if (!text(args?.id)) throw failure('INVALID_ARGS', 'localpost_reply needs the id of the letter being answered');
           if (!REPLY_OUTCOMES.includes(args?.outcome)) throw failure('INVALID_ARGS', 'localpost_reply outcome must be one of ' + REPLY_OUTCOMES.join(', '));
           if (!text(args?.body)) throw failure('INVALID_ARGS', 'localpost_reply needs a body');
           // The real contract names the answered letter reply_to; anything else is an unhandled letter.
-          const result = await mailbox.reply(identity, { reply_to: args.id, outcome: args.outcome, body: args.body }, { caller });
+          const result = await lane.mailbox.reply(lane.identity, { reply_to: args.id, outcome: args.outcome, body: args.body }, { caller });
           return shown({ replied: result?.id ?? null, outcome: result?.outcome ?? args.outcome, archived: result?.archived ?? null, idempotent: result?.idempotent ?? false });
         });
       },
@@ -185,9 +196,9 @@ export function createMailTools({ ctx, mailbox, store, identity, hostId = 'local
       parameters: { type: 'object', properties: { id: { type: 'string', description: 'Envelope id to archive.' } }, required: ['id'] },
       output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: String(value) }] },
       async execute(args, exec) {
-        return withCaller('localpost_archive', exec, async caller => {
+        return withCaller('localpost_archive', exec, async (caller, lane) => {
           if (!text(args?.id)) throw failure('INVALID_ARGS', 'localpost_archive needs an envelope id');
-          const result = await mailbox.archive(identity, args.id, { caller });
+          const result = await lane.mailbox.archive(lane.identity, args.id, { caller });
           return shown({ archived: result?.archived ?? args.id, idempotent: result?.idempotent ?? false });
         });
       },
