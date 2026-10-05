@@ -88,6 +88,8 @@ function wire(t, host, { identities = [{ identity: 'engineer', allowFrom: ['dsh'
     ctx: host.ctx, runtimeVersion: SUPPORTED_VERSION, versionEvidence: EVIDENCE, productionRoot: root, receiverFactory: receivers.factory,
     config: { enabled: true, root, allowFrom: ['codex'], scanIntervalMs: 3600000, debounceMs: 60, identities, ...extra },
   });
+  // 断言中途失败也要停掉真实 receiver 的定时器，否则测试进程退不出（dispose 幂等，用例里显式调用过也无妨）。
+  t.after(() => wiring.dispose());
   return { wiring, receivers, root };
 }
 const AUTHORITY = Object.freeze({ scope: 'analysis-reply', source: 'policy:test' });
