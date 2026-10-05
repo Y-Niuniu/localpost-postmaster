@@ -3,7 +3,11 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { removeTreeSync } from './temp-tree.mjs';
+import { watch, writesUnder } from './fixtures/production-write-witness.mjs';
 import { PRODUCTION_ROOT } from './dsh-wiring.mjs';
+
+// 这些用例在 canonical 生产根上装配（只装配不启动），所以用调用期见证核对"本进程从没往生产根写过"（最后一个用例）。
+watch(PRODUCTION_ROOT);
 
 /**
  * 插件入口冒烟测试（2026-10-05 补）。
@@ -77,6 +81,37 @@ test('插件入口：启用生产接线时不抛，命令/工具/就绪日志都
   assert.match(written, /插件就绪/, '插件就绪日志缺失（说明入口中途抛了）');
 });
 
+test('插件入口：配了其他身份时同样不抛、按身份注册命令；身份配置非法时拒绝装配而不是抛（多身份 T1）', async t => {
+  const base = {
+    root: PRODUCTION_ROOT, intervalMinutes: 999, startupDelayMs: 60000, cooldownHours: 12, ntfyEnabled: false, toastEnabled: false,
+    runtimeVersion: '0.2.0-rc.2', versionEvidence: 'plugin-entry-test',
+  };
+  const autoReceive = { enabled: true, root: PRODUCTION_ROOT, allowFrom: 'codex', scanIntervalMs: 60000, debounceMs: 60 };
+
+  const dir = scratch(t, 'identities');
+  const host = fakeCtx();
+  const logFile = path.join(dir, 'plugin.log');
+  const mod = await import(new URL('../lib/index.js', import.meta.url).href + '?entry-test=3');
+  assert.doesNotThrow(() => mod.apply(host.ctx, { ...base, stateFile: path.join(dir, 'state.json'), logFile,
+    autoReceive: { ...autoReceive, identities: { engineer: { allowFrom: 'dsh' } } } }));
+  const names = host.commands.map(c => c.name);
+  for (const name of ['localpost-bind', 'localpost-auto-start', 'localpost-engineer-bind', 'localpost-engineer-auto-start', 'localpost-engineer-auto-status'])
+    assert.equal(names.includes(name), true, name);
+  assert.equal(host.tools.filter(t => t.name === 'localpost_read').length, 1, '工具仍只有一套');
+  assert.match(fs.readFileSync(logFile, 'utf8'), /生产自动收信已就绪：.*身份=dsh,engineer/);
+
+  const badDir = scratch(t, 'identities-bad');
+  const badHost = fakeCtx();
+  const badLog = path.join(badDir, 'plugin.log');
+  const badMod = await import(new URL('../lib/index.js', import.meta.url).href + '?entry-test=4');
+  assert.doesNotThrow(() => badMod.apply(badHost.ctx, { ...base, stateFile: path.join(badDir, 'state.json'), logFile: badLog,
+    autoReceive: { ...autoReceive, identities: { Engineer: { allowFrom: 'dsh' } } } }));
+  assert.deepEqual(badHost.commands.map(c => c.name), []);
+  const written = fs.readFileSync(badLog, 'utf8');
+  assert.match(written, /生产自动收信未启用（identity_invalid：Engineer）/);
+  assert.match(written, /插件就绪/, '非法身份配置不许连累内核定时器');
+});
+
 test('插件入口：接线未启用时照旧只注册内核工具（默认关）', async t => {
   const dir = scratch(t, 'disabled');
   const host = fakeCtx();
@@ -95,4 +130,8 @@ test('插件入口：接线未启用时照旧只注册内核工具（默认关�
   assert.deepEqual(host.commands.map(c => c.name), []);
   assert.deepEqual(host.tools.map(t => t.name), ['localpost_check']);
   assert.match(fs.readFileSync(logFile, 'utf8'), /未启用/);
+});
+
+test('插件入口：以上装配全程没有往真实生产信箱写过任何东西（调用期见证）', () => {
+  assert.deepEqual(writesUnder(PRODUCTION_ROOT), []);
 });
