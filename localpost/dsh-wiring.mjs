@@ -292,6 +292,37 @@ function createWiring({ kind = 'isolated', ctx, config = {}, runtimeVersion, ver
   decisions.push('commands_registered', 'tools_registered', 'e_commands_registered');
 
   /*
+   * 可选的"绑定后自启"（config.autoStart，配置层的人工开关）：读一次绑定状态，只有已存在 active + auto 的
+   * 绑定时才启动 receiver。目的：让"重启后仍然自动收信"成立，把人工步骤压到只剩一次绑定；模型侧依然没有
+   * 任何 start/stop 工具，start 仍只由人类命令或本开关触发。
+   *
+   * 绑定通常发生在装配**之后**（用户那一刻才敲 /localpost-bind），所以这里除了首次尝试，还对外暴露
+   * parts.retryAutoStart()：宿主用 ctx.setInterval 定期调用它，绑上即自启。首次成功返回 'started'，
+   * 之后返回 'already_running'（宿主据此只记一条日志，不刷屏）。
+   */
+  let autoStarted = false;
+  const attemptAutoStart = async () => {
+    if (disposed) return 'disposed';
+    if (running) return autoStarted ? 'already_running' : 'already_running';
+    try {
+      const state = await store.read(identity);
+      const binding = state?.binding;
+      if (!binding || binding.state !== 'active' || binding.mode !== 'auto') return 'skipped_unbound';
+      await control.start(null);
+      const first = !autoStarted;
+      autoStarted = true;
+      return first ? 'started' : 'already_running';
+    } catch (error) {
+      return 'failed: ' + errorText(error);
+    }
+  };
+  let autoStart = Promise.resolve('disabled');
+  if (config?.autoStart === true) {
+    decisions.push('auto_start_scheduled');
+    autoStart = attemptAutoStart();
+  }
+
+  /*
    * Stops the receiver this wiring owns - after whatever start/stop is queued - and then releases every registration,
    * even if stopping fails; that failure is kept and shown by status().shutdownError. Idempotent, and no start is admitted
    * from here on. Cordis rc.2 awaits a Promise returned by an effect disposer (fiber unload runs runDisposable), so the
@@ -319,6 +350,10 @@ function createWiring({ kind = 'isolated', ctx, config = {}, runtimeVersion, ver
       versionEvidence,
       /** The one receiver this wiring owns, handed out unstarted; it is started from the control commands only. */
       receiver: control,
+      /** 'disabled' | 'skipped_unbound' | 'started' | 'already_running' | 'failed: …' —— 配置了 autoStart 时才有意义。 */
+      autoStart,
+      /** 宿主定期调用：绑定出现后自动启动 receiver（未配置 autoStart 时恒为 'disabled'）。 */
+      retryAutoStart: config?.autoStart === true ? attemptAutoStart : async () => 'disabled',
     }),
   });
 }

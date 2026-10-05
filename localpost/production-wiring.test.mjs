@@ -7,6 +7,9 @@ import { AUTO_COMMANDS, ISOLATED_ROOT, PRODUCTION_ROOT, PRODUCTION_WIRING_STATUS
 import { SUPPORTED_VERSION } from './dsh-host-bridge.mjs';
 import { TOOL_NAMES } from './dsh-mail-tools.mjs';
 import { COMMANDS } from './dsh-host-bridge.mjs';
+import { bindFromChatAction } from './binding-provider.mjs';
+import { createSessionStore } from './session-binding.mjs';
+import { createFakeDshHost } from './fixtures/fake-dsh-host.mjs';
 import { removeTreeSync } from './temp-tree.mjs';
 
 const EVIDENCE = 'precheck:app.asar package.json 0.2.0-rc.2';
@@ -194,6 +197,46 @@ test('命令名被占用时拒绝装配（与隔离入口同名工具/命令互�
   const wiring = attempt(host, { config: { enabled: true, root: PRODUCTION_ROOT, allowFrom: ['codex'] }, receiver });
   assert.deepEqual([wiring.enabled, wiring.reason], [false, 'e_command_name_taken']);
   assert.equal(host.tools.length, 0);
+});
+
+/* ------------------------------------------------------------------ 绑定后自启 */
+
+test('autoStart：已有 active+auto 绑定时装配即自启；未绑定时跳过', async t => {
+  // 未绑定：不启动（receiver 跑了也没有路由）
+  const cold = fakeCtx();
+  const coldReceiver = fakeReceiver();
+  const coldRoot = rootFor(t);
+  const coldWiring = attempt(cold, { config: { enabled: true, root: coldRoot, allowFrom: ['codex'], autoStart: true }, receiver: coldReceiver, productionRoot: coldRoot });
+  assert.equal(await coldWiring.parts.autoStart, 'skipped_unbound');
+  assert.equal(coldReceiver.seen.start, 0);
+  assert.equal(coldWiring.parts.receiver.status().running, false);
+  assert.equal(coldWiring.decisions.includes('auto_start_scheduled'), true);
+  // 装配之后才绑定（真实顺序：用户那一刻才敲 /localpost-bind）⇒ 宿主轮询 retryAutoStart 就能自启
+  const lateHost = createFakeDshHost({ root: coldRoot });
+  lateHost.openThread('chat-late', 'C:/work/late');
+  assert.equal((await bindFromChatAction(createSessionStore({ root: coldRoot }), 'dsh',
+    { host: lateHost, action: lateHost.userBindAction('chat-late'), authority: { scope: 'analysis-reply', source: 'policy:test' } })).ok, true);
+  assert.equal(await coldWiring.parts.retryAutoStart(), 'started');
+  assert.equal(coldReceiver.seen.start, 1);
+  assert.equal(coldWiring.parts.receiver.status().running, true);
+  assert.equal(await coldWiring.parts.retryAutoStart(), 'already_running', '重复轮询只报一次 started');
+  assert.equal(coldReceiver.seen.start, 1, 'start 幂等');
+  await coldWiring.dispose();
+
+  // 已绑定（走真实绑定路径 + 假宿主）：装配即启动
+  const host = fakeCtx();
+  const receiver = fakeReceiver();
+  const root = rootFor(t);
+  const fakeHost = createFakeDshHost({ root });
+  fakeHost.openThread('chat-a', 'C:/work/project-a');
+  const bound = await bindFromChatAction(createSessionStore({ root }), 'dsh',
+    { host: fakeHost, action: fakeHost.userBindAction('chat-a'), authority: { scope: 'analysis-reply', source: 'policy:test' } });
+  assert.equal(bound.ok, true);
+  const wiring = attempt(host, { config: { enabled: true, root, allowFrom: ['codex'], autoStart: true }, receiver, productionRoot: root });
+  assert.equal(await wiring.parts.autoStart, 'started');
+  assert.equal(receiver.seen.start, 1);
+  assert.equal(wiring.parts.receiver.status().running, true);
+  await wiring.dispose();
 });
 
 /* ------------------------------------------------------------------ 生产零接触 */

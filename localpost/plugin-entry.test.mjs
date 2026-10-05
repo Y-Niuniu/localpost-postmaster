@@ -1,0 +1,98 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { removeTreeSync } from './temp-tree.mjs';
+import { PRODUCTION_ROOT } from './dsh-wiring.mjs';
+
+/**
+ * 插件入口冒烟测试（2026-10-05 补）。
+ *
+ * 起因：生产接线里 `row` 声明在 try 块内、块外又引用一次，触发 ReferenceError，整个 fiber 加载失败 ——
+ * 不只是接线没起来，**连内核定时器都不跑了**；当时没有任何测试能发现，因为单测都跑在接线"未启用"的分支上。
+ *
+ * 这里的 enabled 用例故意**只装配不启动**（autoStart: false），并对 canonical 生产根只读：装配不写盘
+ * （wiring 的设计保证），因此不会碰生产数据；而那个 ReferenceError 无论 autoStart 真假都会抛，照样被抓住。
+ */
+const TMP = path.resolve(import.meta.dirname, '../.localpost-tmp/plugin-entry');
+
+function fakeCtx() {
+  const host = { tools: [], commands: [], intervals: 0, timeouts: 0, disposers: [] };
+  host.ctx = {
+    logger: { info() {}, warn() {}, error() {} },
+    effect(fn) { const dispose = fn(); if (typeof dispose === 'function') host.disposers.push(dispose); return () => {}; },
+    on() { return () => {}; },
+    setTimeout() { host.timeouts += 1; return () => {}; },
+    setInterval() { host.intervals += 1; return () => {}; },
+    tools: {
+      register(def) { host.tools.push(def); return () => {}; },
+      get(name) { return host.tools.find(t => t.name === name); },
+      guard() { return () => {}; },
+    },
+    commands: {
+      register(def) { host.commands.push(def); return () => {}; },
+      find(_agent, name) { return host.commands.find(c => c.name === name); },
+    },
+    agents: { get: () => undefined },
+  };
+  return host;
+}
+
+/** 只给插件写日志/状态的地方开临时目录；信箱根仍用 canonical（只读）。 */
+function scratch(t, stamp) {
+  fs.mkdirSync(TMP, { recursive: true });
+  const dir = path.join(TMP, `scratch-${stamp}`);
+  fs.mkdirSync(dir, { recursive: true });
+  t.after(() => removeTreeSync(dir));
+  return dir;
+}
+
+test('插件入口：启用生产接线时不抛，命令/工具/就绪日志都到位（row 作用域回归）', async t => {
+  const dir = scratch(t, 'enabled');
+  const host = fakeCtx();
+  const logFile = path.join(dir, 'plugin.log');
+  const mod = await import(new URL('../lib/index.js', import.meta.url).href + '?entry-test=1');
+
+  assert.doesNotThrow(() => mod.apply(host.ctx, {
+    root: PRODUCTION_ROOT,
+    intervalMinutes: 999,
+    startupDelayMs: 60000,
+    cooldownHours: 12,
+    ntfyEnabled: false,
+    toastEnabled: false,
+    stateFile: path.join(dir, 'state.json'),
+    logFile,
+    runtimeVersion: '0.2.0-rc.2',
+    versionEvidence: 'plugin-entry-test',
+    autoReceive: { enabled: true, root: PRODUCTION_ROOT, allowFrom: 'codex', scanIntervalMs: 60000, debounceMs: 60 },
+  }), '入口必须能加载（抛出 = fiber 失败，连内核定时器都不跑）');
+
+  const written = fs.readFileSync(logFile, 'utf8');
+  assert.deepEqual(host.commands.map(c => c.name).filter(n => n.startsWith('localpost-auto-')).sort(),
+    ['localpost-auto-start', 'localpost-auto-status', 'localpost-auto-stop']);
+  assert.deepEqual(host.tools.map(t => t.name).sort(),
+    ['localpost_archive', 'localpost_check', 'localpost_inbox', 'localpost_read', 'localpost_reply', 'localpost_status']);
+  assert.equal(host.intervals, 1, '未开 autoStart 时只有内核定时器');
+  assert.match(written, /生产自动收信已就绪/, '就绪日志缺失');
+  assert.match(written, /插件就绪/, '插件就绪日志缺失（说明入口中途抛了）');
+});
+
+test('插件入口：接线未启用时照旧只注册内核工具（默认关）', async t => {
+  const dir = scratch(t, 'disabled');
+  const host = fakeCtx();
+  const logFile = path.join(dir, 'plugin.log');
+  const mod = await import(new URL('../lib/index.js', import.meta.url).href + '?entry-test=2');
+
+  assert.doesNotThrow(() => mod.apply(host.ctx, {
+    root: PRODUCTION_ROOT,
+    intervalMinutes: 999,
+    startupDelayMs: 60000,
+    ntfyEnabled: false,
+    toastEnabled: false,
+    stateFile: path.join(dir, 'state.json'),
+    logFile,
+  }));
+  assert.deepEqual(host.commands.map(c => c.name), []);
+  assert.deepEqual(host.tools.map(t => t.name), ['localpost_check']);
+  assert.match(fs.readFileSync(logFile, 'utf8'), /未启用/);
+});
