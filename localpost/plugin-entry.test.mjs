@@ -80,7 +80,7 @@ test('插件入口：启用生产接线时不抛，命令/工具/就绪日志都
 
   const written = fs.readFileSync(logFile, 'utf8');
   assert.deepEqual(host.commands.map(c => c.name).filter(n => n.startsWith('localpost-auto-')).sort(),
-    ['localpost-auto-start', 'localpost-auto-status', 'localpost-auto-stop']);
+    ['localpost-auto-arm', 'localpost-auto-start', 'localpost-auto-status', 'localpost-auto-stop']);
   assert.deepEqual(host.tools.map(t => t.name).sort(),
     ['localpost_archive', 'localpost_check', 'localpost_inbox', 'localpost_read', 'localpost_reply', 'localpost_status']);
   assert.equal(host.intervals, 1, '未开 autoStart 时只有内核定时器');
@@ -102,7 +102,7 @@ test('插件入口：配了其他身份时同样不抛、按身份注册命令�
   assert.doesNotThrow(() => mod.apply(host.ctx, { ...base, stateFile: path.join(dir, 'state.json'), logFile,
     autoReceive: { ...autoReceive, identities: { engineer: { allowFrom: 'dsh' } } } }));
   const names = host.commands.map(c => c.name);
-  for (const name of ['localpost-bind', 'localpost-auto-start', 'localpost-engineer-bind', 'localpost-engineer-auto-start', 'localpost-engineer-auto-status'])
+  for (const name of ['localpost-bind', 'localpost-auto-start', 'localpost-auto-arm', 'localpost-engineer-bind', 'localpost-engineer-auto-start', 'localpost-engineer-auto-arm', 'localpost-engineer-auto-status'])
     assert.equal(names.includes(name), true, name);
   assert.equal(host.tools.filter(t => t.name === 'localpost_read').length, 1, '工具仍只有一套');
   assert.match(fs.readFileSync(logFile, 'utf8'), /生产自动收信已就绪：.*身份=dsh,engineer/);

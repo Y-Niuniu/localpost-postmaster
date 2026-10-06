@@ -207,7 +207,7 @@ test('an enabled wiring registers the base commands, the E commands, the tools a
   const { wiring, receiver } = build(t, host);
   assert.deepEqual([wiring.enabled, wiring.status], [true, WIRING_STATUS]);
   const names = host.commands.map(entry => entry.name).sort();
-  assert.deepEqual(names, [COMMANDS.bind, COMMANDS.status, COMMANDS.unbind, E.start, E.stop, E.status].sort());
+  assert.deepEqual(names, [COMMANDS.bind, COMMANDS.status, COMMANDS.unbind, COMMANDS.arm, E.start, E.stop, E.status].sort());
   for (const definition of host.commands) assert.deepEqual([definition.input, definition.recordInput], [undefined, false], definition.name);
   assert.deepEqual(host.tools.map(entry => entry.name).sort(), [...TOOL_NAMES].sort());
   assert.equal(host.tools.some(entry => /start|dispatch|enable/.test(entry.name)), false, 'no model-callable tool may start dispatch');

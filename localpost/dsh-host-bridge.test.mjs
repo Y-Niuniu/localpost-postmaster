@@ -85,18 +85,18 @@ test('diagnostics name every reason a binding cannot be trusted', async () => {
   assert.deepEqual(good.bridge.diagnostics().reasons, []);
 });
 
-test('the trusted host gets exactly three argument-free commands that are not logged', async () => {
+test('the trusted host gets exactly four argument-free commands that are not logged', async () => {
   const { bridge, host } = await bridgeFor('register');
   const registered = bridge.registerCommands();
   assert.equal(registered.ok, true);
-  assert.equal(host.definitions.length, 3);
+  assert.equal(host.definitions.length, 4);
   for (const definition of host.definitions) {
     assert.equal(definition.input, undefined, definition.name + ' must take no input');
     assert.equal(definition.recordInput, false, definition.name + ' must not record input');
   }
-  assert.deepEqual(host.definitions.map(entry => entry.name).sort(), [COMMANDS.bind, COMMANDS.status, COMMANDS.unbind].sort());
+  assert.deepEqual(host.definitions.map(entry => entry.name).sort(), [COMMANDS.bind, COMMANDS.status, COMMANDS.unbind, COMMANDS.arm].sort());
   assert.equal(bridge.registerCommands().existing, true, 'registering twice must not duplicate');
-  assert.equal(host.definitions.length, 3);
+  assert.equal(host.definitions.length, 4);
 });
 
 test('a taken command name and a mid-way registry failure both leave zero commands registered', async () => {
@@ -221,6 +221,58 @@ test('unbind goes through the mode switch protocol: never under an in-flight dis
   const { binding } = await store.read('dsh');
   assert.deepEqual([binding.mode, binding.state], ['manual', 'active']);
   assert.ok(binding.version > before, 'the CAS version moved with the mode');
+});
+
+// 2026-10-06：用户实测撞上的死结 —— unbind（mode→manual）之后 /localpost-auto-start 要求 mode=auto 而拒绝，
+// /localpost-bind 在已绑定的同一聊天里又是"什么都没改" ⇒ 没有办法回到 auto。auto-arm 就是这条回程，
+// 且它**只改 mode**：不动 generation / session / attestation，因此不涉及"跨聊天搬绑定"。
+test('auto-arm is the way back from manual, and it never moves the binding between chats', async () => {
+  const { bridge, host, store } = await bridgeFor('arm');
+  bridge.registerCommands();
+  const a = chatAgent('chat-A', 'C:/work/A');
+  await find(host.definitions, COMMANDS.bind).handler({ agent: a });
+  await find(host.definitions, COMMANDS.unbind).handler({ agent: a });
+  const before = await store.read('dsh');
+  assert.equal(before.binding.mode, 'manual');
+
+  // 只有绑定聊天能重新武装；被拒时一个字都不许改
+  const wrong = await find(host.definitions, COMMANDS.arm).handler({ agent: chatAgent('chat-B', 'C:/work/B') });
+  assert.equal(wrong.kind, 'error');
+  assert.match(wrong.text, /only the currently bound chat/);
+  assert.equal((await store.read('dsh')).binding.mode, 'manual', 'a refused re-arm must change nothing');
+
+  // 绑定聊天重新武装 ⇒ mode 回 auto；身份、代次、会话全部不动
+  const ok = await find(host.definitions, COMMANDS.arm).handler({ agent: a });
+  assert.equal(ok.kind, 'success');
+  const after = await store.read('dsh');
+  assert.equal(after.binding.mode, 'auto');
+  assert.equal(after.binding.generation, before.binding.generation, 're-arm must not rotate the generation');
+  assert.deepEqual(after.binding.session, before.binding.session, 're-arm must not move the chat');
+  assert.notEqual(arrivalRoute(after).reason, 'binding_manual', 'new mail is routable again');
+
+  // 幂等：已经是 auto 时再 arm = already on，且不推进 CAS 版本
+  const again = await find(host.definitions, COMMANDS.arm).handler({ agent: a });
+  assert.equal(again.kind, 'success');
+  assert.match(again.text, /already on/);
+  assert.equal((await store.read('dsh')).binding.version, after.binding.version, 'an idempotent re-arm must not bump the CAS version');
+});
+
+test('unbind tells the human the command that turns automatic routing back on', async () => {
+  const { bridge, host } = await bridgeFor('unbind-hint');
+  bridge.registerCommands();
+  const a = chatAgent('chat-A', 'C:/work/A');
+  await find(host.definitions, COMMANDS.bind).handler({ agent: a });
+  const out = await find(host.definitions, COMMANDS.unbind).handler({ agent: a });
+  assert.equal(out.kind, 'success');
+  assert.ok(out.text.includes('/' + COMMANDS.arm), 'the success text must name the way back: ' + out.text);
+});
+
+test('auto-arm refuses an unbound identity and points at bind instead', async () => {
+  const { bridge, host } = await bridgeFor('arm-unbound');
+  bridge.registerCommands();
+  const out = await find(host.definitions, COMMANDS.arm).handler({ agent: chatAgent('chat-A', 'C:/work/A') });
+  assert.equal(out.kind, 'error');
+  assert.ok(out.text.includes('/' + COMMANDS.bind), out.text);
 });
 
 test('unbind is a CAS on the binding the caller proved: a rotation in between fails it and leaves the new binding alone', async () => {

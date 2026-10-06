@@ -22,7 +22,7 @@ import { switchMode } from './letter-claims.mjs';
  * an automatic binding written. Without the gate the bridge would look trustworthy while proving nothing.
  */
 export const SUPPORTED_VERSION = '0.2.0-rc.2';
-export const COMMANDS = Object.freeze({ bind: 'localpost-bind', status: 'localpost-status', unbind: 'localpost-unbind' });
+export const COMMANDS = Object.freeze({ bind: 'localpost-bind', status: 'localpost-status', unbind: 'localpost-unbind', arm: 'localpost-auto-arm' });
 const ACTION_TTL_MS = 120000;
 
 // The only authority a chat bind may carry: the trusted analysis-reply policy, provenance recorded.
@@ -228,7 +228,36 @@ export function createDshHostBridge({ ctx, runtimeVersion, store, identity, host
         if (!boundTo(after, caller) || after.binding.generation !== state.binding.generation || after.binding.mode !== 'manual') {
           return { kind: 'error', text: 'LocalPost: could not confirm the unbind of this chat\'s binding; automatic routing may still be on.' };
         }
-        return { kind: 'success', text: 'LocalPost: automatic routing is off for NEW mail. Mail already accepted keeps its original owner and must be reconciled there; it is not moved to another chat.' };
+        return { kind: 'success', text: 'LocalPost: automatic routing is off for NEW mail. Mail already accepted keeps its original owner and must be reconciled there; it is not moved to another chat.'
+          + ' To turn automatic routing back on in this chat, run /' + commandNames.arm + '.' };
+      });
+
+      // 2026-10-06：unbind 只把 mode 切成 manual，而 /localpost-auto-start 要求 mode=auto、bind 在已绑定的同一聊天里
+      // 又是"什么都没改" ⇒ unbind 之后**没有任何命令能回到 auto**（用户实测撞上，卡死在 manual）。
+      // 这里补一条对称的"重新武装"：走同一个 switchMode 协议（freeze → drain → CAS），只改 mode，
+      // 不动 generation / session / attestation —— 因此**不涉及跨聊天搬绑定**（那仍需轮换协议）。
+      define(commandNames.arm, 'Turn automatic routing of NEW mail back on for ' + identity + ' in this chat (no arguments).', async invocation => {
+        const shadowed = guard(commandNames.arm, invocation);
+        if (shadowed) return shadowed;
+        const caller = attestedCommandCaller(invocation, agents, hostId);
+        const state = await store.read(identity);
+        if (!caller) return { kind: 'error', text: 'LocalPost: the host did not prove which chat is calling.' };
+        if (!state) return { kind: 'error', text: 'LocalPost: this identity has no binding to re-arm; run /' + commandNames.bind + ' in the chat that should own it.' };
+        if (!boundTo(state, caller)) {
+          return { kind: 'error', text: 'LocalPost: only the currently bound chat may re-arm automatic routing. Run this in that chat.' };
+        }
+        if (state.binding.mode === 'auto') {
+          return { kind: 'success', text: 'LocalPost: automatic routing is already on for NEW mail; nothing changed (mode=auto, generation=' + state.binding.generation + ').' };
+        }
+        const switched = await switchMode(store, identity, 'auto', { expectedBinding: bindingIdentity(state.binding) });
+        if (switched?.skipped) return { kind: 'error', text: 'LocalPost: mail is being delivered right now, so nothing changed. Run the re-arm again in a moment.' };
+        if (switched?.reason === 'binding_conflict') return { kind: 'error', text: 'LocalPost: the binding changed since this chat was checked (for example a rotation), so nothing was changed.' };
+        if (!switched?.ok) return { kind: 'error', text: 'LocalPost: the re-arm was refused (' + String(switched?.reason ?? 'unknown') + '); nothing changed.' };
+        const after = await store.read(identity);
+        if (!boundTo(after, caller) || after.binding.generation !== state.binding.generation || after.binding.mode !== 'auto') {
+          return { kind: 'error', text: 'LocalPost: could not confirm the re-arm of this chat\'s binding; automatic routing may still be off.' };
+        }
+        return { kind: 'success', text: 'LocalPost: automatic routing is on again for NEW mail (mode=auto, generation=' + after.binding.generation + '). The production receiver self-starts within ~15s.' };
       });
     } catch (error) {
       release();

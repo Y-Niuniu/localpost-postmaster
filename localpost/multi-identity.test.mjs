@@ -19,6 +19,7 @@ import { removeTreeSync } from './temp-tree.mjs';
 const EVIDENCE = 'precheck:app.asar package.json 0.2.0-rc.2';
 const ENGINEER = Object.freeze({
   bind: 'localpost-engineer-bind', status: 'localpost-engineer-status', unbind: 'localpost-engineer-unbind',
+  arm: 'localpost-engineer-auto-arm',
   start: 'localpost-engineer-auto-start', stop: 'localpost-engineer-auto-stop', receiver: 'localpost-engineer-auto-status',
 });
 
@@ -125,7 +126,7 @@ test('身份命令名：宿主自己的身份保留原名，其他身份的名�
   assert.deepEqual(identityCommands('production', 'dsh'), { base: COMMANDS, actions: AUTO_COMMANDS });
   const engineer = identityCommands('production', 'engineer');
   assert.deepEqual([engineer.base, engineer.actions], [
-    { bind: ENGINEER.bind, status: ENGINEER.status, unbind: ENGINEER.unbind },
+    { bind: ENGINEER.bind, status: ENGINEER.status, unbind: ENGINEER.unbind, arm: ENGINEER.arm },
     { start: ENGINEER.start, stop: ENGINEER.stop, status: ENGINEER.receiver },
   ]);
   assert.deepEqual(identityCommands('isolated', 'engineer').actions,

@@ -93,7 +93,7 @@ export function identityCommands(kind, identity, primary = 'dsh') {
   if (identity === primary) return Object.freeze({ base: COMMANDS, actions });
   const named = name => name.replace(/^localpost-/, 'localpost-' + identity + '-');
   return Object.freeze({
-    base: Object.freeze({ bind: named(COMMANDS.bind), status: named(COMMANDS.status), unbind: named(COMMANDS.unbind) }),
+    base: Object.freeze({ bind: named(COMMANDS.bind), status: named(COMMANDS.status), unbind: named(COMMANDS.unbind), arm: named(COMMANDS.arm) }),
     actions: Object.freeze({ start: named(actions.start), stop: named(actions.stop), status: named(actions.status) }),
   });
 }
