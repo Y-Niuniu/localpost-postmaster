@@ -136,6 +136,7 @@ export async function scanMailbox(root) {
   const base = path.join(root, 'agents')
   const envelopes = []
   const malformed = []
+  const vanished = []
   const agents = []
   let agentDirs = []
   try {
@@ -152,7 +153,12 @@ export async function scanMailbox(root) {
         const full = path.join(dir, f)
         const rel = relOf(root, full)
         const parsed = await readJsonFile(full)
-        if (!parsed.ok) { malformed.push({ path: rel, reason: parsed.error }); continue }
+        if (!parsed.ok) {
+          // 另一进程恰好在这两步之间归档/GC 了这封信：**不是坏信**。
+          // 旧版会把它计成 malformed 并告警（对账锁与邮箱写锁不同，正常并发即可产生假告警）。
+          if (parsed.missing) { vanished.push({ path: rel, agent: agent, folder: folder }); continue }
+          malformed.push({ path: rel, reason: parsed.error }); continue
+        }
         const v = validateEnvelope(parsed.value)
         if (!v.ok) { malformed.push({ path: rel, reason: v.errors.join('; ') }); continue }
         envelopes.push({ path: rel, full: full, agent: agent, folder: folder, env: parsed.value })
@@ -160,9 +166,27 @@ export async function scanMailbox(root) {
     }
   }
   let attachmentsOnDisk = []
-  try { attachmentsOnDisk = await fsp.readdir(path.join(root, 'attachments')) }
+  try { attachmentsOnDisk = await listFilesRecursive(path.join(root, 'attachments')) }
   catch (error) { if (error.code !== 'ENOENT') throw error; attachmentsOnDisk = [] }
-  return { envelopes: envelopes, malformed: malformed, agents: agents, attachmentsOnDisk: attachmentsOnDisk }
+  return {
+    envelopes: envelopes, malformed: malformed, vanished: vanished, agents: agents,
+    attachmentsOnDisk: attachmentsOnDisk,
+    attachmentSet: new Set(attachmentsOnDisk),   // 便于 O(1) 判断"附件是否在盘上"
+  }
+}
+
+/** 递归列出目录下的**文件**相对路径（用 / 分隔）；只列顶层会误报"子目录附件缺失"。 */
+async function listFilesRecursive(dir, prefix = '') {
+  const out = []
+  let entries = []
+  try { entries = await fsp.readdir(dir, { withFileTypes: true }) }
+  catch (error) { if (error.code === 'ENOENT') return out; throw error }
+  for (const d of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+    const rel = prefix ? prefix + '/' + d.name : d.name
+    if (d.isDirectory()) out.push(...await listFilesRecursive(path.join(dir, d.name), rel))
+    else if (d.isFile()) out.push(rel)
+  }
+  return out
 }
 
 /* ------------------------- 账本 ------------------------- */
@@ -297,16 +321,21 @@ export function reconcile(input) {
     entries[e.id] = entry
 
     if (typeof e.body === 'string' && e.body.length > config.bodySoftLimit) stats.warnings++
+  }
 
+  // 附件缺失检查独立成一遍（旧版写在 task 分支里 ⇒ result/ping 的附件丢失漏报；且只列顶层目录 ⇒ 子目录附件误报）。
+  for (const item of envelopes) {
+    const e = item.env
     const refs = Array.isArray(e.attachments) ? e.attachments : []
     for (const a of refs) {
-      if (scan.attachmentsOnDisk.indexOf(a) < 0) {
-        alerts.push({
-          id: e.id, kind: 'missing_attachment', severity: 'warn', path: item.path,
-          attachment: a, age_minutes: Math.round(ageMinutes), from: e.from, to: e.to,
-          subject: e.subject, first_seen: isoOf(now),
-        })
-      }
+      const key = String(a).replace(/\\/g, '/')
+      if (scan.attachmentSet.has(key)) continue
+      const ageMinutes = Math.max(0, (nowMs - (Date.parse(e.created_at) || 0)) / 60000)
+      alerts.push({
+        id: e.id, kind: 'missing_attachment', severity: 'warn', path: item.path,
+        attachment: a, age_minutes: Math.round(ageMinutes), from: e.from, to: e.to,
+        subject: e.subject, first_seen: isoOf(now),
+      })
     }
   }
 

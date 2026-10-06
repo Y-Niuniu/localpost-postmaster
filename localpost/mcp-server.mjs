@@ -10,7 +10,7 @@ const TYPES = ['task', 'result', 'ping'];
 const BUDGETS = ['urgent', 'standard', 'high', 'free'];
 const OUTCOMES = ['completed', 'needs_authorization', 'failed'];
 const attachments = { type: 'array', items: { type: 'string' } };
-const metadata = { commit: { type: 'string' }, base_rev: { type: 'string' }, test: { type: 'string' }, attachments };
+const metadata = { commit: { type: 'string' }, base_rev: { type: 'string' }, test: { type: 'string' }, ecosystem: { type: 'string' }, attachments };
 const schema = (properties, required = []) => ({ type: 'object', properties, required, additionalProperties: false });
 export const TOOLS = [
   { name: 'mailbox_rules', description: 'Read mailbox rules without authorizing task execution.', inputSchema: schema({}) },

@@ -194,7 +194,7 @@ export function createMailbox({ root, identity } = {}) {
     if (!Number.isFinite(Date.parse(envelope.created_at))) throw new Error('invalid created_at');
     if (envelope.reply_to !== undefined) assertId(envelope.reply_to);
     if (envelope.outcome !== undefined && !['completed', 'needs_authorization', 'failed'].includes(envelope.outcome)) throw new Error('invalid outcome');
-    for (const key of ['commit', 'base_rev', 'test']) if (envelope[key] !== undefined && typeof envelope[key] !== 'string') throw new Error('invalid metadata: ' + key);
+    for (const key of ['commit', 'base_rev', 'test', 'ecosystem']) if (envelope[key] !== undefined && typeof envelope[key] !== 'string') throw new Error('invalid metadata: ' + key);
     if (envelope.attachments !== undefined && !Array.isArray(envelope.attachments)) throw new Error('attachments must be an array');
     const warnings = envelope.body.length > 200 ? ['body exceeds 200 character soft limit; use attachments'] : [];
     for (const attachment of envelope.attachments || []) {
@@ -265,14 +265,27 @@ export function createMailbox({ root, identity } = {}) {
   function prepareReply(agent, source, options, outcome) {
     if (source.to !== agent || source.type === 'result') throw new Error('invalid original letter or reply loop');
     const terminal = outcome !== 'needs_authorization';
-    const id = options.reply_id ?? (terminal ? `${source.id}.result` : `${source.id}.result.${randomUUID()}`);
+    // 回执 id 必须 ≤128（assertId 上限）。原信 id 可以长到 128 ⇒ 直接加 ".result" 会超长并抛错，
+    // 于是"长 id 的任务永远无法回执"。超长时改用 **确定性** 短 id：<前缀>-<原 id 的 sha256 前 8 位> + 后缀。
+    // 确定性很关键：重试必须得到同一个 id，否则幂等重放会变成"同信两回执"。
+    const id = options.reply_id ?? replyIdFor(source.id, terminal);
     assertId(id);
     if (!terminal && id === `${source.id}.result`) throw new Error('nonterminal reply requires an independent reply ID');
     const draft = { id, thread_id: source.thread_id, from: agent, to: source.from, type: 'result',
       subject: options.subject ?? `回执: ${source.subject}`, body: options.body, budget: source.budget, reply_to: source.id, outcome };
-    for (const key of ['commit', 'base_rev', 'test', 'attachments']) if (options[key] !== undefined) draft[key] = options[key];
+    // ecosystem 与 commit/base_rev/test 同级保留：规矩要求任务与回执都带生态检索结论，
+    // 旧版白名单漏了它 ⇒ 回执里的 ecosystem 会被静默丢弃。
+    for (const key of ['commit', 'base_rev', 'test', 'ecosystem', 'attachments']) if (options[key] !== undefined) draft[key] = options[key];
     checkEnvelope({ ...draft, created_at: new Date().toISOString() });
     return draft;
+  }
+  /** 生成 ≤128 的回执 id；长原信 id 用确定性短哈希收敛（重试得到同一 id）。 */
+  function replyIdFor(sourceId, terminal) {
+    const suffix = terminal ? '.result' : `.result.${randomUUID()}`;
+    const max = 128;
+    if (sourceId.length + suffix.length <= max) return `${sourceId}${suffix}`;
+    const budget = Math.max(1, max - suffix.length - 9);   // 9 = '-' + 8 位十六进制
+    return `${sourceId.slice(0, budget)}-${createHash('sha256').update(sourceId).digest('hex').slice(0, 8)}${suffix}`;
   }
   function publishReply(agent, draft) {
     return locked(async () => {
