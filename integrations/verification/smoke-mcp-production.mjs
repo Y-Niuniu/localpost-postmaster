@@ -6,6 +6,11 @@
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 
+// 生产只读冒烟：**必须显式开启**才跑（避免克隆仓库的人无意触碰生产信箱）
+if (process.env.LOCALPOST_SMOKE_PRODUCTION !== '1') {
+  console.log('跳过：生产只读冒烟需显式开启 —— $env:LOCALPOST_SMOKE_PRODUCTION=1 ; node integrations/verification/smoke-mcp-production.mjs');
+  process.exit(0);
+}
 const ROOT = 'C:/AI_ASSIST/.mailbox';
 const SERVER = 'C:/AI_ASSIST/tools/dsh-mailbox-mcp/server.mjs';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

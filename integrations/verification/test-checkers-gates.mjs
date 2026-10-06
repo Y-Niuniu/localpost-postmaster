@@ -14,14 +14,15 @@
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { SRC as SRCROOT, makeRoot, fakeAgentapi, isolatedEnv, stage, stageKernel, TEST_CONVERSATION_ID } from './lib/harness.mjs';
 
 const CHECKS = [
-  { name: 'claude', src: 'C:/Users/16548/.claude/localpost-wake/claude-check.mjs', identity: 'claude' },
-  { name: 'codex', src: 'C:/Users/16548/.codex/localpost-wake/codex-check.mjs', identity: 'codex' },
+  { name: 'claude', src: path.join(SRCROOT.claude, 'claude-check.mjs'), identity: 'claude' },
+  { name: 'codex', src: path.join(SRCROOT.codex, 'codex-check.mjs'), identity: 'codex' },
 ];
-const T = path.resolve('C:/AI_ASSIST/work/tmp_checkers');
+const T = makeRoot('checkers');
 const AGENTS = path.join(T, 'agents');
-const ROOTCFG = 'C:/AI_ASSIST/work/tmp_checkers';
+const ROOTCFG = T;
 
 const results = [];
 const record = (name, ok, detail = '') => { results.push([name, ok]); console.log(`${ok ? '✅' : '❌'} ${name}${detail ? '  → ' + detail : ''}`); };

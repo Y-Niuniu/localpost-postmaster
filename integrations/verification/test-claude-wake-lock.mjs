@@ -9,9 +9,10 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { SRC as SRCROOT, makeRoot, fakeAgentapi, isolatedEnv, stage, stageKernel, TEST_CONVERSATION_ID } from './lib/harness.mjs';
 
-const SRC = 'C:/Users/16548/.claude/localpost-wake/claude-wake.mjs';
-const T = path.resolve('C:/AI_ASSIST/work/tmp_lock_test');
+const WAKE_SRC = path.join(SRCROOT.claude, 'claude-wake.mjs');
+const T = makeRoot('lock');
 const LOCK = path.join(T, 'watch.lock');
 const LOG = path.join(T, 'wake.log');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -20,9 +21,9 @@ const record = (n, ok, d = '') => { results.push([n, ok]); console.log(`${ok ? '
 
 fs.rmSync(T, { recursive: true, force: true });
 fs.mkdirSync(path.join(T, 'agents', 'claude', 'inbox'), { recursive: true });
-fs.copyFileSync(SRC, path.join(T, 'claude-wake.mjs'));
+fs.copyFileSync(WAKE_SRC, path.join(T, 'claude-wake.mjs'));
 fs.writeFileSync(path.join(T, 'config.json'), JSON.stringify({
-  identity: 'claude', mailboxRoot: 'C:/AI_ASSIST/work/tmp_lock_test',
+  identity: 'claude', mailboxRoot: T,
   allowFrom: ['dsh'], pollSeconds: 15, watchSeconds: 60,
 }, null, 2));
 

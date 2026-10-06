@@ -47,18 +47,29 @@ Copy-Item integrations\bridges\codex\hooks.json "$env:USERPROFILE\.codex\hooks.j
 ```
 **回退**：各生产位置均有 `.bak-*`（wrapper 见 `SNAPSHOTS.md`；桥见各目录 `.bak-20261005-*` / `.bak-20261006-*`）。
 
-## 四、验证证据（可重跑）
+## 四、验证证据（**已入仓、可从仓库重跑**）
+
+套件位于 `integrations/verification/`（含夹具助手 `lib/harness.mjs`），**被测源码取自本仓库**
+（`integrations/bridges/*`、`integrations/dsh-mailbox-mcp/server.mjs`、`localpost/`），克隆仓库即可复现：
 
 | 套件 | 覆盖 | 结果 |
 |---|---|---|
-| `work/scripts/test-gpt-review-fixes.mjs` | GPT 两轮 8 反例 + 结构化解包三条 + 身份 fail-closed | 21/21 |
-| `work/scripts/test-checkers-gates.mjs` | 两个 checker × 四道闸门 + 终态优先 + 冷却恢复 | 14/14 |
-| `work/scripts/test-gemini-wake-state.mjs` | 基线/送达/演练迁移/失败重试/挂起/上限 | 7/7 |
-| `work/scripts/test-claude-wake-lock.mjs` | 活守望不接管、死持有者接管、退出不删他人锁 | 3/3 |
-| `work/scripts/test-mailbox-mcp-reply.mjs` | 回执收敛内核 + 身份 + stdin 收口 + 非法 outcome | 9/9 |
-| `work/scripts/smoke-mcp-production.mjs` | 生产信箱**只读**冒烟 | 5/5 |
+| `verification/test-gpt-review-fixes.mjs` | GPT 两轮 8 反例 + 结构化解包三条 + 身份 fail-closed | 21/21 |
+| `verification/test-checkers-gates.mjs` | 两个 checker × 四道闸门 + 终态优先 + 冷却恢复 | 14/14 |
+| `verification/test-gemini-wake-state.mjs` | 状态机 + **调用次数断言**（成功恰好 1 次 / 上限 3 次 / 其余 0 次） | 9/9 |
+| `verification/test-claude-wake-lock.mjs` | 活守望不接管、死持有者接管、退出不删他人锁 | 3/3 |
+| `verification/test-mailbox-mcp-reply.mjs` | 回执收敛内核 + 身份 + stdin 收口 + 非法 outcome | 9/9 |
+| `verification/test-codex-check.mjs` | codex checker 基础判据 | 4/4 |
+| `verification/smoke-mcp-production.mjs` | 生产信箱**只读**冒烟（**需 `LOCALPOST_SMOKE_PRODUCTION=1` 显式开启**） | 5/5 |
 
-> 注：这些脚本在 `C:/AI_ASSIST/work/scripts/`（工作台），**不在本仓库**；它们是验收证据，不是交付物。
+合计 **60/60**（不含生产 smoke）/ **65/65**（含）；内核本体另见 `node scripts/test.mjs`（383/383 + legacy 45/45）。
+
+**隔离模型（2026-10-06 GPT 复审后加固）**：所有套件用 `lib/harness.mjs` 的 `isolatedEnv()`
+—— **假 `agentapi` 前置 PATH**（调用写入 `agentapi-calls.log`，可断言次数）+ 临时 `ANTIGRAVITY_EXECUTABLE_DATA_DIR`
++ **专用测试会话 id**；被测脚本一律拷进临时根运行。**永不真发消息、不碰生产目录**；
+唯一接触生产路径的是显式开启的生产 smoke。
+
+> 注：`C:/AI_ASSIST/work/scripts/` 里旧的那份是**入仓前的过期副本**，已移走；规范位置 = 本目录。
 
 ## 五、边界
 

@@ -13,10 +13,11 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { SRC as SRCROOT, makeRoot, fakeAgentapi, isolatedEnv, stage, stageKernel, TEST_CONVERSATION_ID } from './lib/harness.mjs';
 
-const PROD = 'C:/AI_ASSIST/.mailbox';
-const SERVER = 'C:/AI_ASSIST/tools/dsh-mailbox-mcp/server.mjs';
-const T = path.resolve('C:/AI_ASSIST/work/tmp_mcp_p11');
+const PROD = SRCROOT.kernel;   // 内核闭包取自仓库 localpost/（不是生产目录）
+const SERVER = SRCROOT.wrapper;   // wrapper 取自仓库 integrations/
+const T = makeRoot('mcp-reply');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const results = [];
 const record = (n, ok, d = '') => { results.push([n, ok]); console.log(`${ok ? '✅' : '❌'} ${n}${d ? '  → ' + d : ''}`); };

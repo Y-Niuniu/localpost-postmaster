@@ -15,19 +15,20 @@
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { SRC as SRCROOT, makeRoot, fakeAgentapi, isolatedEnv, stageKernel, TEST_CONVERSATION_ID } from './lib/harness.mjs';
 
-const T = path.resolve('C:/AI_ASSIST/work/tmp_gpt_fixes');
+const T = makeRoot('gpt-fixes');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const A = path.join(T, 'agents');
 const results = [];
 const rec = (n, ok, d = '') => { results.push([n, ok]); console.log(`${ok ? '✅' : '❌'} ${n}${d ? '  → ' + d : ''}`); };
 
-const CLAUDE_CHECK = 'C:/Users/16548/.claude/localpost-wake/claude-check.mjs';
-const CODEX_CHECK = 'C:/Users/16548/.codex/localpost-wake/codex-check.mjs';
-const GEMINI_WAKE = 'C:/Users/16548/.gemini/config/sidecars/localpost-gemini-wake/wake.mjs';
-const CLAUDE_WAKE = 'C:/Users/16548/.claude/localpost-wake/claude-wake.mjs';
-const MCP_SERVER = 'C:/AI_ASSIST/tools/dsh-mailbox-mcp/server.mjs';
-const PROD_MAILBOX = 'C:/AI_ASSIST/.mailbox';
+const CLAUDE_CHECK = path.join(SRCROOT.claude, 'claude-check.mjs');
+const CODEX_CHECK = path.join(SRCROOT.codex, 'codex-check.mjs');
+const GEMINI_WAKE = path.join(SRCROOT.gemini, 'wake.mjs');
+const CLAUDE_WAKE = path.join(SRCROOT.claude, 'claude-wake.mjs');
+const MCP_SERVER = SRCROOT.wrapper;
+const PROD_MAILBOX = SRCROOT.kernel;   // 内核闭包取自仓库
 
 const wipe = () => { fs.rmSync(T, { recursive: true, force: true }); fs.mkdirSync(T, { recursive: true }); };
 const mk = (p) => fs.mkdirSync(p, { recursive: true });
@@ -113,11 +114,12 @@ for (const [label, src, identity] of [['claude', CLAUDE_CHECK, 'claude'], ['code
   const setupGemini = (state, letters, extra = {}) => {
     wipe(); mk(path.join(A, 'gemini', 'inbox'));
     fs.writeFileSync(path.join(T, 'config.json'), JSON.stringify({
-      identity: 'gemini', conversationId: '1f58f9ab-50c8-4963-b181-876abc0da445',
+      identity: 'gemini', conversationId: TEST_CONVERSATION_ID,
       mailboxRoot: T, allowFrom: ['dsh'], dryRun: false, maxAttemptsPerLetter: 3, ...extra,
     }, null, 2));
     stagedGemini = stage(GEMINI_WAKE);
-    fs.writeFileSync(path.join(T, 'wake-state.json'), JSON.stringify(state, null, 2));
+    fs.mkdirSync(path.join(T, 'data'), { recursive: true });
+    fs.writeFileSync(path.join(T, 'data', 'wake-state.json'), JSON.stringify(state, null, 2));
     for (const l of letters) put('gemini', 'inbox', l);
   };
   let stagedGemini = null;
@@ -126,10 +128,13 @@ for (const [label, src, identity] of [['claude', CLAUDE_CHECK, 'claude'], ['code
     fs.copyFileSync(GEMINI_WAKE, dest);
     // 状态/日志落在 DATA=ANTIGRAVITY_EXECUTABLE_DATA_DIR（缺省=脚本目录）⇒ 测试里显式指向临时根，
     // 避免碰宿主真实 sidecar 数据目录（这也是 GPT 复审建议的做法）。
-    return spawnSync(process.execPath, [dest], { encoding: 'utf8', env: { ...process.env, ANTIGRAVITY_EXECUTABLE_DATA_DIR: T } });
+    fs.mkdirSync(path.join(T, 'data'), { recursive: true });
+    return spawnSync(process.execPath, [dest], { encoding: 'utf8', env: isolatedEnv(T, fakeAgentapi(T, { exitCode: 1 })) });
   };
-  const geminiLog = () => (fs.existsSync(path.join(T, 'wake.log')) ? fs.readFileSync(path.join(T, 'wake.log'), 'utf8') : '');
-  const geminiState = () => JSON.parse(fs.readFileSync(path.join(T, 'wake-state.json'), 'utf8'));
+  // 状态/日志都落在隔离 DATA 目录（= <T>/data）里
+  const GDATA = path.join(T, 'data');
+  const geminiLog = () => (fs.existsSync(path.join(GDATA, 'wake.log')) ? fs.readFileSync(path.join(GDATA, 'wake.log'), 'utf8') : '');
+  const geminiState = () => JSON.parse(fs.readFileSync(path.join(GDATA, 'wake-state.json'), 'utf8'));
 
   // 反例 1：indeterminate ⇒ 挂起，不进发送队列（agentapi 不存在时若误入队列会被计为 failed）
   setupGemini({ baselineAt: 'x', seen: { 'i-1': { firstSeenAt: 'x', attempts: 1, lastResult: 'indeterminate', lastOut: 'timeout after 60s' } } }, [letter('i-1', 'dsh', 'gemini')]);

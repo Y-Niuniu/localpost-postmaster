@@ -11,16 +11,17 @@
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { SRC as SRCROOT, makeRoot, fakeAgentapi, isolatedEnv, stage, stageKernel, TEST_CONVERSATION_ID } from './lib/harness.mjs';
 
-const SRC = 'C:/Users/16548/.codex/localpost-wake/codex-check.mjs';
-const T = path.resolve('C:/AI_ASSIST/work/tmp_codex_wake');
+const CHECK_SRC = path.join(SRCROOT.codex, 'codex-check.mjs');
+const T = makeRoot('codex-check');
 const INBOX = path.join(T, 'agents', 'codex', 'inbox');
 
 fs.rmSync(T, { recursive: true, force: true });
 fs.mkdirSync(INBOX, { recursive: true });
-fs.copyFileSync(SRC, path.join(T, 'codex-check.mjs'));
+fs.copyFileSync(CHECK_SRC, path.join(T, 'codex-check.mjs'));
 fs.writeFileSync(path.join(T, 'config.json'), JSON.stringify({
-  identity: 'codex', mailboxRoot: 'C:/AI_ASSIST/work/tmp_codex_wake',
+  identity: 'codex', mailboxRoot: T,
   allowFrom: ['dsh', 'claude'],
 }, null, 2) + '\n');
 
