@@ -89,7 +89,7 @@ node localpost/mail-backup.mjs prune   --target <目的地> --retention-days 7
 node localpost/mail-backup.mjs status  --target <目的地>
 ```
 
-2026-10-02 首次演练结果（证据 `work/localpost-six-gates-evidence/step2-backup-drill.txt`）：
+2026-10-02 首次演练结果（证据 `docs/evidence/step2-backup-drill.txt`）：
 
 | 项目 | 结果 |
 |---|---|

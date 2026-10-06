@@ -1,0 +1,261 @@
+✔ without a stable turn id or a trusted usage figure the 60% trigger stays off (62.02ms)
+✔ the first independent turn over 60% compacts once; repeated samples of one turn count once (77.7458ms)
+✔ after a successful compaction the next turn still over rotates, and so does a later return over the line (70.1892ms)
+✔ a failed compaction rotates directly, and without compaction support the first turn over rotates (44.9676ms)
+✔ samples from another session, malformed figures and stray compaction reports are ignored (39.5294ms)
+✔ a new generation starts with a fresh context record (0.2225ms)
+✔ a live agent is not evidence of trusted focus or durable acceptance (1.3909ms)
+✔ fake host contracts keep arrival binding A and submit plugin relay after a whole turn (0.7062ms)
+✔ the host acceptance contract deduplicates a repeated mail key (0.177ms)
+✔ a cold target stays unavailable and is never resumed or replaced (0.1776ms)
+✔ an unverified arrival binding rejects before host acceptance (0.1706ms)
+✔ changed policy cannot turn agent mail into user input or next-step steering (0.1861ms)
+✔ native undefined followup does not prove durable acceptance (0.8024ms)
+✔ an unsupported DSH version cannot enable automatic dispatch (0.1525ms)
+✔ a host acceptance provider cannot dispatch the same callback twice (0.19ms)
+✔ mail references must stay in the configured recipient mailbox (0.4685ms)
+✔ exclusive lease has exactly one concurrent owner (37.9343ms)
+✔ release cannot remove a replaced owner, and live old locks are not stolen (6.5922ms)
+✔ paths reject traversal and linked escapes; writes use no shared temporary (13.6087ms)
+✔ stale dead ISO owner is recovered once, unknown owner is retained (18.5536ms)
+✔ a transient replacing-rename refusal is retried within a bound and leaves no temporary (55.4894ms)
+✔ a persistent rename refusal fails after the bound; other rename errors are not retried (1346.2009ms)
+✔ GC 只删除超保留期且有匹配终态的归档，未完成信和附件保留 (120.8215ms)
+✔ dry-run 完全不写文件，也不创建不存在的根目录 (8.1437ms)
+✔ 等待授权与未知信封保留；无法知道附件引用时不删除孤儿附件 (32.2589ms)
+✔ 保留期从终态完成时间算，旧任务最近才完成不可立即删除 (27.0293ms)
+✔ 附件引用按实际安全路径比较，./ 与 Windows 大小写不能使在用附件被删除 (18.744ms)
+✔ PowerShell wrapper 的 WhatIf 只预览且不写 GC 日志 (2616.027ms)
+✔ dry-run 列出归档删除后才成为孤儿的附件，与实际清理计划一致 (17.4436ms)
+✔ 多份有效终态回执按最新完成时间保留整组归档 (39.9349ms)
+✔ 49/50/51: the 50th acceptance makes rotation due and the 51st letter stays queued (94.6228ms)
+✔ an in-flight 50th reservation blocks the 51st; an explicit host rejection releases it (105.1684ms)
+✔ concurrent reservations at 49 admit exactly one, and a burst never overbooks (293.3812ms)
+✔ id + digest deduplicates: repeats never count twice and a changed digest is a conflict (88.0249ms)
+✔ uncertain acceptance is isolated, never redispatched, and closed only by its owner or an operator (127.1379ms)
+✔ a late host outcome for an isolated attempt is kept as evidence only (40.197ms)
+✔ manual and auto share one ledger: one consumer at a time, and a mode switch freezes, drains and swaps by CAS (147.2535ms)
+✔ a pending mode switch is finished by the next actor after a crash (24.9894ms)
+✔ prototype-named letter ids are ordinary ledger keys (73.4268ms)
+✔ backup writes a verified snapshot whose manifest matches the source (105.7842ms)
+✔ backup excludes lock and tmp files and records them as skipped (42.7797ms)
+✔ backup refuses to overwrite an existing snapshot name (37.1707ms)
+✔ backup rejects an empty source instead of publishing an empty snapshot (2.065ms)
+✔ verify detects a tampered snapshot and staging is reported separately (40.7333ms)
+✔ restore reproduces the exact tree and refuses an existing destination (60.2899ms)
+✔ retention is a time window: several snapshots from the same day all survive (11.7303ms)
+✔ retention removes only what is older than the window, and never the newest (9.2431ms)
+✔ ordering follows created_at, never the directory name (9.1392ms)
+✔ retention keeps the newest snapshot even when every snapshot is older than the window (8.5857ms)
+✔ retention boundary: a snapshot created exactly at the cutoff is kept (9.4147ms)
+✔ an invalid created_at is never deleted and is reported for manual handling (6.5216ms)
+✔ a created_at in the future is kept and reported (5.9025ms)
+✔ a snapshot with an unreadable manifest is reported and never deleted (6.6688ms)
+✔ prune refuses when no snapshot exposes a usable created_at (6.3626ms)
+✔ prune refuses to run while the newest snapshot fails verification (8.6412ms)
+✔ prune rejects a nonsensical retention window and reports an empty target (1.2667ms)
+✔ backup honours the retention window end to end (121.0276ms)
+✔ delivery retries are idempotent and conflicting content is rejected (110.6742ms)
+✔ configured identity and path boundaries constrain every mailbox operation (12.1568ms)
+✔ archived IDs cannot recreate pending tasks and concurrent delivery has one winner (168.9563ms)
+✔ only a trusted publication option can bind a route, and retries retain the original target (23.2989ms)
+✔ authorization replies stay pending; terminal reply retries repair archive without new results (116.6505ms)
+✔ reply outcome comes only from the explicit field; body wording never makes it nonterminal (36.3963ms)
+✔ generated IDs are UUIDs and send retries preserve generated timestamps (26.269ms)
+✔ the real MCP stdio process exposes seven tools and preserves reply outcome and base_rev (1994.2967ms)
+✔ a sender outbox copy is not proof of delivery to the recipient (11.0345ms)
+✔ identity-bound archive moves only its own letters, retries idempotently, and rejects other identities and escaping names (34.7348ms)
+✔ an archive failure after a published terminal reply is a visible pending fault that a retry repairs (36.6066ms)
+✔ the MCP server will not start unbound unless administrator mode is explicit (147.1408ms)
+✔ the identity-bound MCP process enforces own-archive, idempotence, identity and path boundaries (255.4278ms)
+✔ MCP reports a published but unarchived reply as a structured partial failure that archive finishes (50.1904ms)
+✔ MCP identity and administrator combinations fail closed (144.5234ms)
+✔ an MCP tool allowlist is enforced on call, not only hidden from the list (1.5544ms)
+✔ 空 / 非法 MAILBOX_TOOLS 拒绝启动（真实 stdio 子进程），未设置才保留人工默认 (735.0409ms)
+✔ a process killed between publishing a reply and archiving recovers by rule: one result, original archived, dead lease reclaimed (236.126ms)
+✔ the server receives only allowlisted names: probes that pass the dsh filter, PATH and case variants are dropped (2129.932ms)
+✔ through the launcher the real server finishes the handshake and all seven tools, and reports the names it actually received (585.3352ms)
+✔ exit code 2 passes through: fail-closed settings still refuse to start, and the launcher takes no arguments (645.1916ms)
+✔ any other server exit code passes through the launcher unchanged (282.5508ms)
+✔ MAILBOX_ADMIN and a non-empty MAILBOX_TOOLS keep their values and permission semantics behind the launcher (799.8501ms)
+✔ NODE_OPTIONS and OPENSSL_CONF must be cleared by the host: the launcher refuses them, but a preload has already run (353.7277ms)
+✔ path 1 alone: killing the launcher the way the SDK closes it (TerminateProcess on Windows) also ends the server (186.3374ms)
+✔ path 2 alone: a launcher that dies from a JavaScript error ends the server first, even without the job object (1623.6181ms)
+✔ path 3 alone: without the job object the real server still exits on the EOF the host delivers when the launcher dies (290.4342ms)
+✔ if the host itself dies (as when dsh crashes), the launcher and the server both end (316.8302ms)
+✔ 迁移快照名独立且不可覆盖：同标签同毫秒第二次直接拒绝 (213.7424ms)
+✔ 同名并发创建只有一个成功：其余明确拒绝，且不触碰胜者的快照 (33.2522ms)
+✔ 快照字节保真：受管文件逐字节一致、哈希入清单、缺失项如实记录 (25.4923ms)
+✔ verify 能发现快照被改动或缺失 (32.3911ms)
+✔ restore 默认只预览不写盘，apply 才写回，被篡改的快照拒绝恢复 (51.2568ms)
+✔ 非 UTF-8 字节原样快照与恢复：清单记录的是磁盘真实字节 (58.9507ms)
+▶ manifest 严格校验：空对象、缺字段、未知结构一律 verify 失败，restore --apply 拒绝写回
+  ✔ 空对象 (4.3789ms)
+  ✔ 不是对象（数组） (4.1639ms)
+  ✔ 不是对象（null） (5.0622ms)
+  ✔ 缺 schema (3.7591ms)
+  ✔ schema 不符 (3.1971ms)
+  ✔ 顶层多出未知字段 (4.1177ms)
+  ✔ 缺 root (3.8061ms)
+  ✔ label 非法 (3.9283ms)
+  ✔ created_at 不是规范时间 (4.1855ms)
+  ✔ 缺 managed (3.1416ms)
+  ✔ managed 不是数组 (3.1515ms)
+  ✔ managed 为空 (3.9316ms)
+  ✔ managed 少一项 (4.1384ms)
+  ✔ managed 重复一项 (2.8651ms)
+  ✔ 受管项未知文件名 (3.4689ms)
+  ✔ 受管项缺 present (3.0943ms)
+  ✔ present 不是布尔 (6.5089ms)
+  ✔ 受管项缺 sha256 (4.0321ms)
+  ✔ 受管项缺 bytes (2.8583ms)
+  ✔ sha256 格式非法 (3.276ms)
+  ✔ bytes 不是非负整数 (3.5132ms)
+  ✔ 受管项多出未知字段 (3.7092ms)
+  ✔ 缺席项夹带字段 (3.9158ms)
+  ✔ bytes 被改（结构合法） (5.056ms)
+  ✔ 全部伪造为缺席（结构合法） (4.7472ms)
+  ✔ 缺 envelopes (2.9008ms)
+  ✔ 信封条目缺 sha256 (3.482ms)
+  ✔ 信封路径越界 (3.7549ms)
+  ✔ 信封条目重复 (3.4869ms)
+✔ manifest 严格校验：空对象、缺字段、未知结构一律 verify 失败，restore --apply 拒绝写回 (148.6549ms)
+✔ 恢复持有信箱写锁：已有新鲜锁时跳过而不是硬写 (27.4674ms)
+✔ 恢复与内核轮次互斥：内核持锁时 restore 整体跳过，不写目标、不留半截锁 (25.4774ms)
+✔ 写回期间内核轮次被挡在门外：restore 持锁时 runOnce 跳过，写回完成后内核照常运行 (50.2007ms)
+✔ 绕过锁的写者在写回后改动目标：targetVerified 与顶层 ok 都为 false (37.1709ms)
+✔ CLI 退出码如实反映结果：被锁跳过 → 1，成功 → 0；路径含空格与中文时照常执行 (1958.4059ms)
+✔ 内核版本号可读 (0.893ms)
+✔ 信封校验：缺字段报错，完整信封通过 (1.2654ms)
+✔ 已回执的任务不产生告警、退出码 0 (170.4573ms)
+✔ 未超时的任务是 sent 状态，不算告警 (14.4727ms)
+✔ 超时的任务产生 warn 告警、退出码 1 (11.9652ms)
+✔ 严重超时升级为 error（超过阈值 x4） (13.1746ms)
+✔ urgent 档用 15 分钟阈值 (14.0916ms)
+✔ 坏信不中断整轮：坏信报错，正常信照常记账 (20.1374ms)
+✔ 附件缺失报 warn；附件存在则安静 (27.2421ms)
+✔ 账本丢失时自动重建，旧账本另存 .bak (35.8689ms)
+✔ 账本损坏时重建并备份 .bak (18.5943ms)
+✔ 状态只前进不回退：账本记 replied，即使信件被清掉也不退回超时 (18.5487ms)
+✔ --rebuild 从信封重建账本：粘滞的假 replied 恢复真实状态，真实完成不受影响 (50.2963ms)
+✔ 账本有记录但信封已消失 → envelope_missing 告警 (17.2132ms)
+✔ dry-run 不写任何文件 (5.5809ms)
+✔ 运行锁：新鲜的锁会让本轮跳过 (3.0134ms)
+✔ 陈旧的锁（超过 5 分钟）不阻塞本轮 (14.2358ms)
+✔ 正文超 200 字只记软警告，不算坏信 (11.2643ms)
+✔ 输出契约：alerts.json 字段齐全，readAlerts 能读回 (11.8342ms)
+✔ 配置文件可覆盖默认阈值 (13.9946ms)
+✔ 回执须来自任务收件方、回到发件方且属于原线程 (0.3154ms)
+✔ 等待授权回复不结束任务，完成结果优先于较新的等待授权回复 (0.2597ms)
+✔ 等待授权只认信封顶层 outcome：正文写「需要授权」但缺 outcome 仍是终态 (0.2864ms)
+✔ 同 ID 相同信封只计一次，不同正文隔离并明确告警 (0.1731ms)
+✔ 并发对账只有一个有效写入者 (15.3662ms)
+✔ 错误告警优先排序，持久日志记录实际退出码 (11.6897ms)
+✔ legacy backlog stays untouched; new mail queues without a client or route (168.3535ms)
+✔ uncertain runtime acceptance is never blindly retried and untrusted sender is blocked (109.4509ms)
+✔ periodic scan discovers mail even if watch hints are missed and result does not cause automatic reply (100.4279ms)
+✔ crash after runtime processed and archived is reconciled only by explicit result (73.6876ms)
+✔ prototype property identifiers survive persisted queue roundtrips (57.1538ms)
+✔ one corrupt publication record cannot block other queued letters (63.3583ms)
+✔ sender permission revoked before dispatch also applies to persisted queued mail (50.8302ms)
+✔ one unavailable runtime target stays queued without blocking another target (54.3571ms)
+✔ publication binds A, closed client queues, restart never resubmits accepted mail (112.8529ms)
+✔ a full rotation persists every state in order and moves unfinished letters one by one by CAS (523.8896ms)
+✔ the handoff only describes state: it carries no ownership and grants no authority (348.522ms)
+✔ a corrupt handoff summary is regenerated mechanically before use and cannot move ownership (165.4658ms)
+▶ each injected step failure keeps mail queued, raises an alert and resumes without guessing a session
+  ✔ host refuses to create (196.5053ms)
+  ✔ create result unknowable (227.1945ms)
+  ✔ candidate echoes another identity (234.3946ms)
+  ✔ candidate echoes another handoff (212.0817ms)
+  ✔ candidate lacks the mailbox tools (226.8951ms)
+  ✔ host verification unreachable (242.7211ms)
+✔ each injected step failure keeps mail queued, raises an alert and resumes without guessing a session (1340.8261ms)
+✔ CAS conflicts stop the rotation without overwriting anyone (194.8444ms)
+✔ the old generation drains: interrupted dispatches are pinned, reservations carry over, and the frozen session gets nothing new (243.1038ms)
+✔ a letter is transferred at most once automatically; the next rotation pins it for an operator (311.4636ms)
+✔ in manual mode the same rotation hands transferred letters over through the ledger only (213.3203ms)
+✔ a mode switch and a rotation exclude each other, and only one rotation driver runs at a time (211.2877ms)
+✔ rotation is not periodic: a quiet week starts nothing (130.4607ms)
+✔ a context rotation starts a fresh context record for the new session (184.5315ms)
+✔ candidate session ids are deterministic, UUID-shaped and distinct per identity, generation and attempt (0.2362ms)
+▶ a crash at every rotation step recovers to exactly one new generation without losing or duplicating mail
+  ✔ state:frozen (349.7657ms)
+  ✔ state:drained (336.5249ms)
+  ✔ handoff:file (306.4852ms)
+  ✔ state:handoff_written (295.8111ms)
+  ✔ candidate:requested (288.5755ms)
+  ✔ host:created (289.5032ms)
+  ✔ state:candidate_created (291.9463ms)
+  ✔ state:verified (318.1298ms)
+  ✔ state:switched (370.5469ms)
+  ✔ host:retired (344.3243ms)
+✔ a crash at every rotation step recovers to exactly one new generation without losing or duplicating mail (3192.8872ms)
+✔ an unknowable candidate creation after a crash stops for an operator; the retry uses a new derived id (297.8138ms)
+▶ a crash mid-dispatch isolates the letter, which is never delivered twice
+  ✔ claim:dispatching (257.3433ms)
+  ✔ host:submitted (269.1236ms)
+✔ a crash mid-dispatch isolates the letter, which is never delivered twice (526.8203ms)
+✔ a binding is explicit, repeatable only verbatim, and never silently replaced (319.9959ms)
+✔ a binding cannot carry implementation authority or an unnamed session (2.3408ms)
+✔ read-modify-write is serialized across independent store instances (338.6726ms)
+✔ a corrupt or foreign state document fails closed and is never overwritten (21.386ms)
+✔ a state lock caught mid-release is retried within a bound; an unknown owner is reported, never stolen (204.6207ms)
+✔ the actor lease admits one host-facing actor; a dead actor is reclaimed only once stale (52.9097ms)
+✔ 瞬时 EPERM 会重试直到成功，并如实报告尝试次数 (11.7959ms)
+✔ 非瞬时错误立刻抛出，不做无意义重试 (0.4986ms)
+✔ 重试耗尽仍失败时抛出最后一次错误，不吞掉真实泄漏 (28.4337ms)
+✔ 同步版本同样重试瞬时错误并最终失败时报错 (32.1738ms)
+✔ 真实目录：同步与异步清理都能删干净嵌套结构 (1170.2489ms)
+✔ isTransient 只认可恢复的错误码 (0.1876ms)
+ℹ tests 206
+ℹ suites 0
+ℹ pass 206
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 8378.6312
+PASS  导出了 name / inject / apply  -> ["tools","timer"]
+PASS  注册了 localpost_check 工具  -> 跑一轮 LocalPost 局长对账：查信箱里超时未回执的任务、坏信、附件缺失。
+PASS  工具 output 形状合法（register 的硬性校验）
+PASS  工具 parameters 是 JSON Schema（object + 两个布尔参数）
+PASS  挂上了启动检查与周期定时器
+PASS  手动查返回人话报告（含超时结论）  -> LocalPost 局长 · 2026-10-03 00:04:28
+PASS  手动查抑制冒泡（本轮不推 ntfy）  -> pushed=0
+PASS  手动查把本轮告警记为「已告知」（冷却状态落盘）  -> overdue|task-1|agents/opencode/inbox/task-1.json|
+PASS  手动查后在报告尾部说明「已回报、不再弹窗」
+PASS  定时器路径：手动查过的告警不重复响  -> pushed=0
+PASS  定时器路径推送了 ntfy  -> {"topic":"selftest","title":"LocalPost 局长 · 1 条告警","message":"1. [warn] 超时 40 分（阈值 15）· dsh → opencode · task-3 · 自测 task-3","priority":3,"tags":["warning","mai
+PASS  汇总文案含告警条数与要点  -> LocalPost 局长 · 1 条告警 | 1. [warn] 超时 40 分（阈值 15）· dsh → opencode · task-3 · 自测 task-3
+PASS  warn 级不弹 toast（仅 error 级）
+PASS  冷却生效：第二次跑不重复推送  -> pushed=1
+PASS  严重度升级到 error 时再次冒泡  -> pushed=2
+PASS  error 级触发了 toast 分支（沙箱内 EPERM 属预期，宿主机内应为「已弹出」）  -> 2026-10-02T23:04:30.586Z  info  toast 已弹出: LocalPost 局长 · 1 条告警（1 条严重）
+PASS  dry-run 报告标注预览  -> LocalPost 局长 · 2026-10-03 00:04:32    [dry-run 预览 · 未写盘]
+PASS  dry-run 不动冷却状态
+PASS  dry-run 不新增推送  -> pushed=2
+PASS  坏信被判为告警并冒泡  -> 1. [error] 坏信 agents/opencode/inbox/broken.json · JSON 解析失败: Expected property name or '}' in JSON at position 2 (line 1 column 3)
+PASS  告警消失后冷却键被清理（下次再超时会重新响）  -> overdue|task-3|agents/opencode/inbox/task-3.json|, malformed||agents/opencode/inbox/broken.json|
+PASS  内核缺失时工具返回可诊断错误（不抛异常）  -> ❌ LocalPost 局长跑不起来：内核调用失败: Cannot find module 'C:\AI_ASSIST\temp\不存在的内核.mjs' imported from C:\AI_ASSIST\tools\.agent-worktrees\claude\lib\index.js
+PASS  单例守卫：旧实例被接管后不再冒泡  -> pushed=3（接管前 3）
+PASS  单例守卫：旧实例停摆在日志里留痕  -> 2026-10-02T23:04:35.436Z  warn  实例已停止（被新实例接管）——同一时刻只允许一个实例在跑
+PASS  alertKey 稳定：同内容告警跨轮同键  -> overdue|task-x|agents/opencode/inbox/task-x.json|
+PASS  alertKey 区分：kind 或 id 变了必须换键
+PASS  alertKey 容错：缺字段/空值返占位而非 undefined  -> ?|||
+PASS  12h 冷却边界：恰好 12h 仍静默（严格超过才重提）
+PASS  12h 冷却边界：超过 1ms 即重提
+PASS  readState 容错：文件不存在 → 空状态且不抛异常  -> {}
+PASS  readState 容错：非法 JSON → 空状态且不抛异常  -> {}
+PASS  readState 容错：JSON 合法但结构不对（缺 notified）→ 退回空状态  -> {}
+PASS  selectFresh 清理：告警已解决（本轮不存在）→ 旧键被删  -> overdue|task-b|agents/opencode/inbox/task-b.json|
+PASS  selectFresh 清理：超 30 天保留期的僵尸键被删（本轮仍存在、冷却极大）
+PASS  配置文件：notify.ntfyEnabled 被读到 -> ntfy=on  -> fgroot-m7cr4ttk05r 间隔=7 分钟 ntfy=on toast=on(error级) 冷却=12h
+PASS  配置文件：顶层 intervalMinutes 被读到 -> 间隔=7  -> fgroot-m7cr4ttk05r 间隔=7 分钟 ntfy=on toast=on(error级) 冷却=12h
+PASS  无配置文件时回到源码默认（ntfy=off 且 间隔=15）  -> groot-ufpaw8jm2s 间隔=15 分钟 ntfy=off toast=on(error级) 冷却=12h
+PASS  lib/ 下没有任何非空 ntfyTopic 字面量（私人 topic 不许抄回源码）  -> ntfyTopic: ''
+PASS  内核 DEFAULT_CONFIG 里没有"声明了没人读"的死键（scanIntervalMinutes / ignoreTypes）  -> export const DEFAULT_CONFIG = { schema: 'localpost-postmaster-config-v1', ti
+PASS  插件只运行fixture内核，源目录ledger字节未改变
+
+===== 自测小结: 40/40 通过 =====
+EXIT=0

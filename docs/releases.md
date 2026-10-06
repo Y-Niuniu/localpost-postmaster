@@ -50,5 +50,5 @@ git -C C:/AI_ASSIST/tools/dsh-localpost-postmaster for-each-ref refs/tags/milest
 - `milestone/eac20c9-migration` → obj `101e22ce4fd6ebd7f476586e4596c721fe951966`，peel `fb3ec71...`
 - `milestone/721e6ef-controlled-write` → obj `059d1a8e439aebd7a7b523aa6f2568082e70d60e`，peel `fb3ec71...`
 
-核对命令与证据：`work/localpost-six-gates-evidence/step4-tags.txt`。
+核对命令与证据：`docs/evidence/step4-tags.txt`。
 仓库内**没有**任何文件引用这两个旧标签名（`git grep` 为空），发布 manifest 只用完整 source SHA。

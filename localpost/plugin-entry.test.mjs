@@ -43,10 +43,17 @@ function fakeCtx() {
 }
 
 /** 只给插件写日志/状态的地方开临时目录；信箱根仍用 canonical（只读）。 */
+// 2026-10-06：t.after 删除后，**插件的日志写入可能晚于清理**（实测留下 scratch-*/plugin.log）⇒
+// 除了 after 钩子，再在进程退出时兜底删一次（同步删除，晚到的写入也会被收掉）。
+const scratchDirs = [];
+process.on('exit', () => {
+  for (const d of scratchDirs) { try { removeTreeSync(d); } catch { /* 退出兜底，失败不影响测试结论 */ } }
+});
 function scratch(t, stamp) {
   fs.mkdirSync(TMP, { recursive: true });
   const dir = path.join(TMP, `scratch-${stamp}`);
   fs.mkdirSync(dir, { recursive: true });
+  scratchDirs.push(dir);
   t.after(() => removeTreeSync(dir));
   return dir;
 }

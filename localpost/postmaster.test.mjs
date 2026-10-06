@@ -9,13 +9,19 @@ import { promises as fsp } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { runOnce, reconcile, readAlerts, loadConfig, validateEnvelope, isTerminalResult, KERNEL_VERSION } from './postmaster.mjs'
+import { removeTreeSync } from './temp-tree.mjs'
 
+// 2026-10-06：本文件的 makeRoot 此前**不清理**临时根 ⇒ 每次跑全套都在系统 temp（或被 runner 改指到
+// .localpost-tmp/suite）里留下 localpost-test-* 目录。现在逐个登记并在 after 钩子收口。
+const createdRoots = []
 async function makeRoot() {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'localpost-test-'))
+  createdRoots.push(root)
   await fsp.mkdir(path.join(root, 'agents'), { recursive: true })
   await fsp.mkdir(path.join(root, 'attachments'), { recursive: true })
   return root
 }
+test.after(() => { for (const dir of createdRoots) removeTreeSync(dir) })
 
 async function put(root, agent, folder, name, content) {
   const dir = path.join(root, 'agents', agent, folder)

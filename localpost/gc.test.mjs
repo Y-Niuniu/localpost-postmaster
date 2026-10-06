@@ -7,14 +7,22 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 import { runGc } from './gc.mjs'
+import { removeTreeSync } from './temp-tree.mjs'
 
 const now = Date.parse('2026-10-01T12:00:00Z')
 const old = new Date(now - 40 * 86400000)
 const envelope = (id, over = {}) => ({ id, thread_id: 'thread-1', from: 'a', to: 'b', type: 'task',
   subject: 'test', body: 'test', budget: 'standard', created_at: old.toISOString(), ...over })
+// 2026-10-06：本文件此前**完全不清理**临时根 ⇒ 任何把 TEMP/TMPDIR 指向 .localpost-tmp 的 runner
+// （隔离验收套件就是）都会在仓库里留下成百个 localpost-gc-* 目录（实测 125 文件/157 目录）。
+// 现在逐个登记，并在 after 钩子里用带重试的同步删除收口。
+const created = []
 async function fixture() {
-  return fs.mkdtemp(path.join(os.tmpdir(), 'localpost-gc-'))
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'localpost-gc-'))
+  created.push(dir)
+  return dir
 }
+test.after(() => { for (const dir of created) removeTreeSync(dir) })
 async function put(root, relative, content) {
   const file = path.join(root, relative)
   await fs.mkdir(path.dirname(file), { recursive: true })

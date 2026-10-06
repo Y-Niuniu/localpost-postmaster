@@ -14,6 +14,7 @@
 
 | 远端 ref | 源本地分支 | tip | 独占提交 | 内容 | 状态 / 标注 | 判定来源 |
 |---|---|---|---|---|---|---|
+| `archive/dsh-live-e-tests` | `agent/dsh-live-e-tests` | `95554a0` | 4 | live-E 隔离 E 启动链修复（真实 start→rebuild 串接 / receiver 原始记录判定 / fail closed 错误传播）、R3 handoff 措辞、4e 可移植性（显式构造外层真仓库） | **归档**（隔离验收，未并入 main）。注：`agent/dsh-live-e-tests` 同名 ref 早于本约定已在远端存在，两者指向同一提交 | 2026-10-06 工作区清理交接（claude）：该分支既未并入 main 也未登记 ⇒ dsh 决定按归档处理并登记 |
 | `archive/claude-live-e` | `agent/claude-live-e` | `715e951` | 3 | live-E 隔离验收链与文档（handoff 恢复段措辞修正等） | **归档**（隔离验收分支，未并入 main） | codex 2026-10-05 源码评审：`agent/claude-live-e` = "隔离验收链及文档" |
 | `archive/wip-mail-guard` | `agent/claude-mail-guard` | `94d993b` | 3 | `wip(mail-turn): C2 守卫生命周期候选`（按 relay 武装、按因果链释放、卸载收口、子 agent 屏障） | **旧基线 WIP · 未完成 · 非生产** | codex 2026-10-05：旧基线 WIP，不能算生产能力；赶时间时不要未经重新评审直接合并 |
 | `archive/dsh-baseline-upgrade` | `agent/dsh-baseline-upgrade` | `9a0d206` | 2 | live-E 隔离验收基线/文档（按 0dfe402 复审单修正安全指引） | **归档**（隔离验收基线/文档，未并入 main） | codex 2026-10-05：`agent/dsh-baseline-upgrade` = "隔离验收基线/文档" |
@@ -24,6 +25,7 @@
 git push origin refs/heads/agent/claude-live-e:refs/heads/archive/claude-live-e
 git push origin refs/heads/agent/claude-mail-guard:refs/heads/archive/wip-mail-guard
 git push origin refs/heads/agent/dsh-baseline-upgrade:refs/heads/archive/dsh-baseline-upgrade
+git push origin refs/heads/agent/dsh-live-e-tests:refs/heads/archive/dsh-live-e-tests   # 2026-10-06 补登
 ```
 
 ## 二、已并入 main 的分支（**不建远端 ref**）

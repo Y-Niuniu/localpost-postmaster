@@ -20,6 +20,11 @@ const initialSourceLedger = existsSync(join(MAILBOX, 'ledger.json')) ? readFileS
 const TMP = join(tmpdir(), 'localpost-selftest')
 const FIXTURE = join(TMP, 'mailbox')
 
+// 2026-10-06 注：这里**故意不做退出清理**。曾试过在 exit 钩子里删 TMP，结果破坏了
+// localpost/test-isolation.test.mjs 的哨兵语义（该测试用合成 homedir/temp 断言"默认路径未被写"，
+// 而子进程一删 TMP，哨兵就变了 ⇒ 那条测试转为失败）。谁把 TEMP 改指到这里，谁负责清理自己的临时根；
+// 本自测只保证不在**默认** temp 之外的地方写东西。
+
 const results = []
 function check(name, ok, detail) {
   results.push({ name, ok, detail })

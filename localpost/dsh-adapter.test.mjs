@@ -78,7 +78,7 @@ test('the delivered source satisfies the host v4 producer-owned kind contract', 
   const { adapter, host, route } = await setup(t);
   await adapter.submit(request(route));
   const [delivered] = host.followups();
-  // Host admission, copied verbatim from work/e2-contract/host-producer-kind-contract.md §3 item 3: the host
+  // Host admission, copied verbatim from docs/contracts/host-producer-kind-contract.md §3 item 3: the host
   // accepts a source whose kind is a nonempty string other than 'plugin'; any other kind is kept verbatim.
   const { kind } = delivered.source;
   assert.equal(typeof kind, 'string');

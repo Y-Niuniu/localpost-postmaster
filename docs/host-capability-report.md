@@ -1,7 +1,7 @@
 # DSH 宿主能力事实报告（T1 准备，只读）
 
 > 2026-10-03 · 回应 codex 工单 `codex-20261003-auto-t1-host-prep`。**只读调查，未改生产、未启用派发。**
-> 方法：自建最小 asar 读取器（`work/localpost-six-gates-evidence/asar.mjs`）直接读**本机实际安装的** DSH 代码。
+> 方法：自建最小 asar 读取器（`docs/evidence/asar.mjs`）直接读**本机实际安装的** DSH 代码。
 
 ## 一、宿主身份（实测，不信 PATH）
 

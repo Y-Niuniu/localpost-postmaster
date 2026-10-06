@@ -9,7 +9,7 @@ function failure(code, message, extra = {}) {
 const text = value => typeof value === 'string' && value.trim() !== '';
 
 // Host v4 admission (verified against the installed 0.2.0-rc.2; team evidence:
-// work/e2-contract/host-producer-kind-contract.md §0 and §3 item 3): an interpreted message is persisted only
+// docs/contracts/host-producer-kind-contract.md §0 and §3 item 3): an interpreted message is persisted only
 // when its source is an object whose `kind` is a nonempty string and not 'plugin'. There is no registry to
 // enlist in - any other kind is kept verbatim.
 //

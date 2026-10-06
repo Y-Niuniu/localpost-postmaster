@@ -33,7 +33,7 @@
 - 隔离测试会话 A、B（建议 `E-test-A` / `E-test-B`），不用于真实工作
 - 测试信 id 一律 `mcptest-` 前缀，**不进生产账本**
 - 生产 `dispatch` 全程关闭；只在测试根内启用
-- 证据落盘 `work/localpost-six-gates-evidence/e-acceptance/`
+- 证据落盘 `docs/evidence/e-acceptance/`
 - **任一步失败 → 立即停止、保持关闭、按 §4 处理**，不得"再试一次就好"
 
 | # | 验收项 | 步骤（谁做） | 通过标准 | 证据 |
