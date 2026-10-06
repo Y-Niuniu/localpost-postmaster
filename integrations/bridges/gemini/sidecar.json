@@ -1,0 +1,5 @@
+{
+  "description": "LocalPost 唤醒桥（gemini / Antigravity）：邮局有新信时，通过 agentapi send-message 唤醒指定会话。每分钟一次，短任务。",
+  "builtin": "schedule",
+  "args": ["* * * * *", "node", "wake.mjs"]
+}

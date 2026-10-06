@@ -1,0 +1,7 @@
+{
+  "identity": "codex",
+  "mailboxRoot": "C:/AI_ASSIST/.mailbox",
+  "allowFrom": ["dsh", "claude", "gemini", "engineer", "opencode"],
+  "maxRemindersPerLetter": 5,
+  "note": "Codex 侧半自动唤醒桥配置。Stop hook 调用 codex-check.mjs；已存在等待授权回执的信不提醒，同一封信提醒次数有上限（兜底）。"
+}

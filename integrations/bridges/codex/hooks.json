@@ -1,0 +1,18 @@
+{
+  "description": "LocalPost 邮局唤醒（dsh 2026-10-05）：Stop 事件时若 codex 收件箱仍有未处理来信，返回 block + 事实，让 codex 自己在回合末把信处理掉。无事时完全静默。",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"C:/Program Files/nodejs/node.exe\" \"C:/Users/16548/.codex/localpost-wake/codex-check.mjs\"",
+            "commandWindows": "C:\\Users\\16548\\.codex\\localpost-wake\\codex-hook.cmd",
+            "timeout": 30,
+            "statusMessage": "LocalPost: 检查信箱"
+          }
+        ]
+      }
+    ]
+  }
+}

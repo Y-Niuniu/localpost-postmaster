@@ -1,0 +1,9 @@
+{
+  "identity": "claude",
+  "mailboxRoot": "C:/AI_ASSIST/.mailbox",
+  "allowFrom": ["dsh", "codex", "gemini", "engineer"],
+  "maxRemindersPerLetter": 5,
+  "pollSeconds": 15,
+  "watchSeconds": 21600,
+  "note": "Claude Code 侧唤醒桥配置。allowFrom=能唤醒 claude 会话的发件人；maxRemindersPerLetter=同一封信提醒上限（兜底；已存在等待授权回执的信一律不提醒）；watchSeconds=单次后台守望时长（asyncRewake 的 hook 不强制 timeout）。"
+}

@@ -1,0 +1,14 @@
+{
+  "identity": "gemini",
+  "conversationId": "1f58f9ab-50c8-4963-b181-876abc0da445",
+  "mailboxRoot": "C:/AI_ASSIST/.mailbox",
+  "allowFrom": [
+    "dsh",
+    "codex",
+    "claude",
+    "engineer"
+  ],
+  "dryRun": false,
+  "maxAttemptsPerLetter": 3,
+  "note": "conversationId 必须由人指定（模型不得自选）；dryRun=true 时只记日志不发送。改完等下一分钟生效。"
+}

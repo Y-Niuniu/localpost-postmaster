@@ -1,0 +1,296 @@
+#!/usr/bin/env node
+// LocalPost 邮局 MCP Server —— 让任何支持 MCP 的 agent（Antigravity / VS Code 系 / Claude Desktop…）
+// 直接收发信件，不需要知道文件路径。
+//
+// 协议：MCP over stdio，newline-delimited JSON-RPC 2.0（零依赖）
+// 规矩唯一源：C:/AI_ASSIST/.mailbox/README.md（本服务器只实现内核语义：信封校验 + 投递 + 归档）
+//
+// 用法（在 mcp_config.json 里）：
+//   "postmaster": { "command": "node", "args": ["C:/AI_ASSIST/tools/dsh-mailbox-mcp/server.mjs"] }
+
+import fs from 'node:fs';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+const ROOT = process.env.MAILBOX_ROOT || 'C:/AI_ASSIST/.mailbox';
+const AGENTS_DIR = path.join(ROOT, 'agents');
+const ATTACH_DIR = path.join(ROOT, 'attachments');
+const PROTOCOL_FALLBACK = '2024-11-05';
+// 共享受控 API（内核同名模块）：投递必须走它，才会写 runtime/arrivals 到达记录 + 拿写锁。
+// 2026-10-05 前的实现是直接 fs.writeFileSync 写 inbox —— 那样投出的信没有到达记录，
+// 生产 receiver 只能判 manual/no_arrival_record ⇒ 永远不唤醒收件聊天。此改动即修这一条。
+const SHARED_API = process.env.LOCALPOST_MAILBOX_API || path.join(ROOT, 'mailbox.mjs');
+let sharedApiPromise = null;
+function sharedApi() {
+  if (sharedApiPromise === null) sharedApiPromise = import(pathToFileURL(SHARED_API).href);
+  return sharedApiPromise;
+}
+
+const REQUIRED = ['id', 'thread_id', 'from', 'to', 'type', 'subject', 'body', 'budget', 'created_at'];
+const TYPES = ['task', 'result', 'ping'];
+const BUDGETS = ['urgent', 'standard', 'high', 'free'];
+const BODY_SOFT_LIMIT = 200;
+
+const log = (...a) => process.stderr.write('[mailbox-mcp] ' + a.join(' ') + '\n');
+const nowIso = () => new Date().toISOString();
+
+function agentDir(agent) {
+  const safe = String(agent || '').trim();
+  if (!/^[a-z0-9_-]{1,32}$/i.test(safe)) throw new Error(`非法 agent 名: ${agent}`);
+  return path.join(AGENTS_DIR, safe);
+}
+function inbox(agent) { return path.join(agentDir(agent), 'inbox'); }
+function archiveDir(agent) { return path.join(agentDir(agent), 'archive'); }
+function ensureAgent(agent) {
+  for (const d of ['inbox', 'outbox', 'archive']) fs.mkdirSync(path.join(agentDir(agent), d), { recursive: true });
+}
+
+function validateEnvelope(env) {
+  const missing = REQUIRED.filter(k => env[k] === undefined || env[k] === null || String(env[k]).trim() === '');
+  if (missing.length) throw new Error(`信封缺必填字段: ${missing.join(', ')}`);
+  if (!TYPES.includes(env.type)) throw new Error(`type 必须是 ${TYPES.join('|')}`);
+  if (!BUDGETS.includes(env.budget)) throw new Error(`budget 必须是 ${BUDGETS.join('|')}`);
+  return true;
+}
+
+async function deliver(env) {
+  validateEnvelope(env);
+  ensureAgent(env.to);
+  const warnings = [];
+  if (String(env.body).length > BODY_SOFT_LIMIT) warnings.push(`body ${String(env.body).length} 字，超过软上限 ${BODY_SOFT_LIMIT}（大内容请走 attachments）`);
+  for (const a of (env.attachments || [])) {
+    if (!fs.existsSync(path.join(ATTACH_DIR, a))) warnings.push(`附件不存在: ${a}`);
+  }
+  // 走共享受控 API：拿写锁 + 按收件人绑定写 runtime/arrivals 到达记录（自动唤醒的前提）。
+  const { createMailbox } = await sharedApi();
+  const box = createMailbox({ root: ROOT, identity: env.from });
+  const result = await box.deliver(env);
+  return {
+    delivered_to: result.delivered_to,
+    warnings: [...warnings, ...(result.warnings || [])],
+    ...(result.idempotent ? { idempotent: true } : {}),
+    arrival_recorded: true,
+  };
+}
+
+function listInbox(agent) {
+  const dir = inbox(agent);
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir).filter(f => f.endsWith('.json')).sort().map(f => {
+    try {
+      const j = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'));
+      return {
+        file: f, id: j.id, thread_id: j.thread_id, from: j.from, type: j.type,
+        subject: j.subject, budget: j.budget, created_at: j.created_at,
+        body: String(j.body || '').slice(0, 300),
+        attachments: j.attachments || [],
+      };
+    } catch (e) { return { file: f, error: 'JSON 解析失败: ' + e.message }; }
+  });
+}
+
+function readLetter(agent, id) {
+  const f = path.join(inbox(agent), `${id}.json`);
+  if (!fs.existsSync(f)) throw new Error(`找不到信: ${id}`);
+  const j = JSON.parse(fs.readFileSync(f, 'utf8'));
+  const atts = (j.attachments || []).map(a => {
+    const p = path.join(ATTACH_DIR, a);
+    if (!fs.existsSync(p)) return { name: a, missing: true };
+    const st = fs.statSync(p);
+    const out = { name: a, bytes: st.size };
+    if (st.size <= 200_000 && /\.(md|txt|json|csv|ya?ml)$/i.test(a)) out.content = fs.readFileSync(p, 'utf8');
+    else out.note = '二进制或过大，未内联（请用文件工具直接读 ' + p.replace(/\//g, '\\') + '）';
+    return out;
+  });
+  return { envelope: j, attachments_resolved: atts };
+}
+
+async function replyTo(agent, reply) {  const src = JSON.parse(fs.readFileSync(path.join(inbox(agent), `${reply.reply_to}.json`), 'utf8'));
+  const env = {
+    id: `${src.id}.result`,
+    thread_id: src.thread_id,
+    from: agent,
+    to: src.from,
+    type: 'result',
+    subject: reply.subject || `回执: ${src.subject}`,
+    body: reply.body,
+    budget: src.budget,
+    created_at: nowIso(),
+    reply_to: src.id,
+  };
+  if (reply.commit) env.commit = reply.commit;
+  if (reply.test) env.test = reply.test;
+  if (reply.attachments) env.attachments = reply.attachments;
+  const r = await deliver(env);
+  // 处理完把原信移进自己的 archive
+  try {
+    fs.mkdirSync(archiveDir(agent), { recursive: true });
+    fs.renameSync(path.join(inbox(agent), `${src.id}.json`), path.join(archiveDir(agent), `${src.id}.json`));
+    r.archived = `${src.id}.json`;
+  } catch (e) { r.archive_error = e.message; }
+  return r;
+}
+
+function archiveLetter(agent, id) {
+  fs.mkdirSync(archiveDir(agent), { recursive: true });
+  const from = path.join(inbox(agent), `${id}.json`);
+  if (!fs.existsSync(from)) throw new Error(`找不到信: ${id}`);
+  fs.renameSync(from, path.join(archiveDir(agent), `${id}.json`));
+  return { archived: id };
+}
+
+function roster() {
+  if (!fs.existsSync(AGENTS_DIR)) return [];
+  return fs.readdirSync(AGENTS_DIR).filter(n => fs.statSync(path.join(AGENTS_DIR, n)).isDirectory()).map(n => ({
+    agent: n,
+    inbox: fs.existsSync(inbox(n)) ? fs.readdirSync(inbox(n)).filter(f => f.endsWith('.json')).length : 0,
+    archive: fs.existsSync(archiveDir(n)) ? fs.readdirSync(archiveDir(n)).filter(f => f.endsWith('.json')).length : 0,
+  }));
+}
+
+// ---------------- MCP ----------------
+const TOOLS = [
+  {
+    name: 'mailbox_rules',
+    description: '返回邮局操作规矩的唯一源路径与要点。任何邮局操作前应先读它。',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  {
+    name: 'mailbox_roster',
+    description: '列出邮局里已注册的 agent 及各自 inbox/archive 的未处理数量。',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  {
+    name: 'mailbox_inbox',
+    description: '查看某个 agent 的收件箱（不改变任何状态）。',
+    inputSchema: { type: 'object', properties: { agent: { type: 'string', description: '你的 agent 名（= 信箱目录名）' } }, required: ['agent'], additionalProperties: false },
+  },
+  {
+    name: 'mailbox_read',
+    description: '读一封信的完整内容，含附件（文本附件内联，二进制只给路径）。',
+    inputSchema: { type: 'object', properties: { agent: { type: 'string' }, id: { type: 'string' } }, required: ['agent', 'id'], additionalProperties: false },
+  },
+  {
+    name: 'mailbox_send',
+    description: '投递一封新信。信封必须含 9 个必填字段；正文软上限 200 字，大内容走 attachments。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        from: { type: 'string' }, to: { type: 'string' },
+        type: { type: 'string', enum: TYPES },
+        subject: { type: 'string' }, body: { type: 'string' },
+        budget: { type: 'string', enum: BUDGETS, description: '默认 standard' },
+        thread_id: { type: 'string', description: '不填则用 id' },
+        id: { type: 'string', description: '不填则自动生成 <from>-<日期>-<序号>' },
+        attachments: { type: 'array', items: { type: 'string' }, description: '.mailbox/attachments/ 下的相对文件名' },
+      },
+      required: ['from', 'to', 'type', 'subject', 'body'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'mailbox_reply',
+    description: '回复一封信：自动生成 result 信封投回原发件人，并把原信移进自己的 archive/。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        agent: { type: 'string', description: '你自己（收件方）' },
+        reply_to: { type: 'string', description: '原信 id' },
+        body: { type: 'string', description: '结果，≤200 字' },
+        subject: { type: 'string' },
+        commit: { type: 'string', description: '（代码任务）commit 号' },
+        test: { type: 'string', description: '（代码任务）验收命令 + 结果' },
+        attachments: { type: 'array', items: { type: 'string' } },
+      },
+      required: ['agent', 'reply_to', 'body'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'mailbox_archive',
+    description: '把一封信从 inbox 移到自己的 archive/（已处理完但不需回执时用，如 ping）。',
+    inputSchema: { type: 'object', properties: { agent: { type: 'string' }, id: { type: 'string' } }, required: ['agent', 'id'], additionalProperties: false },
+  },
+];
+
+function ok(id, result) { return { jsonrpc: '2.0', id, result }; }
+function err(id, code, message) { return { jsonrpc: '2.0', id, error: { code, message } }; }
+
+async function callTool(name, args = {}) {
+  switch (name) {
+    case 'mailbox_rules': {
+      const p = path.join(ROOT, 'README.md');
+      const text = fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : '(README.md 不存在)';
+      return { rules_path: p.replace(/\//g, '\\'), content: text };
+    }
+    case 'mailbox_roster': return { agents: roster() };
+    case 'mailbox_inbox': return { agent: args.agent, letters: listInbox(args.agent) };
+    case 'mailbox_read': return readLetter(args.agent, args.id);
+    case 'mailbox_send': {
+      const seq = String(Date.now()).slice(-6);
+      const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+      const id = args.id || `${args.from}-${stamp}-${seq}`;
+      const env = {
+        id, thread_id: args.thread_id || id, from: args.from, to: args.to, type: args.type,
+        subject: args.subject, body: args.body, budget: args.budget || 'standard',
+        created_at: nowIso(),
+      };
+      if (args.attachments) env.attachments = args.attachments;
+      return await deliver(env);
+    }
+    case 'mailbox_reply': return await replyTo(args.agent, args);
+    case 'mailbox_archive': return archiveLetter(args.agent, args.id);
+    default: throw new Error(`未知工具: ${name}`);
+  }
+}
+
+async function handle(msg) {
+  const { id, method, params } = msg;
+  if (method === 'initialize') {
+    return ok(id, {
+      protocolVersion: params?.protocolVersion || PROTOCOL_FALLBACK,
+      capabilities: { tools: {} },
+      serverInfo: { name: 'localpost-mailbox', version: '1.0.0' },
+      instructions: `这是本地 LocalPost 邮局。规矩唯一源：${path.join(ROOT, 'README.md').replace(/\//g, '\\')}。
+会话开始请：mailbox_inbox({agent:"<你的名字>"}) 查看来信；处理完用 mailbox_reply 回执（自动归档原信）；
+task 必须在超时窗口内回执，否则邮局的局长进程会记账并告警。`,
+    });
+  }
+  if (method === 'notifications/initialized' || method === 'notifications/cancelled') return null;
+  if (method === 'ping') return ok(id, {});
+  if (method === 'tools/list') return ok(id, { tools: TOOLS });
+  if (method === 'tools/call') {
+    const name = params?.name;
+    const args = params?.arguments || {};
+    try {
+      const out = await callTool(name, args);
+      return ok(id, { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] });
+    } catch (e) {
+      return ok(id, { content: [{ type: 'text', text: '错误: ' + e.message }], isError: true });
+    }
+  }
+  return err(id, -32601, `未实现的方法: ${method}`);
+}
+
+let buf = '';
+let chain = Promise.resolve();
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', chunk => {
+  buf += chunk;
+  // 投递改走异步受控 API（写到达记录），因此按收到顺序串行处理，避免并发写同一封信。
+  chain = chain.then(async () => {
+    let i;
+    while ((i = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, i).trim();
+      buf = buf.slice(i + 1);
+      if (!line) continue;
+      let msg;
+      try { msg = JSON.parse(line); } catch (e) { log('JSON 解析失败: ' + e.message); continue; }
+      const res = await handle(msg);
+      if (res) process.stdout.write(JSON.stringify(res) + '\n');
+    }
+  }).catch(e => log('处理失败: ' + (e?.stack || e)));
+});
+process.stdin.on('end', () => process.exit(0));
+process.on('uncaughtException', e => log('未捕获异常: ' + e.stack));
+log(`就绪 · mailbox=${ROOT}`);
