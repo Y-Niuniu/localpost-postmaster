@@ -1,5 +1,7 @@
 # @dsh-external/dsh-localpost-postmaster
 
+工程文档：[LocalPost 工程报告、设计蓝图与操作指南（中文审阅版）](docs/localpost_engineering_report_and_manual.zh-CN.md)。基于 Gemini 初稿修订，说明完整项目及验证边界。
+
 2026-10-01 staged reliability/reception implementation is in `localpost/`.
 Run `node scripts/test.mjs`; integration and runtime gaps are documented in
 `docs/integration.md` and `docs/runtime-probe.md`. This branch does not deploy
