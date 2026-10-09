@@ -18,7 +18,10 @@
  *      （reminderCooldownHours，默认 6h）到点再提醒一次，并在 check-state.json 里留
  *      `manualReview:true`/`heldSince` 作为"待人工处理"的可见出口（GPT P2-6）。
  *
- * 只读：只读信箱文件（不写信箱），只写自己的 check-state.json / check.log。
+ * 收信聊天（2026-10-09，见 wake-binding.mjs）：指定了收信聊天时，只在那个聊天里提醒/唤醒；关掉时哪里都不提醒。
+ * 待认领的登记只由 Stop（--rewake）认领——那是发起登记的聊天回合结束的时刻；发消息（--context）不认领。
+ *
+ * 只读：只读信箱文件（不写信箱），只写自己的 check-state.json / check.log（以及认领时的绑定文件）。
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -30,6 +33,14 @@ if (!cfg) process.exit(0);
 
 const identity = cfg.identity;
 const root = cfg.mailboxRoot;
+// 绑定模块与本脚本部署在同一目录；漏拷时按旧行为走（claude-wake.mjs 会在 wake.log 里记一笔）。
+const binding = await import('./wake-binding.mjs').catch(() => null);
+if (binding) {
+  const input = binding.readHookInput();
+  const session = typeof input.session_id === 'string' && input.session_id ? input.session_id : (process.env.CLAUDE_CODE_SESSION_ID || null);
+  const decision = binding.settle(root, identity, session, { mayClaim: MODE === 'rewake', how: 'claimed by claude Stop hook' });
+  if (decision !== 'mine' && decision !== 'legacy') process.exit(0);
+}
 const allowFrom = Array.isArray(cfg.allowFrom) ? cfg.allowFrom : [];
 const maxReminders = Number.isInteger(cfg.maxRemindersPerLetter) ? cfg.maxRemindersPerLetter : 5;
 const cooldownMs = (Number(cfg.reminderCooldownHours) || 6) * 3600 * 1000;

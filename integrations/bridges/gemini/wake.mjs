@@ -5,7 +5,9 @@
  * 用 `agentapi send-message <人工指定的会话id> <提示>` 把那个 Antigravity 会话叫醒。
  *
  * 硬约束（照搬 DSH 侧 receiver 的语义）：
- *   1) 会话 id 只从本目录 config.json 读，且必须是 UUID；模型运行时不得改它（改配置=人的动作）；
+ *   1) 会话 id 必须是 UUID。来源（2026-10-09 起）：用户在某个 Antigravity 会话里说「把收信切到这个聊天」时，
+ *      模型运行 localpost-switch.mjs 写下的绑定（wake-binding.mjs，模式 off 则一概不发）；没有绑定文件时
+ *      才用本目录 config.json 的 conversationId（原来的人工指定方式）；
  *   2) 首次运行只记基线：**旧信永不唤醒**（避免把历史积压翻出来）；
  *   3) 每封信最多唤醒 maxAttemptsPerLetter 次（成功即不再发）；
  *   4) 只唤醒白名单发件人的 task/ping；result（回执）永不唤醒 —— 那是给人看的；
@@ -54,13 +56,19 @@ process.on('exit', releaseLock);
 const cfg = loadJson(path.join(HERE, 'config.json'));
 if (!cfg) { log('fatal: config.json missing/unreadable'); process.exit(1); }
 const identity = cfg.identity;
-const conversationId = cfg.conversationId;
 const root = cfg.mailboxRoot;
 const allowFrom = Array.isArray(cfg.allowFrom) ? cfg.allowFrom : [];
 const maxAttempts = Number.isInteger(cfg.maxAttemptsPerLetter) ? cfg.maxAttemptsPerLetter : 3;
 if (!safeId(identity)) { log(`fatal: identity invalid (${identity})`); process.exit(1); }
+// 收信聊天：绑定模块与本脚本部署在同一目录；漏拷时记一笔并只用 config.json（旧行为）。
+const bindingModule = await import('./wake-binding.mjs').catch(() => null);
+if (!bindingModule) log('wake-binding.mjs missing next to wake.mjs: 收信聊天开关不生效，只用 config.json 的 conversationId');
+const binding = bindingModule ? bindingModule.readBinding(root, identity) : null;
+if (binding?.mode === 'off') { log('ok: automatic mail is off for ' + identity + '; letters wait in the inbox'); process.exit(0); }
+const chosen = binding?.mode === 'on' && typeof binding.session === 'string' && binding.session !== '';
+const conversationId = chosen ? binding.session : cfg.conversationId;
 if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(conversationId))) {
-  log(`fatal: conversationId must be a UUID chosen by a human (got ${conversationId})`);
+  log(`fatal: conversationId must be a UUID (got ${conversationId} from ${chosen ? 'the mail-chat binding' : 'config.json'})`);
   process.exit(1);
 }
 if (allowFrom.length === 0 || !allowFrom.every(safeId)) { log('fatal: allowFrom must be a non-empty list of safe ids'); process.exit(1); }

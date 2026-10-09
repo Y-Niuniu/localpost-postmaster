@@ -32,6 +32,8 @@ export const SRC = {
   gemini: path.join(REPO, 'integrations', 'bridges', 'gemini'),
   claude: path.join(REPO, 'integrations', 'bridges', 'claude'),
   codex: path.join(REPO, 'integrations', 'bridges', 'codex'),
+  // 收信聊天开关（2026-10-09）：与每个桥部署在同一目录的 wake-binding.mjs + localpost-switch.mjs
+  shared: path.join(REPO, 'integrations', 'bridges', 'shared'),
 };
 
 /** 专用测试会话 id（**不是**生产会话 id） */

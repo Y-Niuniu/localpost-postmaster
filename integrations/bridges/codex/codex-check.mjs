@@ -13,7 +13,11 @@
  *   ④ 提醒上限不是永久静默：超限后进入冷却（reminderCooldownHours，默认 6h），到点再提醒，
  *      状态里留 manualReview/heldSince 作为待人工处理的可见出口。
  *
- * 只读：只读信箱文件（不写信箱），只写自己的 check-state.json / check.log。
+ * 收信聊天（2026-10-09，见 wake-binding.mjs）：指定了收信聊天时只提醒那个聊天，关掉时哪里都不提醒。
+ * Codex 的命令行里拿不到会话 id，所以「切到这里」先登记，由本聊天这一轮结束时的 Stop（这里）用 hook 输入里的
+ * session_id 认领（codex 0.139.0 的 stop.command.input 里 session_id 是必填字段）。
+ *
+ * 只读：只读信箱文件（不写信箱），只写自己的 check-state.json / check.log（以及认领时的绑定文件）。
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -24,6 +28,14 @@ if (!cfg) process.exit(0);
 
 const identity = cfg.identity;
 const root = cfg.mailboxRoot;
+// 绑定模块与本脚本部署在同一目录；漏拷时记一笔并按旧行为走，不让 hook 因此报错。
+const binding = await import('./wake-binding.mjs').catch(() => null);
+const decision = (() => {
+  if (!binding) return 'legacy';
+  const input = binding.readHookInput();
+  const session = typeof input.session_id === 'string' && input.session_id ? input.session_id : null;
+  return binding.settle(root, identity, session, { mayClaim: true, how: 'claimed by codex Stop hook' });
+})();
 const allowFrom = Array.isArray(cfg.allowFrom) ? cfg.allowFrom : [];
 const maxReminders = Number.isInteger(cfg.maxRemindersPerLetter) ? cfg.maxRemindersPerLetter : 5;
 const cooldownMs = (Number(cfg.reminderCooldownHours) || 6) * 3600 * 1000;
@@ -37,6 +49,8 @@ const saveJson = (p, v) => { const t = p + '.tmp'; fs.writeFileSync(t, JSON.stri
 const readdirSafe = (d) => { try { return fs.readdirSync(d); } catch { return []; } };
 const inbox = path.join(root, 'agents', identity, 'inbox');
 
+if (!binding) log('wake-binding.mjs missing next to codex-check.mjs: 收信聊天开关不生效，按旧行为运行');
+if (decision !== 'mine' && decision !== 'legacy') { log(`silent: ${decision === 'off' ? 'automatic mail is off' : 'the mail chat is another session'}`); process.exit(0); }
 if (!fs.existsSync(inbox)) { log('run: 0 waiting (no inbox)'); process.exit(0); }
 
 /** 一次性索引所有信箱（inbox+archive）里的 result 信封，按 reply_to 分组（不按文件名过滤）。 */

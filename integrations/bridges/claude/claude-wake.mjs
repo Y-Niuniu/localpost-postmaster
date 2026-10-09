@@ -13,6 +13,11 @@
  *   2) 每封信只唤醒一次（状态文件去重）；result（回执）永不唤醒；
  *   3) 单实例锁：已有守望进程在跑时，本次直接 exit 0（不重复挂）。
  *
+ * 收信聊天（2026-10-09）：用户说「把收信切到这个聊天」时模型运行 localpost-switch.mjs，写下绑定
+ * （wake-binding.mjs）。之后只有被绑的聊天挂守望：别的聊天的 Stop 直接退出；被绑的聊天回合结束时，
+ * 若锁被别的聊天的守望占着，就接管；正在守望的进程每一轮都核对绑定，绑定挪走了就退出、不再叫醒。
+ * 没有绑定文件时一切照旧（谁先结束一轮谁守望）。
+ *
  * 注入文案按官方建议写成**事实陈述**（命令口吻可能触发防注入）。
  */
 import fs from 'node:fs';
@@ -24,6 +29,15 @@ if (!cfg) { process.stderr.write('localpost-wake: config.json unreadable\n'); pr
 
 const identity = cfg.identity;
 const root = cfg.mailboxRoot;
+// 绑定模块与本脚本部署在同一目录；漏拷时记一笔并按旧行为走，不让 hook 因此报错。
+const binding = await import('./wake-binding.mjs').catch(() => null);
+const session = (() => {
+  if (!binding) return null;
+  const input = binding.readHookInput();
+  return typeof input.session_id === 'string' && input.session_id ? input.session_id : (process.env.CLAUDE_CODE_SESSION_ID || null);
+})();
+/** 'legacy' | 'off' | 'mine' | 'other'（'claim' 在开头认领过；中途出现的登记留给发起它的聊天）。 */
+const where = (mayClaim = false) => (binding ? binding.settle(root, identity, session, { mayClaim, how: 'claimed by claude Stop hook' }) : 'legacy');
 const allowFrom = Array.isArray(cfg.allowFrom) ? cfg.allowFrom : [];
 const pollMs = Math.max(5, Number(cfg.pollSeconds) || 15) * 1000;
 const watchMs = Math.max(60, Number(cfg.watchSeconds) || 21600) * 1000;
@@ -38,6 +52,14 @@ const loadJson = (p, fb = null) => { try { return JSON.parse(fs.readFileSync(p, 
 const saveJson = (p, v) => { const t = p + '.tmp'; fs.writeFileSync(t, JSON.stringify(v, null, 2) + '\n', 'utf8'); fs.renameSync(t, p); };
 const inbox = path.join(root, 'agents', identity, 'inbox');
 
+/* ------------------------------------------------------------ 收信聊天：不是这个聊天就不挂守望 */
+if (!binding) log('wake-binding.mjs missing next to claude-wake.mjs: 收信聊天开关不生效，按旧行为运行');
+const decision = where(true);
+if (decision === 'off' || decision === 'other') {
+  log(`skip: ${decision === 'off' ? 'automatic mail is off' : 'the mail chat is another session'} (this session=${session ?? 'unknown'})`);
+  process.exit(0);
+}
+
 /* ------------------------------------------------------------ 单实例锁（2026-10-05 修 P2；2026-10-06 修 GPT 复审 P2-8） */
 // 一轮：TTL 30 分钟 vs 守望 6 小时 ⇒ 活守望被接管、退出还删别人的锁。
 // 二轮（GPT P2-8）：读锁再写锁不是原子的 —— 两个同时启动的进程可能都读到"无锁"然后一起守望；
@@ -49,7 +71,7 @@ const pidAlive = (pid) => {
   try { process.kill(pid, 0); return true; } catch (e) { return e?.code === 'EPERM'; }
 };
 function acquireLock() {
-  const payload = JSON.stringify({ pid: process.pid, at: Date.now() }) + '\n';
+  const payload = JSON.stringify({ pid: process.pid, at: Date.now(), session }) + '\n';
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
       const fd = fs.openSync(LOCK, 'wx');            // 原子排他：已存在则 EEXIST，不会被"读后写"竞态穿透
@@ -59,9 +81,14 @@ function acquireLock() {
     } catch (error) {
       if (error.code !== 'EEXIST') throw error;
       const cur = loadJson(LOCK);
-      if (cur && cur.pid !== process.pid && pidAlive(cur.pid)) return { ok: false, holder: `pid=${cur.pid}` };
-      const ageMs = Number.isFinite(cur?.at) ? Date.now() - cur.at : Infinity;
-      log(`take over: lock holder ${cur?.pid ? 'pid=' + cur.pid : 'unknown'} 不存活（age=${Number.isFinite(ageMs) ? Math.round(ageMs / 1000) + 's' : 'unknown'}）`);
+      const alive = cur && cur.pid !== process.pid && pidAlive(cur.pid);
+      // 被绑的是这个聊天、锁却在别的聊天的守望手里：接管（那个守望下一轮续租时发现锁不是自己的，就会退出）。
+      if (alive && !(decision === 'mine' && cur.session !== session)) return { ok: false, holder: `pid=${cur.pid}` };
+      if (alive) log(`take over: the mail chat is this session (${session}); lock holder pid=${cur.pid} watches session ${cur.session ?? 'unknown'}`);
+      else {
+        const ageMs = Number.isFinite(cur?.at) ? Date.now() - cur.at : Infinity;
+        log(`take over: lock holder ${cur?.pid ? 'pid=' + cur.pid : 'unknown'} 不存活（age=${Number.isFinite(ageMs) ? Math.round(ageMs / 1000) + 's' : 'unknown'}）`);
+      }
       try { fs.unlinkSync(LOCK); } catch { /* 竞争者已删：下一轮 wx 再试 */ }
     }
   }
@@ -79,7 +106,7 @@ const renew = () => {
     log('lock lost (another watcher took over) — 停止守望，交回');
     process.exit(0);
   }
-  try { fs.writeFileSync(LOCK, JSON.stringify({ pid: process.pid, at: Date.now() }) + '\n'); } catch { /* 续租失败不致命 */ }
+  try { fs.writeFileSync(LOCK, JSON.stringify({ pid: process.pid, at: Date.now(), session }) + '\n'); } catch { /* 续租失败不致命 */ }
 };
 const release = () => {
   const cur = loadJson(LOCK);
@@ -143,6 +170,13 @@ const deadline = Date.now() + watchMs;
 log(`watching ${inbox} every ${pollMs / 1000}s for up to ${Math.round(watchMs / 1000)}s (pid=${process.pid})`);
 const timer = setInterval(() => {
   renew();                                   // 续租：活着的守望永远不该被当作过期锁
+  // 绑定挪走了（切到别的聊天、关掉、或别处新登记的待认领）：不再替这个聊天收信，交回。
+  const now = where();
+  if (now !== 'mine' && now !== 'legacy') {
+    clearInterval(timer);
+    log(`stop watching: the mail chat is no longer this session (${now}); 不再叫醒这里`);
+    process.exit(0);
+  }
   const hit = checkOnce();
   if (hit) {
     clearInterval(timer);
