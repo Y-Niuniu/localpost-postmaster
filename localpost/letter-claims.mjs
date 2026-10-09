@@ -282,6 +282,56 @@ export function switchMode(store, identity, mode, options = {}) {
   });
 }
 
+// A letter the bound chat may still be working on (or that may have reached it): it blocks moving the mail to another chat.
+export const UNFINISHED = Object.freeze(['dispatching', 'accepted', 'completing', 'needs_reconcile']);
+// How many replaced bindings a binding remembers, so mail that arrived under them can still follow it (binding-provider.mjs).
+const MAX_REPLACED = 20;
+
+/**
+ * Moves an identity's mail to another chat, at the user's request in that chat (binding-provider.mjs attests it).
+ * The new binding replaces the old one outright: generation 1 attested by the new chat's own action, automatic, the CAS
+ * version still moving forward. The replaced binding is remembered, so mail that arrived under it and was never delivered
+ * follows the move. A letter the old chat may still be working on blocks the move, unless the user forces it - then it
+ * becomes the new chat's to finish (accepted, owned by the new chat). Settled history and reservations that never reached
+ * the old chat are dropped. Only an actor-lease holder may call this (takeOver), so no dispatch is in flight.
+ */
+export function takeOverIn(state, { session, attestation, source, authority, expectedBinding, force = false } = {}, at) {
+  const { binding } = state;
+  if (expectedBinding !== undefined && !isBinding(binding, expectedBinding)) return { ok: false, reason: 'binding_conflict' };
+  if ((binding.state === 'frozen' && binding.frozen?.for !== 'mode') || Object.values(state.rotations).some(journal => journal.state !== 'retired'))
+    return { ok: false, reason: 'rotation_in_progress' };
+  const unfinished = Object.values(state.claims).filter(claim => UNFINISHED.includes(claim.status)).map(claim => claim.letter);
+  if (unfinished.length > 0 && !force) return { ok: false, reason: 'unfinished_letters', letters: unfinished };
+  const previous = { session: { ...binding.session }, since: binding.since ?? null, attestation: binding.attestation?.actionId ?? null };
+  state.binding = {
+    version: binding.version + 1, generation: 1, session: { ...session }, mode: 'auto', state: 'active', frozen: null,
+    capacity: binding.capacity, authority: { scope: authority.scope, source: authority.source }, source, since: at,
+    attestation: { kind: 'chat-action', ...attestation, at },
+    replaced: [...(binding.replaced ?? []), { ...previous, until: at }].slice(-MAX_REPLACED),
+  };
+  const owner = { generation: 1, session: session.id };
+  const claims = {};
+  for (const id of unfinished) {
+    const old = state.claims[id];
+    // A fresh record: no attempt token, completion intent or hold of the old chat comes along.
+    const claim = { letter: old.letter, digest: old.digest, version: old.version, transfers: old.transfers + 1, attempts: old.attempts,
+      history: old.history, owner, taken_over_from: { ...old.owner } };
+    claims[id] = move(claim, 'accepted', at, { reason: 'taken_over' });
+  }
+  state.claims = claims;
+  state.rotations = {};
+  state.context = null;
+  return { ok: true, binding: state.binding, previous, moved: unfinished };
+}
+
+/** The takeover under the actor lease: dead dispatches are isolated first, and a live actor skips at once (the caller retries). */
+export function takeOver(store, identity, request) {
+  return store.withActor(identity, async () => {
+    await recoverClaims(store, identity);
+    return store.update(identity, state => takeOverIn(state, request, store.at()));
+  });
+}
+
 /**
  * Reserve → write-ahead `dispatching` → host.submit → settle, all under the actor lease.
  * host.submit must answer { accepted: true }, or { accepted: false, definitive: true }, or throw; anything else

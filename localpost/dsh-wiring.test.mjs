@@ -202,15 +202,15 @@ test('a malformed config object cannot enable the wiring', () => {
 
 /* ------------------------------------------------------------------ registration is one transaction */
 
-test('an enabled wiring registers the base commands, the E commands, the tools and the guard, all argument-free', t => {
+test('an enabled wiring registers the three shared commands, the E commands, the tools and the guard, all argument-free', t => {
   const host = fakeCtx();
   const { wiring, receiver } = build(t, host);
   assert.deepEqual([wiring.enabled, wiring.status], [true, WIRING_STATUS]);
   const names = host.commands.map(entry => entry.name).sort();
-  assert.deepEqual(names, [COMMANDS.bind, COMMANDS.status, COMMANDS.unbind, COMMANDS.arm, E.start, E.stop, E.status].sort());
+  assert.deepEqual(names, [COMMANDS.bind, COMMANDS.status, COMMANDS.unbind, E.start, E.stop, E.status].sort());
   for (const definition of host.commands) assert.deepEqual([definition.input, definition.recordInput], [undefined, false], definition.name);
   assert.deepEqual(host.tools.map(entry => entry.name).sort(), [...TOOL_NAMES].sort());
-  assert.equal(host.tools.some(entry => /start|dispatch|enable/.test(entry.name)), false, 'no model-callable tool may start dispatch');
+  assert.equal(host.tools.some(entry => /start|dispatch|enable/.test(entry.name)), false, 'no model-callable tool may start the isolated receiver');
   assert.equal(host.guards.length, 1);
   assert.equal(receiver.seen.construct, 1, 'the receiver is built once, before any registration');
   assert.deepEqual([receiver.seen.start, wiring.parts.receiver.status().running], [0, false], 'loading starts nothing');

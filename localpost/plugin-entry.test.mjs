@@ -17,6 +17,8 @@ watch(PRODUCTION_ROOT);
  *
  * 这里的 enabled 用例故意**只装配不启动**（autoStart: false），并对 canonical 生产根只读：装配不写盘
  * （wiring 的设计保证），因此不会碰生产数据；而那个 ReferenceError 无论 autoStart 真假都会抛，照样被抓住。
+ * 2026-10-09 起生产的 autoStart 默认开，所以这里必须**显式**写 autoStart: false —— 否则真实绑定一旦是 auto，
+ * 跑测试就会在真实信箱上起一个真 receiver（下面有用例把这一点钉住）。
  */
 const TMP = path.resolve(import.meta.dirname, '../.localpost-tmp/plugin-entry');
 
@@ -75,25 +77,24 @@ test('插件入口：启用生产接线时不抛，命令/工具/就绪日志都
     logFile,
     runtimeVersion: '0.2.0-rc.2',
     versionEvidence: 'plugin-entry-test',
-    autoReceive: { enabled: true, root: PRODUCTION_ROOT, allowFrom: 'codex', scanIntervalMs: 60000, debounceMs: 60 },
+    autoReceive: { enabled: true, root: PRODUCTION_ROOT, allowFrom: 'codex', scanIntervalMs: 60000, debounceMs: 60, autoStart: false },
   }), '入口必须能加载（抛出 = fiber 失败，连内核定时器都不跑）');
 
   const written = fs.readFileSync(logFile, 'utf8');
-  assert.deepEqual(host.commands.map(c => c.name).filter(n => n.startsWith('localpost-auto-')).sort(),
-    ['localpost-auto-arm', 'localpost-auto-start', 'localpost-auto-status', 'localpost-auto-stop']);
+  assert.deepEqual(host.commands.map(c => c.name).sort(), ['localpost-bind', 'localpost-status', 'localpost-unbind'], '只有三条共用命令');
   assert.deepEqual(host.tools.map(t => t.name).sort(),
-    ['localpost_archive', 'localpost_check', 'localpost_inbox', 'localpost_read', 'localpost_reply', 'localpost_status']);
-  assert.equal(host.intervals, 1, '未开 autoStart 时只有内核定时器');
+    ['localpost_archive', 'localpost_bind_here', 'localpost_check', 'localpost_inbox', 'localpost_read', 'localpost_reply', 'localpost_status', 'localpost_unbind']);
+  assert.equal(host.intervals, 1, '关了 autoStart 时只有内核定时器');
   assert.match(written, /生产自动收信已就绪/, '就绪日志缺失');
   assert.match(written, /插件就绪/, '插件就绪日志缺失（说明入口中途抛了）');
 });
 
-test('插件入口：配了其他身份时同样不抛、按身份注册命令；身份配置非法时拒绝装配而不是抛（多身份 T1）', async t => {
+test('插件入口：配了其他身份时同样不抛、命令仍是共用的三条；身份配置非法时拒绝装配而不是抛（多身份 T1）', async t => {
   const base = {
     root: PRODUCTION_ROOT, intervalMinutes: 999, startupDelayMs: 60000, cooldownHours: 12, ntfyEnabled: false, toastEnabled: false,
     runtimeVersion: '0.2.0-rc.2', versionEvidence: 'plugin-entry-test',
   };
-  const autoReceive = { enabled: true, root: PRODUCTION_ROOT, allowFrom: 'codex', scanIntervalMs: 60000, debounceMs: 60 };
+  const autoReceive = { enabled: true, root: PRODUCTION_ROOT, allowFrom: 'codex', scanIntervalMs: 60000, debounceMs: 60, autoStart: false };
 
   const dir = scratch(t, 'identities');
   const host = fakeCtx();
@@ -101,9 +102,7 @@ test('插件入口：配了其他身份时同样不抛、按身份注册命令�
   const mod = await import(new URL('../lib/index.js', import.meta.url).href + '?entry-test=3');
   assert.doesNotThrow(() => mod.apply(host.ctx, { ...base, stateFile: path.join(dir, 'state.json'), logFile,
     autoReceive: { ...autoReceive, identities: { engineer: { allowFrom: 'dsh' } } } }));
-  const names = host.commands.map(c => c.name);
-  for (const name of ['localpost-bind', 'localpost-auto-start', 'localpost-auto-arm', 'localpost-engineer-bind', 'localpost-engineer-auto-start', 'localpost-engineer-auto-arm', 'localpost-engineer-auto-status'])
-    assert.equal(names.includes(name), true, name);
+  assert.deepEqual(host.commands.map(c => c.name).sort(), ['localpost-bind', 'localpost-status', 'localpost-unbind'], '不再按身份生成命令');
   assert.equal(host.tools.filter(t => t.name === 'localpost_read').length, 1, '工具仍只有一套');
   assert.match(fs.readFileSync(logFile, 'utf8'), /生产自动收信已就绪：.*身份=dsh,engineer/);
 

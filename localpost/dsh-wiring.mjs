@@ -3,7 +3,7 @@ import { assertId } from './fs-safe.mjs';
 import { createSessionStore } from './session-binding.mjs';
 import { createMailbox } from './mailbox.mjs';
 import { createBindingProvider } from './binding-provider.mjs';
-import { attestedCommandCaller, COMMANDS, createDshHostBridge, SUPPORTED_VERSION } from './dsh-host-bridge.mjs';
+import { attestedCommandCaller, COMMANDS, createDshHostBridge, describeOrExplain, registerBindingCommands, statusText, SUPPORTED_VERSION } from './dsh-host-bridge.mjs';
 import { createMailTools } from './dsh-mail-tools.mjs';
 import { createLedgerAcceptance } from './ledger-acceptance.mjs';
 import { createDshAdapter } from './dsh-adapter.mjs';
@@ -23,17 +23,22 @@ import { IDENTITY_PATTERN, createChatIdentity } from './chat-identity.mjs';
  *     is refused outright, so a typo can never point automatic handling at real mail;
  *   - every input and capability is checked, and everything that can fail without side effects - the
  *     receiver included - is built, before the first registration;
- *   - the registrations (base commands, mail tools with their guard, E commands) are one transaction:
+ *   - the registrations (the three shared commands, mail tools with their guard, E commands) are one transaction:
  *     any failure releases what was registered, in reverse order, and returns a refusal;
- *   - the receiver is owned here and handed out unstarted: only the E human commands start it, so live
- *     E1-E6 stay a separately authorized step, not a side effect of loading a plugin;
+ *   - the receiver is owned here and handed out unstarted: on the isolated entry only the E human commands start it,
+ *     so live E1-E6 stay a separately authorized step, not a side effect of loading a plugin;
  *   - dispose stops the receiver and then releases every registration, even when stopping fails.
  *
  * One host can serve further identities next to its own (`config.identities`, default none; design and threat
- * analysis in docs/multi-identity.md). Each gets its own lane - mailbox, bridge, acceptance ledger, adapter, receiver
- * and argument-free human commands named after it - and its own strict sender list; the mail tools stay one set and
- * work on the identity the calling chat speaks for (chat-identity.mjs), never on one named in an argument. Without
- * further identities everything below behaves exactly as the single-identity wiring did.
+ * analysis in docs/multi-identity.md). Each gets its own lane - mailbox, bridge, acceptance ledger, adapter, receiver -
+ * and its own strict sender list. The human commands (/localpost-bind, /localpost-unbind, /localpost-status) and the
+ * mail tools are one set for the whole host and act on the identity the calling chat speaks for (chat-identity.mjs);
+ * only switching the mail chat may name an identity, because becoming its mail chat is what it does. Without further
+ * identities everything below behaves exactly as the single-identity wiring did.
+ *
+ * 2026-10-09 (user decision): the production entry has no receiver commands any more - its receivers start with an
+ * automatic binding (autoStart, on by default there) - and the mail chat is switched in plain language or with the three
+ * shared commands. The 14 per-identity commands it used to register were more than anyone could keep apart.
  *
  * Status `ready_for_live_E` means the code is ready for the live run. It is not evidence that E1-E6
  * ran, and it is not permission to enable production dispatch.
@@ -42,10 +47,9 @@ export const ISOLATED_ROOT = 'C:/AI_ASSIST/work/localpost-e-test';
 export const PRODUCTION_ROOT = 'C:/AI_ASSIST/.mailbox';
 export const WIRING_STATUS = 'ready_for_live_E';
 export const E_COMMANDS = Object.freeze({ start: 'localpost-e-start', stop: 'localpost-e-stop', status: 'localpost-e-status' });
-// 生产自动收信（2026-10-05 用户放行）：同一套装配，只有"根"与命令名不同。
+// 生产自动收信（2026-10-05 用户放行）：同一套装配，只有"根"不同；receiver 随绑定自启，没有控制命令（2026-10-09）。
 // 隔离入口拒绝生产根、生产入口拒绝隔离根——两个方向都 fail closed，永不会互相串。
 export const PRODUCTION_WIRING_STATUS = 'ready_for_live_production';
-export const AUTO_COMMANDS = Object.freeze({ start: 'localpost-auto-start', stop: 'localpost-auto-stop', status: 'localpost-auto-status' });
 
 const resolved = value => { try { return path.resolve(String(value)); } catch { return null; } };
 const samePath = (left, right) => left !== null && right !== null && left.toLowerCase() === right.toLowerCase();
@@ -70,6 +74,15 @@ export function allowFromConfig(value) {
 }
 
 /**
+ * Whether the production entry starts receivers with an automatic binding: on unless the profile row says `autoStart: false`
+ * or the environment says DSH_LOCALPOST_AUTO_START=0 (2026-10-09: the production entry has no receiver commands any more,
+ * so off by default would mean a receiver nothing can start).
+ */
+export function autoStartConfig(value, environment) {
+  return value !== false && environment !== '0';
+}
+
+/**
  * The further identities as the profile carries them: a map from identity to its own settings, for example
  * `identities: { engineer: { allowFrom: 'dsh,codex' } }`. Like allowFromConfig this only reshapes - every check is in
  * createWiring - so a malformed entry reaches validation and refuses the wiring instead of vanishing.
@@ -84,18 +97,15 @@ export function identitiesConfig(value) {
 }
 
 /**
- * The human commands of one identity. The host's own identity keeps the historical names; every further identity gets
- * the same commands with its name after the prefix (`/localpost-engineer-bind`, `/localpost-engineer-auto-start`), so a
- * command names the identity it acts for and still takes no input.
+ * The receiver commands of one identity. Only the isolated acceptance entry has them (live E1-E6 are started by hand
+ * there): the host's own identity keeps the historical names and a further identity gets its name after the prefix
+ * (`/localpost-engineer-e-start`). The production entry has none - its receivers start with an automatic binding.
  */
 export function identityCommands(kind, identity, primary = 'dsh') {
-  const actions = kind === 'production' ? AUTO_COMMANDS : E_COMMANDS;
-  if (identity === primary) return Object.freeze({ base: COMMANDS, actions });
+  if (kind === 'production') return Object.freeze({ actions: Object.freeze({}) });
+  if (identity === primary) return Object.freeze({ actions: E_COMMANDS });
   const named = name => name.replace(/^localpost-/, 'localpost-' + identity + '-');
-  return Object.freeze({
-    base: Object.freeze({ bind: named(COMMANDS.bind), status: named(COMMANDS.status), unbind: named(COMMANDS.unbind), arm: named(COMMANDS.arm) }),
-    actions: Object.freeze({ start: named(actions.start), stop: named(actions.stop), status: named(actions.status) }),
-  });
+  return Object.freeze({ actions: Object.freeze({ start: named(E_COMMANDS.start), stop: named(E_COMMANDS.stop), status: named(E_COMMANDS.status) }) });
 }
 
 /** A refusal that registered nothing and disposes nothing, so callers can treat every shape alike. */
@@ -121,8 +131,8 @@ export function createIsolatedWiring(input = {}) {
  * 生产自动收信（同一套装配，另一个根）。
  *
  * 与隔离入口互为镜像：隔离入口拒绝生产根，这里拒绝隔离根；两边都 fail closed，串不到一起。
- * 注册的能力与隔离入口相同（base 命令、5 个邮件工具 + guard、3 个控制命令），只是根换成真实
- * `.mailbox`、命令名换成 `localpost-auto-*`、状态串换成 `ready_for_live_production`。
+ * 注册的是三条共用命令 + 邮件工具（含切换收信聊天的两个）+ guard；没有 receiver 控制命令——
+ * receiver 随自动绑定自启（autoStart 在生产默认开），状态串是 `ready_for_live_production`。
  */
 export function createProductionWiring(input = {}) {
   return createWiring({ ...input, kind: 'production' });
@@ -177,8 +187,8 @@ function createWiring({ kind = 'isolated', ctx, config = {}, runtimeVersion, ver
   /*
    * Further identities (default none). Each is a name a command can carry, distinct from the primary and from every other,
    * with its own sender list checked exactly like the primary's: nothing is inherited, so the list that runs for an
-   * identity is the list written for it. Every generated command name must be unique, so no identity can take another's
-   * command (an identity called `auto` would otherwise collide with /localpost-auto-status).
+   * identity is the list written for it. Every command name must be unique, so no identity's E commands can take another
+   * command's name.
    */
   const extras = config?.identities === undefined || config?.identities === null ? [] : config.identities;
   if (!Array.isArray(extras)) return refuse('identities_invalid');
@@ -193,7 +203,7 @@ function createWiring({ kind = 'isolated', ctx, config = {}, runtimeVersion, ver
     plans.push({ identity: name, allowFrom: [...senders] });
   }
   for (const plan of plans) plan.names = identityCommands(kind, plan.identity, identity);
-  const commandNames = plans.flatMap(plan => [...Object.values(plan.names.base), ...Object.values(plan.names.actions)]);
+  const commandNames = [...Object.values(COMMANDS), ...plans.flatMap(plan => Object.values(plan.names.actions))];
   if (new Set(commandNames).size !== commandNames.length) return refuse('identity_command_conflict');
   if (plans.length > 1) decisions.push('identities_validated');
 
@@ -226,25 +236,31 @@ function createWiring({ kind = 'isolated', ctx, config = {}, runtimeVersion, ver
    * included. One session store serves all identities (it keys every document by identity); each identity gets its own
    * mailbox, bridge, acceptance ledger, adapter and receiver, so nothing in one identity's lane can act for another.
    */
-  let store, tools;
+  let store, tools, laneOf, statusFor;
   const lanes = [];
   try {
     store = createSessionStore({ root });
     for (const plan of plans) {
-      const mailbox = createMailbox({ root, identity: plan.identity });
-      const bridge = createDshHostBridge({ ctx, runtimeVersion, store, identity: plan.identity, hostId, names: plan.names.base,
-        ...(plans.length > 1 ? { admitBind: admitBindFor(plan.identity) } : {}) });
+      const lane = { identity: plan.identity, names: plan.names };
+      lane.mailbox = createMailbox({ root, identity: plan.identity });
+      // A switch to automatic routing starts the lane's receiver at once instead of at the host's next poll.
+      lane.bridge = createDshHostBridge({ ctx, runtimeVersion, store, identity: plan.identity, hostId,
+        ...(plans.length > 1 ? { admitBind: admitBindFor(plan.identity) } : {}),
+        onChange: () => { void lane.retryAutoStart?.(); } });
       const acceptance = createLedgerAcceptance({ store, identity: plan.identity });
-      const adapter = createDshAdapter({ ctx, runtimeVersion, hostId, mailboxAgent: plan.identity, acceptance,
-        bindingProvider: createBindingProvider({ store, identity: plan.identity, host: bridge }) });
-      const receiver = receiverFactory({ root, agent: plan.identity, allowFrom: [...plan.allowFrom], adapter, scanIntervalMs, debounceMs });
-      lanes.push({ identity: plan.identity, names: plan.names, mailbox, bridge, adapter, receiver });
+      lane.adapter = createDshAdapter({ ctx, runtimeVersion, hostId, mailboxAgent: plan.identity, acceptance,
+        bindingProvider: createBindingProvider({ store, identity: plan.identity, host: lane.bridge }) });
+      lane.receiver = receiverFactory({ root, agent: plan.identity, allowFrom: [...plan.allowFrom], adapter: lane.adapter, scanIntervalMs, debounceMs });
+      lanes.push(lane);
     }
     if (lanes.length > 1) chatIdentity = createChatIdentity({ store, primary: identity, identities: lanes.slice(1).map(lane => lane.identity) });
     const laneByIdentity = new Map(lanes.map(lane => [lane.identity, lane]));
+    laneOf = chatIdentity === null ? async () => lanes[0] : async caller => laneByIdentity.get(await chatIdentity.identityOf(caller));
+    // Who receives each identity's mail, with its receiver's state; the same text for /localpost-status and localpost_status.
+    statusFor = async caller => statusText(await Promise.all(lanes.map(async lane => ({ ...(await describeOrExplain(lane.bridge)), receiver: lane.control?.status() }))), caller);
     // One tool set for every identity: each call works on the lane of the identity the attested caller speaks for.
-    tools = createMailTools({ ctx, mailbox: lanes[0].mailbox, store, identity, runtimeVersion, hostId,
-      ...(chatIdentity === null ? {} : { resolve: async caller => laneByIdentity.get(await chatIdentity.identityOf(caller)) }) });
+    tools = createMailTools({ ctx, mailbox: lanes[0].mailbox, store, identity, runtimeVersion, hostId, bridge: lanes[0].bridge, lanes, status: statusFor,
+      ...(chatIdentity === null ? {} : { resolve: laneOf }) });
   } catch (error) {
     return refuse('build_failed', errorText(error));
   }
@@ -330,11 +346,12 @@ function createWiring({ kind = 'isolated', ctx, config = {}, runtimeVersion, ver
   for (const lane of lanes) Object.assign(lane, controlFor(lane));
 
   /*
-   * The E entry points are human commands: no model-callable tool can start automatic dispatch. Each one first proves
-   * that the definition the host resolves for this very agent is the one registered here (a scoped command can shadow a
-   * global one), then that the host attests the caller. Start needs the lane's bound chat under an active, automatic
-   * binding; stop and status are open to that bound chat in any binding state and to the chat that started the lane's
-   * running receiver, so a receiver can always be stopped - and unloading the plugin stops every lane in any case.
+   * The E entry points (isolated acceptance only) are human commands: no model-callable tool can start the isolated
+   * receiver. Each one first proves that the definition the host resolves for this very agent is the one registered here
+   * (a scoped command can shadow a global one), then that the host attests the caller. Start needs the lane's bound chat
+   * under an active, automatic binding; stop and status are open to that bound chat in any binding state and to the chat
+   * that started the lane's running receiver, so a receiver can always be stopped - and unloading the plugin stops every
+   * lane in any case.
    */
   const handlers = new Map();
   const effectiveIsOurs = (name, invocation) => {
@@ -362,7 +379,7 @@ function createWiring({ kind = 'isolated', ctx, config = {}, runtimeVersion, ver
     handlers.set(name, handler);
     return { name, description, recordInput: false, handler };
   };
-  const actionDefinitions = lanes.flatMap(lane => {
+  const actionDefinitions = isProduction ? [] : lanes.flatMap(lane => {
     const { actions } = lane.names;
     const whose = lane.identity === identity ? '' : ' ' + lane.identity + ' 的';
     const mayControl = mayControlFor(lane);
@@ -376,17 +393,17 @@ function createWiring({ kind = 'isolated', ctx, config = {}, runtimeVersion, ver
     ];
   });
 
-  // One transaction: every lane's base commands, the mail tools with their guard, then every lane's E commands. Any
+  // One transaction: the three shared commands, the mail tools with their guard, then every lane's E commands. Any
   // failure releases everything registered so far, in reverse order, and the caller gets a refusal instead of a
   // half-registered wiring.
   const disposers = [];
   const release = () => { for (const dispose of disposers.splice(0).reverse()) { try { dispose(); } catch { /* release is best effort */ } } };
   try {
-    for (const lane of lanes) {
-      const commands = lane.bridge.registerCommands();
-      if (commands.ok !== true) { release(); return refuse('commands_' + String(commands.reason ?? 'refused'), commands.name); }
-      disposers.push(commands.dispose);
-    }
+    // A host that cannot attest a chat gets no command at all (every lane shares this host, so the first one decides).
+    const commands = lanes[0].bridge.capabilities.chatBinding !== true ? { ok: false, reason: 'host_cannot_attest' }
+      : registerBindingCommands({ ctx, hostId, resolve: async caller => (await laneOf(caller)).bridge, status: statusFor });
+    if (commands.ok !== true) { release(); return refuse('commands_' + String(commands.reason ?? 'refused'), commands.name); }
+    disposers.push(commands.dispose);
     const registered = tools.register();
     if (registered.ok !== true) { release(); return refuse('tools_' + String(registered.reason ?? 'refused'), registered.name); }
     disposers.push(registered.dispose);
@@ -401,12 +418,12 @@ function createWiring({ kind = 'isolated', ctx, config = {}, runtimeVersion, ver
   decisions.push('commands_registered', 'tools_registered', 'e_commands_registered');
 
   /*
-   * 可选的"绑定后自启"（config.autoStart，配置层的人工开关）：每个身份各读一次自己的绑定状态，只有已存在
-   * active + auto 的绑定时才启动该身份的 receiver。目的：让"重启后仍然自动收信"成立，把人工步骤压到只剩一次
-   * 绑定；模型侧依然没有任何 start/stop 工具，start 仍只由人类命令或本开关触发。
+   * "绑定后自启"（config.autoStart）：每个身份各读一次自己的绑定状态，只有已存在 active + auto 的绑定时才启动该身份的
+   * receiver。目的：让"重启后仍然自动收信"成立，人工步骤只剩一次绑定。生产入口默认开（没有 receiver 命令了，
+   * 写 autoStart: false 才关）；隔离入口默认关（E 命令手动启动）。
    *
-   * 绑定通常发生在装配**之后**（用户那一刻才敲绑定命令），所以这里除了首次尝试，还对外暴露每个身份的
-   * retryAutoStart()：宿主用 ctx.setInterval 定期调用它，绑上即自启。首次成功返回 'started'，
+   * 绑定通常发生在装配**之后**，所以这里除了首次尝试，还对外暴露每个身份的 retryAutoStart()：宿主用
+   * ctx.setInterval 定期调用它，桥在绑定/恢复/接管成功后也立即调一次（onChange）。首次成功返回 'started'，
    * 之后返回 'already_running'（宿主据此只记一条日志，不刷屏）。
    */
   const autoStartFor = lane => {
@@ -427,7 +444,7 @@ function createWiring({ kind = 'isolated', ctx, config = {}, runtimeVersion, ver
       }
     };
   };
-  const autoStartOn = config?.autoStart === true;
+  const autoStartOn = isProduction ? config?.autoStart !== false : config?.autoStart === true;
   if (autoStartOn) decisions.push('auto_start_scheduled');
   for (const lane of lanes) {
     lane.retryAutoStart = autoStartOn ? autoStartFor(lane) : async () => 'disabled';
@@ -465,13 +482,15 @@ function createWiring({ kind = 'isolated', ctx, config = {}, runtimeVersion, ver
       capabilities: Object.freeze({ ...tools.capabilities(), adapter: primary.adapter.capabilities }),
       diagnostics: () => primary.adapter.diagnostics(),
       versionEvidence,
-      /** The host identity's receiver, handed out unstarted; it is started from the control commands only. */
+      /** The three human commands, shared by every identity (dsh-host-bridge.mjs). */
+      commands: COMMANDS,
+      /** The host identity's receiver, handed out unstarted: production starts it with an automatic binding, isolated E by hand. */
       receiver: primary.control,
-      /** 'disabled' | 'skipped_unbound' | 'started' | 'already_running' | 'failed: …' —— 配置了 autoStart 时才有意义。 */
+      /** 'disabled' | 'skipped_unbound' | 'started' | 'already_running' | 'failed: …' —— autoStart 关着时恒为 'disabled'。 */
       autoStart: primary.autoStart,
-      /** 宿主定期调用：绑定出现后自动启动 receiver（未配置 autoStart 时恒为 'disabled'）。 */
+      /** 宿主定期调用：绑定出现后自动启动 receiver（autoStart 关着时恒为 'disabled'）。 */
       retryAutoStart: primary.retryAutoStart,
-      /** Every identity's lane, the host's own first: its command names, receiver control and auto-start, as above. */
+      /** Every identity's lane, the host's own first: its E command names (isolated only), receiver control and auto-start. */
       identities: Object.freeze(Object.fromEntries(lanes.map(lane => [lane.identity, Object.freeze({
         identity: lane.identity, commands: lane.names, receiver: lane.control, autoStart: lane.autoStart, retryAutoStart: lane.retryAutoStart,
       })]))),

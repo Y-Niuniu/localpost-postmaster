@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { watch, writesUnder } from './fixtures/production-write-witness.mjs';
-import { AUTO_COMMANDS, ISOLATED_ROOT, PRODUCTION_ROOT, PRODUCTION_WIRING_STATUS, createProductionWiring } from './dsh-wiring.mjs';
+import { ISOLATED_ROOT, PRODUCTION_ROOT, PRODUCTION_WIRING_STATUS, autoStartConfig, createProductionWiring } from './dsh-wiring.mjs';
 import { SUPPORTED_VERSION } from './dsh-host-bridge.mjs';
 import { TOOL_NAMES } from './dsh-mail-tools.mjs';
 import { COMMANDS } from './dsh-host-bridge.mjs';
@@ -131,7 +131,7 @@ test('运行时版本与版本证据同样是硬门禁', () => {
 
 /* ------------------------------------------------------------------ 正常装配 */
 
-test('启用后在传入的生产根上装配：3 个 auto 命令 + 邮件工具 + guard，receiver 已建但未启动', t => {
+test('启用后在传入的生产根上装配：只有 3 条共用命令 + 邮件工具 + guard，receiver 已建但未启动', t => {
   const host = fakeCtx();
   const receiver = fakeReceiver();
   const root = rootFor(t);
@@ -141,9 +141,8 @@ test('启用后在传入的生产根上装配：3 个 auto 命令 + 邮件工具
   assert.equal(wiring.status, PRODUCTION_WIRING_STATUS);
   assert.equal(wiring.parts.kind, 'production');
   assert.equal(wiring.parts.root, path.resolve(root));
-  assert.deepEqual(Object.values(AUTO_COMMANDS).every(name => host.commands.some(entry => entry.name === name)), true);
-  assert.deepEqual(COMMANDS ? true : true, true);
-  for (const name of Object.values(AUTO_COMMANDS)) assert.equal(host.commands.filter(entry => entry.name === name).length, 1, name);
+  assert.deepEqual(host.commands.map(entry => entry.name).sort(), Object.values(COMMANDS).sort(), '没有 receiver 启停命令，也没有 auto-arm');
+  assert.deepEqual(wiring.parts.commands, COMMANDS);
   assert.equal(host.tools.length, TOOL_NAMES.length);
   assert.equal(host.guards.length, 1);
   assert.equal(receiver.seen.construct, 1);
@@ -162,7 +161,7 @@ test('启用后在传入的生产根上装配：3 个 auto 命令 + 邮件工具
   });
 });
 
-test('控制命令可启动/停止 receiver（人类命令路径）', async t => {
+test('receiver 控制对象可启动/停止（自启与卸载走的就是它）', async t => {
   const host = fakeCtx();
   const receiver = fakeReceiver();
   const root = rootFor(t);
@@ -179,12 +178,12 @@ test('控制命令可启动/停止 receiver（人类命令路径）', async t =>
 
 test('命令名被占用时拒绝装配（与隔离入口同名工具/命令互斥）', () => {
   const host = fakeCtx();
-  host.commands.push({ name: AUTO_COMMANDS.start, handler: () => ({}) });
+  host.commands.push({ name: COMMANDS.bind, handler: () => ({}) });
   const receiver = fakeReceiver();
-  const root = rootFor.root ?? PRODUCTION_ROOT;
   const wiring = attempt(host, { config: { enabled: true, root: PRODUCTION_ROOT, allowFrom: ['codex'] }, receiver });
-  assert.deepEqual([wiring.enabled, wiring.reason], [false, 'e_command_name_taken']);
+  assert.deepEqual([wiring.enabled, wiring.reason, wiring.detail], [false, 'commands_command_name_taken', COMMANDS.bind]);
   assert.equal(host.tools.length, 0);
+  assert.deepEqual(host.commands.map(entry => entry.name), [COMMANDS.bind], '只剩原来占名的那一条');
 });
 
 /* ------------------------------------------------------------------ 绑定后自启 */
@@ -225,6 +224,23 @@ test('autoStart：已有 active+auto 绑定时装配即自启；未绑定时跳�
   assert.equal(receiver.seen.start, 1);
   assert.equal(wiring.parts.receiver.status().running, true);
   await wiring.dispose();
+});
+
+test('插件配置里的 autoStart：默认开，只有 false 或环境变量 0 才关', () => {
+  assert.deepEqual([autoStartConfig(undefined, undefined), autoStartConfig(true, undefined), autoStartConfig('yes', undefined)], [true, true, true]);
+  assert.deepEqual([autoStartConfig(false, undefined), autoStartConfig(undefined, '0'), autoStartConfig(true, '0')], [false, false, false]);
+  assert.equal(autoStartConfig(undefined, '1'), true);
+});
+
+test('生产的 autoStart 默认开（没有启停命令了）；明确写 false 才关', async t => {
+  for (const [autoStart, expected] of [[undefined, 'skipped_unbound'], [true, 'skipped_unbound'], [false, 'disabled']]) {
+    const root = rootFor(t);
+    const wiring = attempt(fakeCtx(), { config: { enabled: true, root, allowFrom: ['codex'], ...(autoStart === undefined ? {} : { autoStart }) },
+      receiver: fakeReceiver(), productionRoot: root });
+    assert.equal(await wiring.parts.autoStart, expected, String(autoStart));
+    assert.equal(wiring.decisions.includes('auto_start_scheduled'), autoStart !== false, String(autoStart));
+    await wiring.dispose();
+  }
 });
 
 /* ------------------------------------------------------------------ 生产零接触 */
