@@ -419,8 +419,10 @@ test('端到端：dsh 投给 engineer 的信只唤醒 engineer 的聊天一次�
   const e = chat(host, 'chat-E');
   assert.equal((await run(host, COMMANDS.bind, a)).kind, 'success');
   assert.match(await bindAs(host, e, 'engineer'), /现在是 engineer/);
-  // 两个 receiver 随绑定自启；start() 等首轮扫描结束才算 running，之后手动扫描不会撞上它。
+  // 两个 receiver 随绑定自启（start() 等首轮扫描结束才算 running）。两个身份同时自启时，首轮扫描会争同一把
+  // 投递写锁，没抢到的那个首轮被跳过、还没记基线 —— 所以投信前各扫一次，把基线定在"空信箱"上。
   await until(() => wiring.parts.identities.dsh.receiver.status().running && wiring.parts.identities.engineer.receiver.status().running, 'both receivers');
+  for (const identity of ['dsh', 'engineer']) assert.equal((await instances.get(identity).scan()).agent, identity, identity + ' 的基线已记下');
 
   await deliver(root, 'dsh', { id: 'eng-task-1', to: 'engineer' });
   await deliver(root, 'codex', { id: 'eng-task-2', to: 'engineer' });   // codex 不在 engineer 的白名单里

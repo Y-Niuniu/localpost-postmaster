@@ -5,7 +5,7 @@ import path from 'node:path';
 import { createSessionStore, bind, bindingIdentity } from './session-binding.mjs';
 import {
   reserve, reserveIn, beginDispatch, beginDispatchIn, settle, settleIn, dispatchLetter, claimManual, complete,
-  resolveUncertain, requestMode, requestModeIn, switchMode, recoverClaims, occupancy, rotationDue,
+  resolveUncertain, requestMode, requestModeIn, switchMode, recoverClaims, occupancy, rotationDue, takeOverIn,
 } from './letter-claims.mjs';
 import { auditState } from './rotation.mjs';
 import { envelopeDigest } from './mailbox.mjs';
@@ -207,4 +207,83 @@ test('a mode switch for a proven binding identity switches that binding or nothi
   const state = { binding: { ...binding }, rotations: {}, claims: {} };
   assert.equal(requestModeIn(state, 'manual', { expectedBinding: proven }, at).ok, true, 'the proven binding itself is switched');
   assert.deepEqual([state.binding.state, state.binding.frozen.mode], ['frozen', 'manual']);
+});
+
+/* ------------------------------------------------------------------ takeover (2026-10-09): moving the mail to another chat */
+
+const TAKEOVER_AT = '2026-10-09T00:00:00.000Z';
+const takeoverState = (overrides = {}) => ({
+  binding: { version: 3, generation: 1, session: { host: 'local', id: 'chat-A', cwd: 'C:/work/A' }, since: '2026-10-06T00:00:00.000Z',
+    attestation: { kind: 'chat-action', actionId: 'a1' }, mode: 'manual', state: 'active', frozen: null, capacity: 50,
+    authority: { scope: 'analysis-reply', source: 'policy:test' }, source: 'chat-action:a1', ...overrides },
+  claims: {}, rotations: {}, context: { samples: 1 },
+});
+const takeoverRequest = (state, extra = {}) => ({
+  session: { host: 'local', id: 'chat-B', cwd: 'C:/work/B' }, attestation: { actionId: 'b1', hostId: 'local', threadId: 'chat-B', cwd: 'C:/work/B' },
+  source: 'chat-action:b1', authority: { scope: 'analysis-reply', source: 'policy:user-request-in-chat' },
+  expectedBinding: bindingIdentity(state.binding), ...extra,
+});
+
+test('takeover replaces the binding with a fresh attested one for the new chat and remembers the one it replaced', () => {
+  const state = takeoverState();
+  const result = takeOverIn(state, takeoverRequest(state), TAKEOVER_AT);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.previous, { session: { host: 'local', id: 'chat-A', cwd: 'C:/work/A' }, since: '2026-10-06T00:00:00.000Z', attestation: 'a1' });
+  const { binding } = state;
+  assert.deepEqual([binding.version, binding.generation, binding.mode, binding.state, binding.frozen], [4, 1, 'auto', 'active', null]);
+  assert.deepEqual(binding.session, { host: 'local', id: 'chat-B', cwd: 'C:/work/B' });
+  assert.deepEqual(binding.attestation, { kind: 'chat-action', actionId: 'b1', hostId: 'local', threadId: 'chat-B', cwd: 'C:/work/B', at: TAKEOVER_AT });
+  assert.deepEqual([binding.since, binding.source, binding.capacity, binding.authority.source], [TAKEOVER_AT, 'chat-action:b1', 50, 'policy:user-request-in-chat']);
+  assert.deepEqual(binding.replaced, [{ ...result.previous, until: TAKEOVER_AT }]);
+  assert.deepEqual([state.rotations, state.context], [{}, null], 'the old chat\'s rotation journals and context samples do not carry over');
+  // A second takeover keeps the whole chain, so mail from either replaced binding still follows.
+  takeOverIn(state, takeoverRequest(state, { session: { host: 'local', id: 'chat-C', cwd: 'C:/work/C' }, attestation: { actionId: 'c1', hostId: 'local', threadId: 'chat-C', cwd: 'C:/work/C' }, source: 'chat-action:c1' }), TAKEOVER_AT);
+  assert.deepEqual(state.binding.replaced.map(entry => entry.attestation), ['a1', 'b1']);
+});
+
+test('takeover changes nothing when the binding moved since the caller looked, or a rotation is under way', () => {
+  for (const [label, overrides, rotations, reason] of [
+    ['another chat bound afresh at the same version (ABA)', { since: '2026-10-08T00:00:00.000Z', attestation: { kind: 'chat-action', actionId: 'a2' } }, {}, 'binding_conflict'],
+    ['the binding was switched since', { version: 5 }, {}, 'binding_conflict'],
+    ['a rotation freeze', { state: 'frozen', frozen: { for: 'rotation', at: TAKEOVER_AT } }, {}, 'rotation_in_progress'],
+    ['an unfinished rotation journal', {}, { 1: { generation: 1, state: 'drained', from: { host: 'local', id: 'chat-A' }, history: [] } }, 'rotation_in_progress'],
+  ]) {
+    const seen = takeoverState();
+    const state = takeoverState(overrides);
+    state.rotations = rotations;
+    const before = structuredClone(state);
+    const request = takeoverRequest(seen);
+    assert.deepEqual(takeOverIn(state, request, TAKEOVER_AT), { ok: false, reason }, label);
+    assert.deepEqual(state, before, 'zero change: ' + label);
+  }
+  // A pending mode switch is no obstacle: the new binding is automatic anyway.
+  const pending = takeoverState({ state: 'frozen', frozen: { for: 'mode', mode: 'auto', at: TAKEOVER_AT } });
+  assert.equal(takeOverIn(pending, takeoverRequest(pending), TAKEOVER_AT).ok, true);
+  assert.deepEqual([pending.binding.state, pending.binding.frozen, pending.binding.mode], ['active', null, 'auto']);
+});
+
+test('takeover: letters the old chat may still be working on block it; forced, they are the new chat\'s, settled history is dropped', () => {
+  const claim = (letter, status) => ({ letter, digest: 'b'.repeat(64), version: 2, transfers: 0, attempts: 1, history: [], status,
+    owner: { generation: 1, session: 'chat-A' }, completion: status === 'completing' ? { op: 'reply' } : undefined });
+  const fill = state => {
+    for (const [id, status] of [['l-dispatching', 'dispatching'], ['l-accepted', 'accepted'], ['l-completing', 'completing'], ['l-uncertain', 'needs_reconcile'],
+      ['l-done', 'done'], ['l-released', 'released'], ['l-reserved', 'reserved']]) state.claims[id] = claim(id, status);
+    return state;
+  };
+  const blocked = fill(takeoverState());
+  const before = structuredClone(blocked);
+  const refused = takeOverIn(blocked, takeoverRequest(blocked), TAKEOVER_AT);
+  assert.deepEqual([refused.ok, refused.reason, [...refused.letters].sort()], [false, 'unfinished_letters', ['l-accepted', 'l-completing', 'l-dispatching', 'l-uncertain']]);
+  assert.deepEqual(blocked, before, 'zero change while unfinished letters block it');
+
+  const forced = fill(takeoverState());
+  const moved = takeOverIn(forced, takeoverRequest(forced, { force: true }), TAKEOVER_AT);
+  assert.deepEqual([...moved.moved].sort(), ['l-accepted', 'l-completing', 'l-dispatching', 'l-uncertain']);
+  assert.deepEqual(Object.keys(forced.claims).sort(), ['l-accepted', 'l-completing', 'l-dispatching', 'l-uncertain'], 'done, released and stray reservations are dropped');
+  for (const entry of Object.values(forced.claims)) {
+    assert.deepEqual([entry.status, entry.owner, entry.taken_over_from, entry.transfers, entry.version, entry.reason],
+      ['accepted', { generation: 1, session: 'chat-B' }, { generation: 1, session: 'chat-A' }, 1, 3, 'taken_over'], entry.letter);
+    assert.equal(Object.hasOwn(entry, 'completion'), false, 'the old chat\'s completion intent does not bind the new chat');
+    assert.deepEqual(entry.history.at(-1), { status: 'accepted', generation: 1, at: TAKEOVER_AT });
+  }
 });

@@ -75,4 +75,6 @@ Copy-Item integrations\bridges\codex\hooks.json "$env:USERPROFILE\.codex\hooks.j
 
 - 桥只做"唤醒"，**信 ≠ 授权**：信里写的事是否执行仍由收件方按 `.mailbox/README.md` 与用户授权决定。
 - 会话绑定（Antigravity 的 conversationId、claude/codex 的 hook 目标）**只有人能改**，模型不改。
+  （DSH 自己的收信聊天 2026-10-09 起可以用自然语言切换——只能切到说话的那个聊天，见 `docs/production-auto-receive.md`；
+  这三个外部桥的同类开关是下一步，用户已提出要做。）
 - 生产内核（`.mailbox/*.mjs`）是本仓库 `localpost/` 的部署副本，部署需用户明确确认，并留备份 + A/B 只读比对。

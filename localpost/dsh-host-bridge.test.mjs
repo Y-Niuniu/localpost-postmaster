@@ -235,6 +235,88 @@ test('letters the old chat has not finished stop the move until the user forces 
   }
 });
 
+/**
+ * A store whose read number `swap.at` runs `swap.run` - after taking its snapshot (the caller then acts on a stale copy), or
+ * with `swap.before` ahead of it (the caller sees the change): a deterministic "something changed in between".
+ */
+function racingStore(real) {
+  const control = { swap: null, reads: 0 };
+  const store = { ...real, read: async identity => {
+    control.reads += 1;
+    const due = control.swap && control.swap.at === control.reads ? control.swap : null;
+    if (due) control.swap = null;
+    if (due?.before) await due.run();
+    const snapshot = await real.read(identity);
+    if (due && !due.before) await due.run();
+    return snapshot;
+  } };
+  return { store, control };
+}
+
+test('a move that races another move is read again: it takes over from the chat that holds the mail now, and says so', async () => {
+  const root = await scratch('takeover-race');
+  const real = createSessionStore({ root, waitMs: 500 });
+  const { store, control } = racingStore(real);
+  const host = fakeHost();
+  const bridge = createDshHostBridge({ ctx: host.ctx, runtimeVersion: '0.2.0-rc.2', store, identity: 'dsh', ...QUICK });
+  bridge.registerCommands();
+  await find(host.definitions, COMMANDS.bind).handler({ agent: chatAgent('chat-A', 'C:/work/A') });
+  // C reads A's binding; before C writes, B takes the mail over.
+  control.swap = { at: control.reads + 1, run: async () => {
+    const moved = await bridge.bindHere({ host: 'local', session: 'chat-B', cwd: 'C:/work/B' });
+    assert.equal(moved.ok, true);
+  } };
+  const answer = await find(host.definitions, COMMANDS.bind).handler({ agent: chatAgent('chat-C', 'C:/work/C') });
+  assert.equal(answer.kind, 'success', answer.text);
+  assert.match(answer.text, /从聊天 chat-B 切到/, 'it names the chat it really took the mail from: ' + answer.text);
+  const { binding } = await real.read('dsh');
+  assert.equal(binding.session.id, 'chat-C');
+  assert.deepEqual(binding.replaced.map(entry => entry.session.id), ['chat-A', 'chat-B']);
+});
+
+test('a switch that cannot be confirmed against the store afterwards is not reported as done', async () => {
+  const root = await scratch('takeover-unconfirmed');
+  const real = createSessionStore({ root, waitMs: 500 });
+  const { store, control } = racingStore(real);
+  const host = fakeHost();
+  const changes = [];
+  const bridge = createDshHostBridge({ ctx: host.ctx, runtimeVersion: '0.2.0-rc.2', store, identity: 'dsh', ...QUICK, onChange: identity => changes.push(identity) });
+  bridge.registerCommands();
+  await find(host.definitions, COMMANDS.bind).handler({ agent: chatAgent('chat-A', 'C:/work/A') });
+  changes.length = 0;
+  // B's move lands (read 1 is B's look, the write goes through the store's own lock); before the confirming read 2, the mail
+  // is paused elsewhere.
+  control.swap = { at: control.reads + 2, before: true, run: () => real.update('dsh', state => { state.binding.mode = 'manual'; state.binding.version += 1; }) };
+  const answer = await find(host.definitions, COMMANDS.bind).handler({ agent: chatAgent('chat-B', 'C:/work/B') });
+  assert.equal(answer.kind, 'error');
+  assert.match(answer.text, /核对不上/);
+  assert.deepEqual(changes, [], 'an unconfirmed switch does not start a receiver');
+});
+
+test('a shadowed shared command refuses and changes nothing', async () => {
+  const definitions = [];
+  const shadowFor = chatAgent('chat-S', 'C:/work/S');
+  const ctx = {
+    agents: { get: id => live.get(id) },
+    commands: {
+      register: definition => { definitions.push(definition); return () => {}; },
+      // Like the real host: a scoped definition for one agent shadows the global one.
+      find: (agent, name) => (agent === shadowFor ? { name, handler: async () => ({ kind: 'success', text: 'shadow' }) } : definitions.find(entry => entry.name === name)),
+    },
+  };
+  const root = await scratch('shadow');
+  const store = createSessionStore({ root, waitMs: 500 });
+  const bridge = createDshHostBridge({ ctx, runtimeVersion: '0.2.0-rc.2', store, identity: 'dsh', ...QUICK });
+  assert.equal(bridge.registerCommands().ok, true);
+  for (const name of Object.values(COMMANDS)) {
+    const answer = await find(definitions, name).handler({ agent: shadowFor });
+    assert.equal(answer.kind, 'error', name);
+    assert.match(answer.text, /遮蔽/, name);
+  }
+  assert.equal(await store.read('dsh'), null, 'nothing was bound');
+  assert.equal((await find(definitions, COMMANDS.bind).handler({ agent: chatAgent('chat-T', 'C:/work/T') })).kind, 'success', 'other chats are served');
+});
+
 test('a move waits for a dispatch in flight instead of asking the human to try again', async () => {
   const { root, bridge, host, store } = await bridgeFor('takeover-busy', { extra: { busyRetries: 100, busyPauseMs: 10 } });
   bridge.registerCommands();

@@ -2,6 +2,16 @@
 
 2026-10-05 · T1（交接信 `dsh-20261005-handoff-auto-receive-to-claude-001`，用户当面授权）· base `24eb33b`
 
+> **2026-10-09 变更（用户决定，分支 `agent/claude-nl-bind`）**——下文 10-05 的设计里，以下几处已改：
+> - **命令不再按身份生成**：全宿主共用 `/localpost-bind`、`/localpost-unbind`、`/localpost-status`，作用于调用聊天所代表的身份
+>   （没代表任何身份时是 dsh）；`-auto-arm` 和生产的 `-auto-start|stop|status` 全部删除（生产 receiver 随自动绑定自启）。原来 2 个身份就有 14 条命令。
+> - **模型可以切换收信聊天**：新增 `localpost_bind_here`、`localpost_unbind`。它们是**唯一**可以点名身份的工具（成为某身份的收信聊天，就是它们的用途），
+>   而且只能绑**调用者自己的聊天**（绑定动作由桥在这次调用里铸造，宿主证明调用者）；"一个聊天只代表一个身份"照旧由 `admitBind` 串行判定。
+>   信件工具（inbox/read/reply/archive）仍然没有身份参数。`localpost_status` 任何已证明的聊天都能问，列出所有身份。
+> - **可以换聊天了**：在别的聊天绑定 = 接管（`letter-claims.mjs` `takeOverIn`），不再报 "T1 cannot move a binding between chats"。
+>   被接管的旧聊天不再被任何身份点名，所以"解绑不释放身份"的问题也随之解决：把这个身份的收信切到别的聊天即可。
+> - 威胁表第 2、6、7 行据此更新（见表下注）。
+
 ## 问题
 
 生产自动收信只认一个身份：`identity` 固定 `dsh`，工具名、命令名在宿主里全局唯一，所以一个 DSH 宿主只能有一个"信到就自动醒"的聊天。
@@ -59,13 +69,19 @@ autoReceive:
 | 7 | 用身份名劫持命令 | 生成的命令名必须全局唯一 | `identity_command_conflict` |
 | 8 | 根判定 | 未改动 | `production-wiring` / `dsh-wiring` 原有用例全绿 |
 
+> **2026-10-09 注**：第 2 行改为"模型只能在用户本人在该聊天里直接要求时，把**调用者自己的聊天**绑成某身份的收信聊天；
+> 不能指定别的聊天，也没有 receiver 启停工具"（证据：`dsh-mail-tools.test.mjs` 切换工具三例、`multi-identity.test.mjs`
+> "只有切换工具能点名身份"）。第 6 行：生产没有按身份的启停命令了，receiver 随各自身份的自动绑定自启（"自启按身份各管各的"两例）。
+> 第 7 行：命令不再由身份名生成，只剩隔离入口的 E 命令按身份命名，唯一性检查保留。
+
 **依赖的既有前提**（不是本次新引入的）：宿主命令只能由人在界面里执行。`CommandRuntime.execute` 是 UI 侧的远程入口，执行记录写的是 `source: { kind: 'user' }`（`work/b-host-guard-evidence/host-commands.js:327-339`）。
 
 ## 已知边界（不在本次范围）
 
 - **LocalPost 工具的边界不等于文件系统的边界。** 如果 DSH 聊天带有通用文件工具，沙箱又允许读 `.mailbox`，模型就能绕过 LocalPost 工具，直接读别的身份的信封文件。这一层归 `dsh-sandbox-policy` 管，插件单方面封不住。
 - **信封里的 `from` 不是认证。** 任何能写 `.mailbox` 的进程都能自称任何发件人，所以 allowFrom 只是策略过滤，不是身份认证（这是既有性质）。防注入靠的是 analysis-reply 授权范围，以及"信件内容是不可信数据"这条规则。
-- **解绑不释放身份。** `/localpost-<id>-unbind` 只把模式切到 manual，绑定记录仍点名该聊天，所以该聊天仍然代表这个身份。要把它"还给" dsh，需要运维清掉绑定记录（与原有"T1 不在聊天之间迁移绑定"的约定一致）。
+- **解绑不释放身份。** `/localpost-unbind` 只把模式切到 manual，绑定记录仍点名该聊天，所以该聊天仍然代表这个身份。
+  ~~要把它"还给" dsh，需要运维清掉绑定记录~~（2026-10-09 起：在别的聊天把这个身份的收信切过去即可，被接管的旧聊天不再被点名）。
 - **不要给外部客户端也在用的身份配 DSH 绑定。** 例如把 DSH 聊天绑成 `codex`，就会出现两个消费者。记账会让已被自动认领的信拒绝手动读取，所以不会重复处理，但这仍是配置错误。只给"只由 DSH 聊天消费"的身份配置。
 - 外部客户端（Codex / Claude Code / Antigravity＝`gemini`）的唤醒不在 T1 内，见 T2 调研结论 `docs/external-client-wake-survey.md`。
 
