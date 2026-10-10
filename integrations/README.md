@@ -25,7 +25,7 @@
 
 | 桥 | 仓库副本 | 生产位置 | 唤醒机制 |
 |---|---|---|---|
-| **gemini / Antigravity** | `bridges/gemini/{wake.mjs,config.json,sidecar.json}` | `~/.gemini/config/sidecars/localpost-gemini-wake/`（宿主 `builtin: schedule`，每分钟一次） | `agentapi send-message <人工指定的会话id> <提示>`；状态语义：baseline/skip/sent/dryRun/failed/**indeterminate 挂起**/exhausted |
+| **gemini / Antigravity** | `bridges/gemini/{wake.mjs,config.json,sidecar.json}` | `~/.gemini/config/sidecars/localpost-gemini-wake/`（宿主 `builtin: schedule`，每分钟一次） | `agentapi send-message <收信会话id> <提示>`；状态语义：baseline/skip/sent/dryRun/failed/**indeterminate 挂起**/exhausted。**孤儿调度**（2026-10-10）：Antigravity 每次重启都留下一个旧 `schedule` 进程，指向已不存在的语言服务；每轮先 TCP 探一下 `ANTIGRAVITY_LS_ADDRESS`，明确被拒就什么都不改地退出（不占次数），同一地址连续 3 轮、跨 2 分钟被拒就结束自己的 `schedule` 进程；发送时"连不上语言服务"也不占次数（另有 `maxTransportFailures`，默认 60） |
 | **claude** | `bridges/claude/{claude-check.mjs,claude-wake.mjs,config.json}` | `~/.claude/localpost-wake/`；hooks 在 `~/.claude/settings.json` | `Stop`+`asyncRewake`（exit 2 唤醒）+ `UserPromptSubmit`（注入事实）+ 后台守望（`claude-wake.mjs`，原子排他锁、PID 存活优先、续租、失锁即停） |
 | **codex** | `bridges/codex/{codex-check.mjs,config.json,codex-hook.cmd,hooks.json}` | `~/.codex/localpost-wake/`；hook 在 `~/.codex/hooks.json` | `Stop` hook → `{decision:'block',reason}` 让 codex 继续处理；`.cmd` 包装（**纯 ASCII**，先留 launched 痕迹再调绝对路径 node） |
 
@@ -79,13 +79,15 @@ Copy-Item integrations\bridges\shared\*.mjs "$env:USERPROFILE\.gemini\config\sid
 | `verification/test-gpt-review-fixes.mjs` | GPT 两轮 8 反例 + 结构化解包三条 + 身份 fail-closed | 21/21 |
 | `verification/test-checkers-gates.mjs` | 两个 checker × 四道闸门 + 终态优先 + 冷却恢复 | 14/14 |
 | `verification/test-gemini-wake-state.mjs` | 状态机 + **调用次数断言**（成功恰好 1 次 / 上限 3 次 / 其余 0 次） | 9/9 |
+| `verification/test-gemini-orphan.mjs` | 孤儿调度：被拒只退出不占次数、退场的两个条件（次数 + 时间）各缺一不可、连得上永不退场、传输失败不占次数及上限、看不懂的地址照旧 | 12/12 |
 | `verification/test-claude-wake-lock.mjs` | 活守望不接管、死持有者接管、退出不删他人锁 | 3/3 |
 | `verification/test-mailbox-mcp-reply.mjs` | 回执收敛内核 + 身份 + stdin 收口 + 非法 outcome | 9/9 |
 | `verification/test-codex-check.mjs` | codex checker 基础判据 | 4/4 |
 | `verification/test-wake-binding.mjs` | 收信聊天开关：判定表、三家 `here/off/status`、四个桥遵守绑定、claude 守望接管与退让、gemini 会话优先级 | 29/29 |
 | `verification/smoke-mcp-production.mjs` | 生产信箱**只读**冒烟（**需 `LOCALPOST_SMOKE_PRODUCTION=1` 显式开启**） | 5/5 |
 
-合计 **89/89**（不含生产 smoke）/ **94/94**（含）；内核本体另见 `node scripts/test.mjs`（403/403 + legacy 45/45）。
+合计 **101/101**（不含生产 smoke）/ **106/106**（含）；内核本体另见 `node scripts/test.mjs`（403/403 + legacy 45/45）。
+`test-gemini-orphan.mjs` 的 10 个变异全部被抓到；退场用例都挂在假 `schedule` 进程下跑，错误退场结束的是假进程、不会是测试本身。
 `test-wake-binding.mjs` 的 18 个变异（一次只拆一处保护）全部被抓到。原有 6 套只拷桥脚本、不拷 `wake-binding.mjs`，
 正好覆盖"漏拷时按旧行为运行"。子进程环境会删掉 `CLAUDE_CODE_SESSION_ID`，在 Claude Code 里跑也不会带进真实会话 id。
 

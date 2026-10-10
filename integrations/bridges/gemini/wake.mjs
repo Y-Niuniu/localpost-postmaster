@@ -12,10 +12,14 @@
  *   3) 每封信最多唤醒 maxAttemptsPerLetter 次（成功即不再发）；
  *   4) 只唤醒白名单发件人的 task/ping；result（回执）永不唤醒 —— 那是给人看的；
  *   5) 单实例锁：同一时刻只有一个桥在跑，超过 10 分钟的陈旧锁自动接管。
+ *   6) 孤儿调度（2026-10-10）：连不上自己语言服务的这一轮什么都不改就退出（不消耗任何一封信的次数）；
+ *      同一地址连续 3 轮、跨 2 分钟以上都连不上，就结束自己的 schedule 进程。见下方「孤儿调度」一节。
+ *   7) "语言服务连不上"这类传输失败不计入 maxAttemptsPerLetter（信根本没送出去，可以放心重试），另有上限兜底。
  *
  * 日志：$ANTIGRAVITY_EXECUTABLE_DATA_DIR/wake.log（宿主未提供时落在脚本目录旁）。
  */
 import fs from 'node:fs';
+import net from 'node:net';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 
@@ -36,9 +40,76 @@ function loadJson(p, fallback = null) {
   try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return fallback; }
 }
 function saveJson(p, value) {
-  const tmp = p + '.tmp';
+  const tmp = p + '.' + process.pid + '.tmp';      // 几个调度实例可能同时写同一个文件：临时名各用各的
   fs.writeFileSync(tmp, JSON.stringify(value, null, 2) + '\n', 'utf8');
   fs.renameSync(tmp, p);
+}
+
+/* ---------------------------------------------------------------- 孤儿调度（2026-10-10） */
+/*
+ * Antigravity 每次重启都会起一个新的语言服务和一个新的 schedule 进程（`language_server.exe multicall schedule … node wake.mjs`），
+ * 旧的 schedule 进程却不会跟着退出：它们照样每分钟跑本脚本，环境里的 ANTIGRAVITY_LS_ADDRESS 指向已经不存在的语言服务。
+ * 2026-10-10 12:38 实测：一封信到了，三个孤儿各试一次（连接被拒），35 秒内把 maxAttemptsPerLetter=3 用光、判 exhausted，
+ * 活着的那个实例根本没轮上，用户只好手动「查信」。当时机器上同时有 4 个 schedule 进程，其中 3 个的父进程早已不在。
+ *
+ * 所以每一轮先探一下自己的语言服务（只做 TCP 连接，不调用任何接口）：
+ *   连得上 / 判断不了（地址看不懂、超时、别的错误）→ 照常运行；
+ *   明确被拒 → 这一轮送不出去：什么都不改就退出，信留给活着的实例；
+ *   同一地址连续 3 轮、跨 2 分钟以上都被拒 → 结束自己的 schedule 进程（`node wake.mjs` 是它的直接子进程，已实测），
+ *   免得孤儿随每次重启越积越多。活着的实例连得上自己的语言服务，永远走不到这一步。
+ */
+const ORPHANS = path.join(DATA, 'orphans.json');
+const RETIRE_AFTER_REFUSALS = 3;
+const RETIRE_AFTER_MS = 2 * 60 * 1000;
+
+/** host + port from ANTIGRAVITY_LS_ADDRESS (`localhost:1234`, `127.0.0.1:1234`, `[::1]:1234`, `http://localhost:1234`), or null. */
+function lsEndpoint(value) {
+  const match = /^(?:[a-z][a-z0-9+.-]*:\/\/)?(\[[0-9a-f:.]+\]|[^:/\s]+):(\d{1,5})(?:\/.*)?$/i.exec(String(value ?? '').trim());
+  if (!match) return null;
+  const port = Number(match[2]);
+  return port > 0 && port < 65536 ? { host: match[1].replace(/^\[|\]$/g, ''), port } : null;
+}
+
+/**
+ * 'up' | 'refused' | 'unknown'：连上就是 up；明确被拒才是 refused（localhost 由 Node 自动 IPv4/IPv6 都试，全被拒时是
+ * AggregateError，每一个都得是 ECONNREFUSED）；超时或别的错误一律 unknown（不作判断）。
+ */
+function probe({ host, port }) {
+  return new Promise((resolve) => {
+    const socket = net.connect({ host, port });
+    const done = (result) => { socket.destroy(); resolve(result); };
+    socket.setTimeout(3000, () => done('unknown'));     // Windows 对本机被拒的连接会重试约 1 秒；给足余量，超时一律不作判断
+    socket.once('connect', () => done('up'));
+    socket.once('error', (error) => {
+      const codes = Array.isArray(error.errors) ? error.errors.map((part) => part.code) : [error.code];
+      done(codes.length > 0 && codes.every((code) => code === 'ECONNREFUSED') ? 'refused' : 'unknown');
+    });
+  });
+}
+
+const lsAddress = process.env.ANTIGRAVITY_LS_ADDRESS;
+const endpoint = lsAddress ? lsEndpoint(lsAddress) : null;
+if (endpoint) {
+  const key = `${endpoint.host}:${endpoint.port}`;
+  const health = await probe(endpoint);
+  const orphans = loadJson(ORPHANS, {});
+  if (health === 'refused') {
+    const before = orphans[key];
+    const entry = { firstRefusedAt: before?.firstRefusedAt ?? now(), lastRefusedAt: now(), refusals: Number(before?.refusals ?? 0) + 1, scheduler: process.ppid };
+    orphans[key] = entry;
+    try { saveJson(ORPHANS, orphans); } catch { /* 记不下也照样退出：这一轮本来就送不出去 */ }
+    if (entry.refusals >= RETIRE_AFTER_REFUSALS && Date.now() - Date.parse(entry.firstRefusedAt) >= RETIRE_AFTER_MS) {
+      log(`retire orphan scheduler: language server ${lsAddress} has refused ${entry.refusals} times since ${entry.firstRefusedAt}; ending schedule process pid=${process.ppid}`);
+      try { process.kill(process.ppid); } catch (error) { log(`retire failed for pid=${process.ppid}: ${error.message}`); }
+    } else if (entry.refusals === 1) {
+      log(`skip: language server ${lsAddress} refuses connections (an orphan scheduler left by an earlier Antigravity?); nothing sent, no attempt used`);
+    }
+    process.exit(0);
+  }
+  if (health === 'up' && orphans[key]) {
+    delete orphans[key];
+    try { saveJson(ORPHANS, orphans); } catch { /* 下次再清 */ }
+  }
 }
 
 /* ---------------------------------------------------------------- 单实例锁 */
@@ -59,6 +130,9 @@ const identity = cfg.identity;
 const root = cfg.mailboxRoot;
 const allowFrom = Array.isArray(cfg.allowFrom) ? cfg.allowFrom : [];
 const maxAttempts = Number.isInteger(cfg.maxAttemptsPerLetter) ? cfg.maxAttemptsPerLetter : 3;
+// "语言服务连不上"不算一次尝试（信没送出去）；但连着这么多次都送不出去，就停下来等人看（约一小时，每分钟一次）。
+const maxTransportFailures = Number.isInteger(cfg.maxTransportFailures) ? cfg.maxTransportFailures : 60;
+const TRANSPORT = /code = Unavailable|actively refused|connection refused|ECONNREFUSED|ANTIGRAVITY_LS_ADDRESS is not set/i;
 if (!safeId(identity)) { log(`fatal: identity invalid (${identity})`); process.exit(1); }
 // 收信聊天：绑定模块与本脚本部署在同一目录；漏拷时记一笔并只用 config.json（旧行为）。
 const bindingModule = await import('./wake-binding.mjs').catch(() => null);
@@ -143,7 +217,7 @@ function disposition(env) {
   if (note.startsWith('ignored') || note.startsWith('denied')) return 'skip';
   if (e.sentAt) return 'sent';
   if (e.lastResult === 'indeterminate' && cfg.retryIndeterminate !== true) return 'held';
-  if (Number(e.attempts ?? 0) >= maxAttempts) return 'exhausted';
+  if (Number(e.attempts ?? 0) >= maxAttempts || e.lastResult === 'exhausted') return 'exhausted';
   // 重点顺序：只有"演练过且从未真发过"才算 dryRun；一旦真发过（lastAttemptAt），以 attempts/lastResult 为准。
   if (e.dryRunAt && !e.lastAttemptAt) return 'dryRun';
   if (e.lastResult === 'failed' || e.lastResult === 'indeterminate') return 'retry';
@@ -219,8 +293,10 @@ function sendWake(env) {
     child.on('error', (e) => finish({ ok: false, indeterminate: true, out: String(e?.message || e) }));
     child.on('close', (code) => {
       const txt = out.trim();
-      // 只有"退出码 0 且响应里没有 error 字段"才算送达；其余按显式失败计数（可重试到 maxAttempts）。
-      finish({ ok: code === 0 && !/"error"\s*:/i.test(txt), code, indeterminate: false, out: txt.slice(0, 400) });
+      // 只有"退出码 0 且响应里没有 error 字段"才算送达。连不上语言服务 = 根本没送出去（transport），不占尝试次数；
+      // 其余按显式失败计数（可重试到 maxAttempts）。
+      const ok = code === 0 && !/"error"\s*:/i.test(txt);
+      finish({ ok, code, indeterminate: false, transport: !ok && TRANSPORT.test(txt), out: txt.slice(0, 400) });
     });
   });
 }
@@ -248,6 +324,15 @@ for (const { env, why } of pending) {
     seen[env.id] = { ...prev, attempts, lastAttemptAt: now(), lastResult: 'indeterminate', lastOut: res.out };
     failed += 1;
     log(`INDETERMINATE for ${env.id} attempt=${attempts}/${maxAttempts}: ${res.out}`);
+  } else if (res.transport) {
+    // 语言服务连不上：信没送出去，不占尝试次数，下一轮（多半是活着的那个实例）再送。连续太多次才停下来等人看。
+    const transportFailures = Number(prev.transportFailures ?? 0) + 1;
+    const exhausted = transportFailures >= maxTransportFailures;
+    seen[env.id] = { ...prev, transportFailures, lastTransportAt: now(), lastOut: res.out, ...(exhausted ? { lastResult: 'exhausted' } : {}) };
+    failed += 1;
+    log(exhausted
+      ? `give up: ${env.id} — language server unreachable ${transportFailures} times in a row; 需人工处理（不会静默重试）`
+      : `not delivered: ${env.id} — language server unreachable (${transportFailures}/${maxTransportFailures}); no attempt used, next run retries`);
   } else {
     seen[env.id] = { ...prev, attempts, lastAttemptAt: now(), lastResult: 'failed', lastOut: res.out };
     failed += 1;
