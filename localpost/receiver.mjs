@@ -22,7 +22,7 @@ const json = async file => {
 };
 
 // Receiver records transport facts only. It never writes ledger or business files.
-export function createReceiver({ root, agent, allowFrom = [], adapter, now = () => Date.now(), scanIntervalMs = 30000, debounceMs = 300, watch = fs.watch } = {}) {
+export function createReceiver({ root, agent, allowFrom = [], adapter, now = () => Date.now(), scanIntervalMs = 30000, debounceMs = 300, baselineWaitMs = 5000, watch = fs.watch } = {}) {
   assertId(agent); allowFrom.forEach(assertId);
   root = path.resolve(root);
   let ancestor = root;
@@ -157,6 +157,21 @@ export function createReceiver({ root, agent, allowFrom = [], adapter, now = () 
     return pending;
   }
 
+  // Running means the baseline exists, so a letter delivered after start() returns is new mail. The first scan records
+  // the baseline under the publication lease and is skipped while that lease is taken - by a delivery, or by another
+  // identity's receiver recording its own baseline at the same moment. Retry it the way a delivery waits for the lease
+  // (busy only, 10 ms pauses, real time since the injected clock may stand still); past baselineWaitMs fail the start, as
+  // a baseline taken by a later scan would count the mail delivered in between as historical.
+  async function firstScan() {
+    const started = Date.now();
+    while (true) {
+      const result = await scan();
+      if (!result.skipped || await json(stateFile())) return;
+      if (result.reason !== 'busy' || Date.now() - started > baselineWaitMs) throw new Error('Receiver baseline not recorded: ' + result.reason);
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+  }
+
   const hint = () => {
     if (stopped) return;
     clearTimeout(debounce);
@@ -164,9 +179,9 @@ export function createReceiver({ root, agent, allowFrom = [], adapter, now = () 
   };
   let lastError;
   const onError = error => { lastError = { at: new Date(now()).toISOString(), message: error.message }; };
-  // start() and stop() run one at a time. start() waits twice (the inbox directory, the first scan); a stop() arriving in
-  // between runs after it and tears down what it opened, so nothing is scheduled once stop() has returned, and two
-  // concurrent starts open one watcher, not two.
+  // start() and stop() run one at a time. start() waits twice (the inbox directory, the first scan - retried until the
+  // baseline exists); a stop() arriving in between runs after it and tears down what it opened, so nothing is scheduled
+  // once stop() has returned, and two concurrent starts open one watcher, not two.
   let lifecycle = Promise.resolve();
   const serially = task => {
     const next = lifecycle.then(task, task);
@@ -184,7 +199,7 @@ export function createReceiver({ root, agent, allowFrom = [], adapter, now = () 
         stopped = false;
         try { watcher = watch(inbox(), hint); watcher.on('error', onError); }
         catch (error) { onError(error); }
-        await scan();
+        await firstScan();
         interval = setInterval(() => { void scan().catch(onError); }, scanIntervalMs);
       });
     },
